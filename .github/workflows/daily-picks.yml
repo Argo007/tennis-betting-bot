@@ -1,8 +1,8 @@
 name: Daily Tennis Picks
 
 on:
-  workflow_dispatch:  # run it manually from the Actions tab
-  # If you want it automatic every morning (07:00 UTC), uncomment below:
+  workflow_dispatch:
+  # Uncomment to run daily at 07:00 UTC:
   # schedule:
   #   - cron: "0 7 * * *"
 
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        region: [eu, uk, us]   # try 3 regions so you actually get data
+        region: [eu, uk, us]
 
     steps:
       - name: Checkout repository
@@ -26,20 +26,15 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests
 
-      # Quick sanity check so we know if the API is returning anything
-      - name: Debug Odds API (list sports + sample ATP odds EU)
+      # Sanity check the provider (optional but helpful)
+      - name: Debug Odds API (sample ATP odds EU)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          set -e
-          echo "Listing sports (first 2KB):"
-          curl -s "https://api.the-odds-api.com/v4/sports?apiKey=${ODDS_API_KEY}" | head -c 2000 || true
-          echo
-          echo "Sample ATP odds (eu) (first 2KB):"
           curl -s "https://api.the-odds-api.com/v4/sports/tennis_atp/odds?apiKey=${ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal" | head -c 2000 || true
           echo
 
-      - name: Run picks (region=${{ matrix.region }})
+      - name: Run model (region=${{ matrix.region }})
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
@@ -50,14 +45,15 @@ jobs:
             --kelly 0.25 \
             --lookahead-h 120 > run_${{ matrix.region }}.txt
 
-      # Show the top lines in the job summary so you don't need to download the CSV
-      - name: Show top picks in summary (region=${{ matrix.region }})
+      - name: Summary (region=${{ matrix.region }})
         run: |
           echo "### Region: ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
           grep -E "Top Favorite|Top Underdog|ATP Favorite|ATP Underdog|WTA Favorite|WTA Underdog|No qualifying events" run_${{ matrix.region }}.txt || echo "No picks."
 
-      - name: Upload CSV artifact (region=${{ matrix.region }})
+      - name: Upload artifacts (region=${{ matrix.region }})
         uses: actions/upload-artifact@v4
         with:
-          name: picks-${{ matrix.region }}
-          path: value_picks_pro_*.csv
+          name: results-${{ matrix.region }}
+          path: |
+            value_picks_pro_*.csv
+            run_${{ matrix.region }}.txt
