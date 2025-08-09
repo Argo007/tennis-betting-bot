@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -71,11 +71,9 @@ jobs:
           atp_elo_df = calculate_elo(atp_matches).sort_values("elo", ascending=False)
           wta_elo_df = calculate_elo(wta_matches).sort_values("elo", ascending=False)
 
-          # Save in /data
+          # Save in /data and root so the script finds them either way
           atp_elo_df.to_csv("data/atp_elo.csv", index=False)
           wta_elo_df.to_csv("data/wta_elo.csv", index=False)
-
-          # Also save in repo root
           atp_elo_df.to_csv("atp_elo.csv", index=False)
           wta_elo_df.to_csv("wta_elo.csv", index=False)
 
@@ -86,9 +84,6 @@ jobs:
           print(wta_elo_df.head().to_string(index=False))
           PYCODE
 
-      # -------------------
-      # RUN YOUR PICKS SCRIPT
-      # -------------------
       - name: Run tennis value picks
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -96,7 +91,7 @@ jobs:
           python tennis_value_picks_pro.py --region eu --out value_picks_pro.csv
 
       - name: Upload results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: value-picks
           path: value_picks_pro.csv
