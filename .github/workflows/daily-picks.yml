@@ -1,4 +1,4 @@
-name: Daily Tennis Picks
+name: Daily Tennis Picks (Auto Elo)
 
 on:
   schedule:
@@ -71,7 +71,7 @@ jobs:
           atp_elo_df = calculate_elo(atp_matches).sort_values("elo", ascending=False)
           wta_elo_df = calculate_elo(wta_matches).sort_values("elo", ascending=False)
 
-          # Save in /data and root so the script finds them either way
+          # Save in /data and repo root so the script finds them either way
           atp_elo_df.to_csv("data/atp_elo.csv", index=False)
           wta_elo_df.to_csv("data/wta_elo.csv", index=False)
           atp_elo_df.to_csv("atp_elo.csv", index=False)
@@ -84,12 +84,18 @@ jobs:
           print(wta_elo_df.head().to_string(index=False))
           PYCODE
 
+      # -------------------
+      # RUN YOUR PICKS SCRIPT
+      # -------------------
       - name: Run tennis value picks
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python tennis_value_picks_pro.py --region eu --out value_picks_pro.csv
 
+      # -------------------
+      # UPLOAD RESULTS
+      # -------------------
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
