@@ -68,9 +68,22 @@ jobs:
           atp_matches = load_matches("matches/atp_matches_*.csv")
           wta_matches = load_matches("matches/wta_matches_*.csv")
 
-          calculate_elo(atp_matches).to_csv("data/atp_elo.csv", index=False)
-          calculate_elo(wta_matches).to_csv("data/wta_elo.csv", index=False)
-          print("Elo files generated in data/")
+          atp_elo_df = calculate_elo(atp_matches).sort_values("elo", ascending=False)
+          wta_elo_df = calculate_elo(wta_matches).sort_values("elo", ascending=False)
+
+          # Save in /data
+          atp_elo_df.to_csv("data/atp_elo.csv", index=False)
+          wta_elo_df.to_csv("data/wta_elo.csv", index=False)
+
+          # Also save in repo root
+          atp_elo_df.to_csv("atp_elo.csv", index=False)
+          wta_elo_df.to_csv("wta_elo.csv", index=False)
+
+          print("✅ Elo files generated in data/ and repo root")
+          print("\n🏆 Top 5 ATP Elo Players:")
+          print(atp_elo_df.head().to_string(index=False))
+          print("\n🏆 Top 5 WTA Elo Players:")
+          print(wta_elo_df.head().to_string(index=False))
           PYCODE
 
       # -------------------
