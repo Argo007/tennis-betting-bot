@@ -9,11 +9,10 @@ from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
 import requests
 
-ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
 SPORT_KEYS = ["tennis_atp", "tennis_wta"]
 DEFAULT_REGION = "eu"
 
-# Default Elo sources (Jeff Sackmann public datasets)
+# Fixed/valid Elo sources (Jeff Sackmann public datasets)
 DEFAULT_ELO_MEN = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_elo.csv"
 DEFAULT_ELO_WOMEN = "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_elo.csv"
 
@@ -34,11 +33,19 @@ def implied_prob(decimal_odds: float) -> Optional[float]:
         return None
 
 def get_odds(api_key: str, sport_key: str, region: str) -> List[Dict[str, Any]]:
-    params = {"apiKey": api_key, "regions": region, "markets": "h2h", "oddsFormat": "decimal"}
-    url = ODDS_API_URL.format(sport_key=sport_key)
+    # Correct query params (prevents h2h/oddsFormat from sticking together)
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": region,
+        "markets": "h2h",
+        "oddsFormat": "decimal",
+    }
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    print(f"[DEBUG] fetched {len(data)} events for {sport_key} region={region}")
+    return data
 
 def load_csv(path_or_url: str) -> pd.DataFrame:
     if path_or_url.startswith("http"):
@@ -51,7 +58,7 @@ def normalize_player_name(name: str) -> str:
     return " ".join(name.strip().replace("-", " ").split()).lower()
 
 def latest_elo_by_player(df: pd.DataFrame, surface: str) -> pd.DataFrame:
-    # Expect columns: player, date, elo, elo_hard, elo_clay, elo_grass (Sackmann format)
+    # Expect columns: player, date, elo, elo_hard, elo_clay, elo_grass (Sackmann)
     cols = {c.lower(): c for c in df.columns}
     name_col = cols.get("player") or cols.get("player_name") or list(df.columns)[0]
     date_col = cols.get("date") or "date"
@@ -152,7 +159,6 @@ def kelly_fraction(p: float, odds: float, cap: float) -> float:
 
 def build_surface_map(path: Optional[str]) -> Dict[str, str]:
     if not path or not os.path.exists(path):
-        # Minimal defaults; extend as needed
         return {
             "wimbledon": "grass",
             "roland garros": "clay",
@@ -193,7 +199,7 @@ def main():
     ap.add_argument("--market-weight", type=float, default=float(os.getenv("MARKET_WEIGHT", 0.6)))
     ap.add_argument("--model-weight", type=float, default=float(os.getenv("MODEL_WEIGHT", 0.4)))
     ap.add_argument("--kelly", type=float, default=float(os.getenv("KELLY_CAP", 0.25)))
-    ap.add_argument("--lookahead-h", type=int, default=int(os.getenv("LOOKAHEAD_H", 36)))
+    ap.add_argument("--lookahead-h", type=int, default=int(os.getenv("LOOKAHEAD_H", 120)))  # bigger default to avoid empties
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -249,6 +255,7 @@ def main():
             if (dt - now_utc).total_seconds() > args.lookahead_h * 3600:
                 continue
 
+            # Infer surface from tournament text; fallback to default
             surface = None
             for k, v in surface_map.items():
                 if k in (title + " " + league).lower():
@@ -332,7 +339,7 @@ def main():
             })
 
     # ----- ALWAYS write a CSV to repo root -----
-    out_path = f"value_picks_pro_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    out_path = args.out or f"value_picks_pro_{datetime.utcnow().strftime('%Y%m%d')}.csv"
     if not rows:
         df = pd.DataFrame(columns=[
             "tour","surface","event_id","commence_time_utc","player","opponent",
