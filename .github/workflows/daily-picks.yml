@@ -1,53 +1,153 @@
-      - name: Build SMART PICKS (Bouzas / Fenix style)
+name: Daily Tennis Picks (Upsets & Favorites)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"     # runs daily at 08:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (no requirements.txt)
         run: |
-          python - << 'PY'
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      # ---- Generate Elo from last two seasons ----
+      - name: Download ATP/WTA match data
+        run: |
+          mkdir -p matches
+          curl -L -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -L -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -L -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -L -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+
+      - name: Generate Elo ratings
+        run: |
+          python <<'PY'
+          import pandas as pd, glob, os
+          START_ELO, K = 1500, 32
+          def exp(a,b): return 1/(1+10**((b-a)/400))
+          def upd(a,b,s): return a + K*(s - exp(a,b))
+          def calc(pattern):
+              files = glob.glob(pattern)
+              df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+              elos={}
+              for _,r in df.iterrows():
+                  w,l = r['winner_name'], r['loser_name']
+                  ew,el = elos.get(w,START_ELO), elos.get(l,START_ELO)
+                  elos[w]=upd(ew,el,1); elos[l]=upd(el,ew,0)
+              return pd.DataFrame([{"player":k,"elo":v} for k,v in elos.items()]).sort_values("elo",ascending=False)
+          os.makedirs("data", exist_ok=True)
+          atp = calc("matches/atp_matches_*.csv")
+          wta = calc("matches/wta_matches_*.csv")
+          atp.to_csv("data/atp_elo.csv", index=False); atp.to_csv("atp_elo.csv", index=False)
+          wta.to_csv("data/wta_elo.csv", index=False); wta.to_csv("wta_elo.csv", index=False)
+          print("✅ Elo generated.")
+          PY
+
+      # ---- Run your model script (must exist in repo root) ----
+      - name: Run tennis value picks
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
+
+      # ---- Build Upsets & Favorites (robust) ----
+      - name: Build SMART PICKS – Upsets & Favorites (robust)
+        run: |
+          python - <<'PY'
           import pandas as pd, os
+
           df = pd.read_csv("value_picks_pro.csv")
 
-          # Focus on mid-range upset candidates
-          smart = df[
-              (df['ev_per_unit'] > 0) &
-              (df['blended_prob'] >= 0.40) &
-              (df['best_odds'].between(2.20, 4.50)) &
-              (df['confidence'] >= 50)
-          ].copy()
+          # Force numeric types to avoid "invalid type" filter errors
+          num_cols = ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]
+          for c in num_cols:
+              df[c] = pd.to_numeric(df.get(c), errors="coerce")
+          df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob"])
 
-          # Keep only one side of a match (higher EV side)
-          smart.insert(0, "match_id", smart.apply(lambda r: " :: ".join(sorted([str(r['player']), str(r['opponent'])])), axis=1))
-          smart = smart.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
+          # Helper: keep only one side of each match (higher EV side)
+          def dedup_best_side(d):
+              d = d.copy()
+              d.insert(0, "match_id",
+                       d.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1))
+              return d.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
 
-          # Select relevant columns
+          # Mid-range upsets (Bouzas / Fearnley / Sramkova / Blockx vibe)
+          upsets = df[
+              (df["ev_per_unit"] > 0) &
+              (df["blended_prob"] >= 0.40) &
+              (df["best_odds"].between(2.20, 4.50)) &
+              (df["confidence"] >= 50)
+          ]
+          upsets = dedup_best_side(upsets)
+
+          # Safe high-value favorites
+          favorites = df[
+              (df["ev_per_unit"] > 0) &
+              (df["blended_prob"] >= 0.70) &
+              (df["best_odds"].between(1.30, 1.80)) &
+              (df["confidence"] >= 50)
+          ]
+          favorites = dedup_best_side(favorites)
+
           cols = ["tour","surface","commence_time_utc","player","opponent",
                   "blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]
 
-          smart = smart.sort_values(["ev_per_unit","confidence"], ascending=False).head(5)[cols]
+          upsets = upsets.sort_values(["ev_per_unit","confidence"], ascending=False).head(5)[cols]
+          favorites = favorites.sort_values(["ev_per_unit","confidence"], ascending=False).head(5)[cols]
 
-          # Fallback: if empty, take top 3 EV from whole dataset
-          if smart.empty:
-              fallback = df[(df['ev_per_unit']>0)].copy()
-              fallback.insert(0, "match_id", fallback.apply(lambda r: " :: ".join(sorted([str(r['player']), str(r['opponent'])])), axis=1))
-              fallback = fallback.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
-              smart = fallback.sort_values(["ev_per_unit","confidence"], ascending=False).head(3)[cols]
+          # Fallbacks so you always see something
+          if upsets.empty:
+              fb = dedup_best_side(df[df["ev_per_unit"]>0])
+              upsets = fb.sort_values(["ev_per_unit","confidence"], ascending=False).head(3)[cols]
+          if favorites.empty:
+              fb = dedup_best_side(df[(df["ev_per_unit"]>0) & (df["best_odds"]<=2.0)])
+              favorites = fb.sort_values(["ev_per_unit","confidence"], ascending=False).head(3)[cols]
 
-          smart.to_csv("smart_picks.csv", index=False)
+          # Save CSVs
+          upsets.to_csv("smart_picks_upsets.csv", index=False)
+          favorites.to_csv("smart_picks_favorites.csv", index=False)
 
+          # Print to summary
           def md(df):
               if df.empty: return "_No picks_"
               d=df.round(4)
               return "| " + " | ".join(d.columns) + " |\n" + "| " + " | ".join(["---"]*len(d.columns)) + " |\n" + \
                      "\n".join("| " + " | ".join(map(str,row)) + " |" for row in d.values)
-
           def bullets(df):
               if df.empty: return "_No picks_"
               out=[]
               for _,r in df.iterrows():
                   out.append(f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
-                             f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f})")
+                             f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, Kelly={r['kelly_fraction']:.2f})")
               return "\n".join(out)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("## 🎯 SMART PICKS – Mid-range Upsets\n")
-              f.write(md(smart) + "\n\n")
-              f.write("### Quick list\n")
-              f.write(bullets(smart) + "\n")
+              f.write("## 🎯 Mid-range Upsets (2.20–4.50)\n")
+              f.write(md(upsets) + "\n\n")
+              f.write(bullets(upsets) + "\n\n")
+              f.write("## 🛡 Safe High-Value Favorites (1.30–1.80)\n")
+              f.write(md(favorites) + "\n\n")
+              f.write(bullets(favorites) + "\n")
           PY
+
+      # ---- Upload both CSVs as an artifact ----
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: smart-picks
+          path: |
+            smart_picks_upsets.csv
+            smart_picks_favorites.csv
