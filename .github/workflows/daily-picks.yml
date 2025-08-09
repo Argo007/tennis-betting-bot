@@ -2,102 +2,62 @@ name: Daily Tennis Picks (Auto Elo)
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # Runs every day at 08:00 UTC
-  workflow_dispatch: {}
+    - cron: "0 8 * * *"  # Runs daily at 08:00 UTC
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install -r requirements.txt
 
-      # -------------------
-      # ELO GENERATION STEP
-      # -------------------
-      - name: Download ATP/WTA match data
+      # ------------------------------
+      # GENERATE ELO FILES
+      # ------------------------------
+      - name: Generate ATP/WTA Elo
         run: |
-          mkdir -p matches
-          curl -L -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -L -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -L -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -L -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
-
-      - name: Generate Elo ratings
-        run: |
-          python <<'PYCODE'
-          import pandas as pd, os, glob
-
-          START_ELO = 1500
-          K_FACTOR = 32
-
-          def expected_score(player_elo, opp_elo):
-              return 1 / (1 + 10 ** ((opp_elo - player_elo) / 400))
-
-          def update_elo(player_elo, opp_elo, score):
-              return player_elo + K_FACTOR * (score - expected_score(player_elo, opp_elo))
-
-          def calculate_elo(matches):
-              elos = {}
-              for _, row in matches.iterrows():
-                  p1 = row['winner_name']
-                  p2 = row['loser_name']
-                  p1_elo = elos.get(p1, START_ELO)
-                  p2_elo = elos.get(p2, START_ELO)
-                  elos[p1] = update_elo(p1_elo, p2_elo, 1)
-                  elos[p2] = update_elo(p2_elo, p1_elo, 0)
-              return pd.DataFrame(list(elos.items()), columns=["player", "elo"])
-
-          def load_matches(pattern):
-              files = glob.glob(pattern)
-              dfs = [pd.read_csv(f) for f in files]
-              return pd.concat(dfs, ignore_index=True)
-
-          os.makedirs("data", exist_ok=True)
-          atp_matches = load_matches("matches/atp_matches_*.csv")
-          wta_matches = load_matches("matches/wta_matches_*.csv")
+          python - <<'PYCODE'
+          from elo_module import calculate_elo  # Make sure this exists
+          import pandas as pd
+          atp_matches = pd.read_csv("data/atp_matches.csv")
+          wta_matches = pd.read_csv("data/wta_matches.csv")
 
           atp_elo_df = calculate_elo(atp_matches).sort_values("elo", ascending=False)
           wta_elo_df = calculate_elo(wta_matches).sort_values("elo", ascending=False)
 
-          # Save in /data and repo root so the script finds them either way
+          # Save in /data and root so the script finds them
           atp_elo_df.to_csv("data/atp_elo.csv", index=False)
           wta_elo_df.to_csv("data/wta_elo.csv", index=False)
           atp_elo_df.to_csv("atp_elo.csv", index=False)
           wta_elo_df.to_csv("wta_elo.csv", index=False)
-
-          print("✅ Elo files generated in data/ and repo root")
-          print("\n🏆 Top 5 ATP Elo Players:")
-          print(atp_elo_df.head().to_string(index=False))
-          print("\n🏆 Top 5 WTA Elo Players:")
-          print(wta_elo_df.head().to_string(index=False))
           PYCODE
 
-      # -------------------
+      # ------------------------------
       # RUN YOUR PICKS SCRIPT
-      # -------------------
+      # ------------------------------
       - name: Run tennis value picks
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python tennis_value_picks_pro.py --region eu --out value_picks_pro.csv
 
-      # -------------------
+      # ------------------------------
       # UPLOAD RESULTS
-      # -------------------
-      - name: Upload results
+      # ------------------------------
+      - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
         with:
-          name: value-picks
+          name: results-eu
           path: value_picks_pro.csv
