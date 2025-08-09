@@ -1,0 +1,23 @@
+name: Daily Tennis Picks
+on:
+  schedule:
+    - cron: "0 7 * * *"   # runs daily at 07:00 UTC (09:00 Amsterdam)
+  workflow_dispatch:       # allows manual runs
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas requests
+      - env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python tennis_value_picks_pro.py --region eu --market-weight 0.6 --model-weight 0.4 --kelly 0.25
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picks
+          path: value_picks_pro_*.csv
