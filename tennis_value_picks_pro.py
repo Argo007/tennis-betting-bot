@@ -158,4 +158,4 @@ def kelly_fraction(p: float, odds: float, cap: float) -> float:
     f = ((b*p) - q) / b if b>0 else 0.0
     return max(0.0, min(cap, f))
 
-def build_surface_map(path: Optional[str]) -> Dict[str,str]
+def build_surface_map(path: Optional[str]) -> Dict[str,str]:
