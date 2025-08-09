@@ -1,47 +1,36 @@
-      - name: Build SMART PICKS – Upsets & Favorites
+      - name: Build SMART PICKS (Bouzas / Fenix style)
         run: |
           python - << 'PY'
           import pandas as pd, os
           df = pd.read_csv("value_picks_pro.csv")
 
-          # ===== Upset filter =====
-          upsets = df[
+          # Focus on mid-range upset candidates
+          smart = df[
               (df['ev_per_unit'] > 0) &
               (df['blended_prob'] >= 0.40) &
               (df['best_odds'].between(2.20, 4.50)) &
               (df['confidence'] >= 50)
           ].copy()
 
-          upsets.insert(0, "match_id", upsets.apply(lambda r: " :: ".join(sorted([str(r['player']), str(r['opponent'])])), axis=1))
-          upsets = upsets.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
+          # Keep only one side of a match (higher EV side)
+          smart.insert(0, "match_id", smart.apply(lambda r: " :: ".join(sorted([str(r['player']), str(r['opponent'])])), axis=1))
+          smart = smart.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
 
-          upset_cols = ["tour","surface","commence_time_utc","player","opponent",
-                        "blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]
+          # Select relevant columns
+          cols = ["tour","surface","commence_time_utc","player","opponent",
+                  "blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]
 
-          upsets = upsets.sort_values(["ev_per_unit","confidence"], ascending=False).head(5)[upset_cols]
+          smart = smart.sort_values(["ev_per_unit","confidence"], ascending=False).head(5)[cols]
 
-          # Fallback if empty
-          if upsets.empty:
+          # Fallback: if empty, take top 3 EV from whole dataset
+          if smart.empty:
               fallback = df[(df['ev_per_unit']>0)].copy()
               fallback.insert(0, "match_id", fallback.apply(lambda r: " :: ".join(sorted([str(r['player']), str(r['opponent'])])), axis=1))
               fallback = fallback.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
-              upsets = fallback.sort_values(["ev_per_unit","confidence"], ascending=False).head(3)[upset_cols]
+              smart = fallback.sort_values(["ev_per_unit","confidence"], ascending=False).head(3)[cols]
 
-          # ===== Favorite filter =====
-          favorites = df[
-              (df['ev_per_unit'] > 0) &
-              (df['blended_prob'] >= 0.70) &
-              (df['best_odds'].between(1.30, 1.80)) &
-              (df['confidence'] >= 50)
-          ].copy()
+          smart.to_csv("smart_picks.csv", index=False)
 
-          favorites.insert(0, "match_id", favorites.apply(lambda r: " :: ".join(sorted([str(r['player']), str(r['opponent'])])), axis=1))
-          favorites = favorites.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
-
-          fav_cols = upset_cols
-          favorites = favorites.sort_values(["ev_per_unit","confidence"], ascending=False).head(5)[fav_cols]
-
-          # Markdown table
           def md(df):
               if df.empty: return "_No picks_"
               d=df.round(4)
@@ -57,13 +46,8 @@
               return "\n".join(out)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("## 🎯 SMART PICKS – Mid-range Upsets (2.20–4.50 odds)\n")
-              f.write(md(upsets) + "\n\n")
+              f.write("## 🎯 SMART PICKS – Mid-range Upsets\n")
+              f.write(md(smart) + "\n\n")
               f.write("### Quick list\n")
-              f.write(bullets(upsets) + "\n\n")
-
-              f.write("## 🛡 SAFE HIGH-VALUE FAVORITES (1.30–1.80 odds)\n")
-              f.write(md(favorites) + "\n\n")
-              f.write("### Quick list\n")
-              f.write(bullets(favorites) + "\n")
+              f.write(bullets(smart) + "\n")
           PY
