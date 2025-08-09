@@ -1,50 +1,89 @@
 name: Daily Tennis Picks
 
 on:
-  workflow_dispatch:
-  # schedule:
-  #   - cron: "0 7 * * *"  # uncomment to run daily 07:00 UTC
+  schedule:
+    - cron: '0 8 * * *'  # Runs every day at 08:00 UTC
+  workflow_dispatch: {}
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        region: [eu, uk, us]
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
 
-      - name: Run model (region=${{ matrix.region }})
+      # -------------------
+      # ELO GENERATION STEP
+      # -------------------
+      - name: Download ATP/WTA match data
+        run: |
+          mkdir -p matches
+          curl -L -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -L -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -L -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -L -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+
+      - name: Generate Elo ratings
+        run: |
+          python <<'PYCODE'
+          import pandas as pd, os, glob
+
+          START_ELO = 1500
+          K_FACTOR = 32
+
+          def expected_score(player_elo, opp_elo):
+              return 1 / (1 + 10 ** ((opp_elo - player_elo) / 400))
+
+          def update_elo(player_elo, opp_elo, score):
+              return player_elo + K_FACTOR * (score - expected_score(player_elo, opp_elo))
+
+          def calculate_elo(matches):
+              elos = {}
+              for _, row in matches.iterrows():
+                  p1 = row['winner_name']
+                  p2 = row['loser_name']
+                  p1_elo = elos.get(p1, START_ELO)
+                  p2_elo = elos.get(p2, START_ELO)
+                  elos[p1] = update_elo(p1_elo, p2_elo, 1)
+                  elos[p2] = update_elo(p2_elo, p1_elo, 0)
+              return pd.DataFrame(list(elos.items()), columns=["player", "elo"])
+
+          def load_matches(pattern):
+              files = glob.glob(pattern)
+              dfs = [pd.read_csv(f) for f in files]
+              return pd.concat(dfs, ignore_index=True)
+
+          os.makedirs("data", exist_ok=True)
+          atp_matches = load_matches("matches/atp_matches_*.csv")
+          wta_matches = load_matches("matches/wta_matches_*.csv")
+
+          calculate_elo(atp_matches).to_csv("data/atp_elo.csv", index=False)
+          calculate_elo(wta_matches).to_csv("data/wta_elo.csv", index=False)
+          print("Elo files generated in data/")
+          PYCODE
+
+      # -------------------
+      # RUN YOUR PICKS SCRIPT
+      # -------------------
+      - name: Run tennis value picks
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          python tennis_value_picks_pro.py \
-            --region ${{ matrix.region }} \
-            --market-weight 0.6 \
-            --model-weight 0.4 \
-            --kelly 0.25 \
-            --lookahead-h 120 > run_${{ matrix.region }}.txt
+          python tennis_value_picks_pro.py --region eu --out value_picks_pro.csv
 
-      - name: Summary (region=${{ matrix.region }})
-        run: |
-          echo "### Region: ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
-          grep -E "Top Favorite|Top Underdog|ATP Favorite|ATP Underdog|WTA Favorite|WTA Underdog|No active ATP/WTA sport keys|No qualifying events" run_${{ matrix.region }}.txt || echo "No picks."
-
-      - name: Upload artifacts (region=${{ matrix.region }})
-        uses: actions/upload-artifact@v4
+      - name: Upload results
+        uses: actions/upload-artifact@v3
         with:
-          name: results-${{ matrix.region }}
-          path: |
-            value_picks_pro_*.csv
-            run_${{ matrix.region }}.txt
+          name: value-picks
+          path: value_picks_pro.csv
