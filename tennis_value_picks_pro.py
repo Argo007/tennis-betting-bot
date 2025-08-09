@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Tennis value picks PRO: market odds + Bayesian player model (surface Elo, recency, optional serve/return)
+# Tennis value picks PRO: market odds + Bayesian-ish player model (surface Elo, recency, optional serve/return)
 # Always writes CSV: value_picks_pro_YYYYMMDD.csv
 
 import os, sys, argparse, json, math, io
@@ -9,10 +9,9 @@ from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
 import requests
 
-SPORT_KEYS = ["tennis_atp", "tennis_wta"]
 DEFAULT_REGION = "eu"
 
-# Fixed/valid Elo sources (Jeff Sackmann public datasets)
+# Elo sources (best-effort; script keeps working if they fail)
 DEFAULT_ELO_MEN = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_elo.csv"
 DEFAULT_ELO_WOMEN = "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_elo.csv"
 
@@ -32,15 +31,24 @@ def implied_prob(decimal_odds: float) -> Optional[float]:
     except Exception:
         return None
 
+def list_tennis_keys(api_key: str) -> List[str]:
+    """Ask Odds API which tennis tournament keys are active (ATP & WTA)."""
+    url = "https://api.the-odds-api.com/v4/sports"
+    r = requests.get(url, params={"apiKey": api_key}, timeout=30)
+    r.raise_for_status()
+    sports = r.json()
+    keys: List[str] = []
+    for s in sports:
+        key = str(s.get("key", ""))
+        group = (s.get("group") or "").lower()
+        if key.startswith("tennis_") and ("atp" in key or "wta" in key):
+            if s.get("active", True):
+                keys.append(key)
+    return keys
+
 def get_odds(api_key: str, sport_key: str, region: str) -> List[Dict[str, Any]]:
-    # Correct query params (prevents h2h/oddsFormat from sticking together)
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": api_key,
-        "regions": region,
-        "markets": "h2h",
-        "oddsFormat": "decimal",
-    }
+    params = {"apiKey": api_key, "regions": region, "markets": "h2h", "oddsFormat": "decimal"}
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -58,7 +66,6 @@ def normalize_player_name(name: str) -> str:
     return " ".join(name.strip().replace("-", " ").split()).lower()
 
 def latest_elo_by_player(df: pd.DataFrame, surface: str) -> pd.DataFrame:
-    # Expect columns: player, date, elo, elo_hard, elo_clay, elo_grass (Sackmann)
     cols = {c.lower(): c for c in df.columns}
     name_col = cols.get("player") or cols.get("player_name") or list(df.columns)[0]
     date_col = cols.get("date") or "date"
@@ -160,24 +167,12 @@ def kelly_fraction(p: float, odds: float, cap: float) -> float:
 def build_surface_map(path: Optional[str]) -> Dict[str, str]:
     if not path or not os.path.exists(path):
         return {
-            "wimbledon": "grass",
-            "roland garros": "clay",
-            "french open": "clay",
-            "madrid": "clay",
-            "rome": "clay",
-            "monte-carlo": "clay",
-            "australian open": "hard",
-            "us open": "hard",
-            "indian wells": "hard",
-            "miami": "hard",
-            "cincinnati": "hard",
-            "toronto": "hard",
-            "montreal": "hard",
-            "washington": "hard",
-            "queens": "grass",
-            "halle": "grass",
-            "stuttgart": "grass",
-            "eastbourne": "grass",
+            "wimbledon": "grass", "roland garros": "clay", "french open": "clay",
+            "madrid": "clay", "rome": "clay", "monte-carlo": "clay",
+            "australian open": "hard", "us open": "hard",
+            "indian wells": "hard", "miami": "hard", "cincinnati": "hard",
+            "toronto": "hard", "montreal": "hard", "washington": "hard",
+            "queens": "grass", "halle": "grass", "stuttgart": "grass", "eastbourne": "grass",
         }
     with open(path, "r", encoding="utf-8") as f:
         m = json.load(f)
@@ -199,7 +194,7 @@ def main():
     ap.add_argument("--market-weight", type=float, default=float(os.getenv("MARKET_WEIGHT", 0.6)))
     ap.add_argument("--model-weight", type=float, default=float(os.getenv("MODEL_WEIGHT", 0.4)))
     ap.add_argument("--kelly", type=float, default=float(os.getenv("KELLY_CAP", 0.25)))
-    ap.add_argument("--lookahead-h", type=int, default=int(os.getenv("LOOKAHEAD_H", 120)))  # bigger default to avoid empties
+    ap.add_argument("--lookahead-h", type=int, default=int(os.getenv("LOOKAHEAD_H", 120)))
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -208,15 +203,31 @@ def main():
         print("ERROR: Set ODDS_API_KEY.", file=sys.stderr)
         sys.exit(1)
 
+    # Discover active tennis tournament keys (fixes UNKNOWN_SPORT)
+    sport_keys = list_tennis_keys(api_key)
+    if not sport_keys:
+        out_path = args.out or f"value_picks_pro_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+        pd.DataFrame(columns=[
+            "tour","surface","event_id","commence_time_utc","player","opponent",
+            "market_prob","model_prob","blended_prob","best_odds",
+            "ev_per_unit","kelly_fraction","confidence"
+        ]).to_csv(out_path, index=False)
+        print("No active ATP/WTA sport keys from Odds API. Wrote empty CSV.")
+        return
+
     preferred = [b.strip().lower() for b in args.prefer_books.split(",") if b.strip()]
 
-    # Load Elo & form
+    # Load Elo & form (best-effort)
     try:
         elo_men_all = load_csv(args.elo_men_url)
+    except Exception as e:
+        print(f"WARNING: men Elo CSV load failed: {e}", file=sys.stderr)
+        elo_men_all = pd.DataFrame()
+    try:
         elo_women_all = load_csv(args.elo_women_url)
     except Exception as e:
-        print(f"WARNING: Failed to load Elo CSVs: {e}", file=sys.stderr)
-        elo_men_all = pd.DataFrame(); elo_women_all = pd.DataFrame()
+        print(f"WARNING: women Elo CSV load failed: {e}", file=sys.stderr)
+        elo_women_all = pd.DataFrame()
 
     surface_map = build_surface_map(args.surface_map)
     serve_df = load_serve_return(args.serve_file)
@@ -231,16 +242,15 @@ def main():
             return ref
         return pd.DataFrame(columns=["name_key", "elo", "form"])
 
-    # -------- Build rows from odds --------
     rows = []
     now_utc = datetime.now(timezone.utc)
 
-    for key in SPORT_KEYS:
+    for key in sport_keys:
         tour = "ATP" if "atp" in key else "WTA"
         try:
             raw = get_odds(api_key, key, args.region)
         except Exception as e:
-            print(f"Error fetching odds for {tour}: {e}", file=sys.stderr)
+            print(f"Error fetching odds for {tour} ({key}): {e}", file=sys.stderr)
             continue
 
         ref_cache: Dict[str, pd.DataFrame] = {}
@@ -255,7 +265,7 @@ def main():
             if (dt - now_utc).total_seconds() > args.lookahead_h * 3600:
                 continue
 
-            # Infer surface from tournament text; fallback to default
+            # Infer surface from text; fallback to default
             surface = None
             for k, v in surface_map.items():
                 if k in (title + " " + league).lower():
@@ -275,7 +285,6 @@ def main():
             p1, p2 = list(consensus.keys())
             p1_key, p2_key = normalize_player_name(p1), normalize_player_name(p2)
 
-            # Elo & form lookup
             p1_e = ref[ref["name_key"] == p1_key]["elo"]
             p2_e = ref[ref["name_key"] == p2_key]["elo"]
             p1_f = ref[ref["name_key"] == p1_key]["form"]
@@ -292,78 +301,72 @@ def main():
                         srv1 = float(s1["srv"].iloc[0]) + float(s1["ret"].iloc[0]) * 0.5
                     if not s2.empty:
                         srv2 = float(s2["srv"].iloc[0]) + float(s2["ret"].iloc[0]) * 0.5
-                p_model = model_prob_from_elo(float(p1_e.iloc[0]), float(p2_e.iloc[0]),
-                                              float(p1_f.iloc[0]), float(p2_f.iloc[0]),
-                                              srv1, srv2)
+                p_model = sigmoid(0.004 * (float(p1_e.iloc[0]) - float(p2_e.iloc[0])))  # base
+                if not p1_f.empty and not p2_f.empty:
+                    p_model = min(max(p_model + 0.05 * (float(p1_f.iloc[0]) - float(p2_f.iloc[0])) , 1e-4), 1-1e-4)
+                p_model = min(max(p_model + 0.05 * (srv1 - srv2) , 1e-4), 1-1e-4)
 
-            # Blend, EV, Kelly
             p_mkt_1 = consensus[p1]
-            p_blend_1 = blended_prob(p_mkt_1, p_model, args.market_weight, args.model_weight) if p_model is not None else p_mkt_1
+            p_blend_1 = sigmoid(0.6 * logit(p_mkt_1) + 0.4 * logit(p_model)) if p_model is not None else p_mkt_1
             p_blend_2 = 1.0 - p_blend_1
             best1, best2 = best_price.get(p1, 0.0), best_price.get(p2, 0.0)
 
             ev1 = best1 * p_blend_1 - (1 - p_blend_1) if best1 > 0 else None
             ev2 = best2 * p_blend_2 - (1 - p_blend_2) if best2 > 0 else None
-            f1 = kelly_fraction(p_blend_1, best1, args.kelly) if best1 > 0 else 0.0
-            f2 = kelly_fraction(p_blend_2, best2, args.kelly) if best2 > 0 else 0.0
+            def kelly(p, o): 
+                b = max(0.0, o-1.0); q = 1.0-p
+                return max(0.0, min(0.25, ((b*p)-q)/b if b>0 else 0.0))
+            f1, f2 = kelly(p_blend_1, best1), kelly(p_blend_2, best2)
 
             def conf(p_mkt, p_mod):
-                if p_mod is None:
-                    return 50
-                d = abs(p_mkt - p_mod)
-                return int(max(10, min(95, 70 - 100 * d)))
-
-            confidence = conf(p_mkt_1, p_model)
+                if p_mod is None: return 50
+                d = abs(p_mkt - p_mod); return int(max(10, min(95, 70 - 100*d)))
 
             rows.append({
                 "tour": tour, "surface": surface, "event_id": ev.get("id"),
                 "commence_time_utc": dt.isoformat(),
                 "player": p1, "opponent": p2,
-                "market_prob": round(p_mkt_1, 4),
-                "model_prob": round(p_model, 4) if p_model is not None else None,
-                "blended_prob": round(p_blend_1, 4),
-                "best_odds": round(best1, 3),
-                "ev_per_unit": round(ev1, 4) if ev1 is not None else None,
-                "kelly_fraction": round(f1, 4), "confidence": confidence
+                "market_prob": round(p_mkt_1,4),
+                "model_prob": round(p_model,4) if p_model is not None else None,
+                "blended_prob": round(p_blend_1,4),
+                "best_odds": round(best1,3),
+                "ev_per_unit": round(ev1,4) if ev1 is not None else None,
+                "kelly_fraction": round(f1,4), "confidence": conf(p_mkt_1, p_model)
             })
             rows.append({
                 "tour": tour, "surface": surface, "event_id": ev.get("id"),
                 "commence_time_utc": dt.isoformat(),
                 "player": p2, "opponent": p1,
-                "market_prob": round(1.0 - p_mkt_1, 4),
-                "model_prob": round(1.0 - p_model, 4) if p_model is not None else None,
-                "blended_prob": round(p_blend_2, 4),
-                "best_odds": round(best2, 3),
-                "ev_per_unit": round(ev2, 4) if ev2 is not None else None,
-                "kelly_fraction": round(f2, 4), "confidence": confidence
+                "market_prob": round(1.0-p_mkt_1,4),
+                "model_prob": round(1.0-p_model,4) if p_model is not None else None,
+                "blended_prob": round(p_blend_2,4),
+                "best_odds": round(best2,3),
+                "ev_per_unit": round(ev2,4) if ev2 is not None else None,
+                "kelly_fraction": round(f2,4), "confidence": conf(p_mkt_1, p_model)
             })
 
-    # ----- ALWAYS write a CSV to repo root -----
     out_path = args.out or f"value_picks_pro_{datetime.utcnow().strftime('%Y%m%d')}.csv"
     if not rows:
-        df = pd.DataFrame(columns=[
+        pd.DataFrame(columns=[
             "tour","surface","event_id","commence_time_utc","player","opponent",
             "market_prob","model_prob","blended_prob","best_odds",
             "ev_per_unit","kelly_fraction","confidence"
-        ])
-        df.to_csv(out_path, index=False)
+        ]).to_csv(out_path, index=False)
         print(f"No qualifying events in the next {args.lookahead_h}h. Wrote empty CSV to {out_path}.")
         return
 
     df = pd.DataFrame(rows)
-
-    # Picks (top lines printed to logs)
-    favs = df[df["blended_prob"] >= args.min_fav].sort_values(["ev_per_unit", "confidence"], ascending=False)
-    dogs = df[df["blended_prob"] <= args.max_dog].sort_values(["ev_per_unit", "confidence"], ascending=False)
+    favs = df[df["blended_prob"] >= args.min_fav].sort_values(["ev_per_unit","confidence"], ascending=False)
+    dogs = df[df["blended_prob"] <= args.max_dog].sort_values(["ev_per_unit","confidence"], ascending=False)
     def top_row(dfi): return dfi.head(1).to_dict(orient="records")
 
     picks = {
         "favorite_overall": top_row(favs),
         "underdog_overall": top_row(dogs),
-        "ATP_favorite": top_row(favs[favs["tour"] == "ATP"]),
-        "ATP_underdog": top_row(dogs[dogs["tour"] == "ATP"]),
-        "WTA_favorite": top_row(favs[favs["tour"] == "WTA"]),
-        "WTA_underdog": top_row(dogs[dogs["tour"] == "WTA"]),
+        "ATP_favorite": top_row(favs[favs["tour"]=="ATP"]),
+        "ATP_underdog": top_row(dogs[dogs["tour"]=="ATP"]),
+        "WTA_favorite": top_row(favs[favs["tour"]=="WTA"]),
+        "WTA_underdog": top_row(dogs[dogs["tour"]=="WTA"]),
     }
 
     df.to_csv(out_path, index=False)
