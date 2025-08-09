@@ -158,4 +158,30 @@ def kelly_fraction(p: float, odds: float, cap: float) -> float:
     f = ((b*p) - q) / b if b>0 else 0.0
     return max(0.0, min(cap, f))
 
-def build_surface_map(path: Optional[str]) -> Dict[str,str]:
+def build_surface_map(path: Optional[str]) -> Dict[str, str]:
+    if not path or not os.path.exists(path):
+        # Minimal defaults; extend as needed
+        return {
+            "wimbledon": "grass",
+            "roland garros": "clay",
+            "french open": "clay",
+            "madrid": "clay",
+            "rome": "clay",
+            "monte-carlo": "clay",
+            "australian open": "hard",
+            "us open": "hard",
+            "indian wells": "hard",
+            "miami": "hard",
+            "cincinnati": "hard",
+            "toronto": "hard",
+            "montreal": "hard",
+            "washington": "hard",
+            "queens": "grass",
+            "halle": "grass",
+            "stuttgart": "grass",
+            "eastbourne": "grass",
+        }
+    with open(path, "r", encoding="utf-8") as f:
+        m = json.load(f)
+        return {k.lower(): v.lower() for k, v in m.items()}
+
