@@ -6,6 +6,10 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [eu, uk, us]
 
     steps:
       - name: Checkout repository
@@ -19,20 +23,22 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests
 
-      # >>> THIS passes your repo secret to the script <<<
-      - name: Run tennis picks script
+      - name: Run picks (region=${{ matrix.region }})
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python tennis_value_picks_pro.py \
-            --region eu \
+            --region ${{ matrix.region }} \
             --market-weight 0.6 \
             --model-weight 0.4 \
             --kelly 0.25 \
-            --lookahead-h 72
+            --lookahead-h 120 > run_${{ matrix.region }}.txt
+          # Add top-line summary to the job summary
+          echo "### Region: ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
+          grep -E "Top Favorite|Top Underdog|ATP Favorite|ATP Underdog|WTA Favorite|WTA Underdog|No qualifying events" run_${{ matrix.region }}.txt || true
 
-      - name: Upload results (CSV artifact)
+      - name: Upload CSV artifact (region=${{ matrix.region }})
         uses: actions/upload-artifact@v4
         with:
-          name: tennis-picks
+          name: picks-${{ matrix.region }}
           path: value_picks_pro_*.csv
