@@ -2,9 +2,8 @@ name: Daily Tennis Picks
 
 on:
   workflow_dispatch:
-  # Uncomment to run daily at 07:00 UTC:
   # schedule:
-  #   - cron: "0 7 * * *"
+  #   - cron: "0 7 * * *"  # uncomment to run daily 07:00 UTC
 
 jobs:
   run:
@@ -26,14 +25,6 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests
 
-      # Sanity check the provider (optional but helpful)
-      - name: Debug Odds API (sample ATP odds EU)
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: |
-          curl -s "https://api.the-odds-api.com/v4/sports/tennis_atp/odds?apiKey=${ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal" | head -c 2000 || true
-          echo
-
       - name: Run model (region=${{ matrix.region }})
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -48,7 +39,7 @@ jobs:
       - name: Summary (region=${{ matrix.region }})
         run: |
           echo "### Region: ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
-          grep -E "Top Favorite|Top Underdog|ATP Favorite|ATP Underdog|WTA Favorite|WTA Underdog|No qualifying events" run_${{ matrix.region }}.txt || echo "No picks."
+          grep -E "Top Favorite|Top Underdog|ATP Favorite|ATP Underdog|WTA Favorite|WTA Underdog|No active ATP/WTA sport keys|No qualifying events" run_${{ matrix.region }}.txt || echo "No picks."
 
       - name: Upload artifacts (region=${{ matrix.region }})
         uses: actions/upload-artifact@v4
