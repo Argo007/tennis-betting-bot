@@ -1,86 +1,162 @@
-name: Daily Basketball Picks
+name: Basketball Picks (TEST — NBA + EuroLeague)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}   # run manually any time
 
 jobs:
-  build:
+  picks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-      - name: Install dependencies
-        run: pip install pandas requests
+          python-version: "3.11"
 
-      - name: Fetch NBA and EuroLeague Data
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Print NBA & EuroLeague shortlists (TEST)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
-          import requests, pandas as pd
-          from datetime import datetime, timedelta
+          import os, math, requests, pandas as pd
 
-          ODDS_API_KEY = "${{ secrets.ODDS_API_KEY }}"
+          API_KEY = os.getenv("ODDS_API_KEY")
+          if not API_KEY:
+              raise SystemExit("ERROR: Missing ODDS_API_KEY secret.")
 
-          def fetch_odds(sport):
-              url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds"
-              params = {
-                  'apiKey': ODDS_API_KEY,
-                  'regions': 'eu,us',
-                  'markets': 'h2h',
-                  'oddsFormat': 'decimal'
-              }
-              r = requests.get(url, params=params)
+          REGION = "eu"  # add ",us" if you want US books too
+
+          # Basketball bands (conservative)
+          FAV_MIN, FAV_MAX = 1.30, 1.80
+          DOG_MIN, DOG_MAX = 2.20, 4.50
+          MIN_KELLY = 0.01
+          KELLY_CAP = 0.25
+
+          def implied_prob(odds):
+            o = float(odds); return 1.0/o if o>1.0 else None
+
+          def ev_kelly(p, o):
+            o=float(o); ev = o*p - (1-p)
+            b = o-1.0
+            k = ((b*p)-(1-p))/b if b>0 else 0.0
+            return ev, max(0.0, min(KELLY_CAP, k))
+
+          def fetch_odds(sport_key):
+            url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+            params = {"apiKey": API_KEY, "regions": REGION, "markets": "h2h", "oddsFormat": "decimal"}
+            try:
+              r = requests.get(url, params=params, timeout=30)
+              if r.status_code == 404:
+                return []
               r.raise_for_status()
               return r.json()
+            except Exception:
+              return []
 
-          sports = {
-              'nba': 'basketball_nba',
-              'euroleague': 'basketball_euroleague'
-          }
+          def build_rows(sport_key, league):
+            events = fetch_odds(sport_key)
+            rows = []
+            for ev in events:
+              home, away = ev.get("home_team"), ev.get("away_team")
+              if not home or not away: continue
+              probs, best = {}, {}
+              for bk in ev.get("bookmakers", []):
+                for m in bk.get("markets", []):
+                  if m.get("key") != "h2h": continue
+                  for oc in m.get("outcomes", []):
+                    nm, price = oc.get("name"), oc.get("price")
+                    if not nm or not price: continue
+                    ip = implied_prob(price)
+                    if ip is None: continue
+                    probs.setdefault(nm, []).append(ip)
+                    best[nm] = max(best.get(nm, 0.0), float(price))
+              if home not in probs or away not in probs: 
+                continue
 
-          games = []
-          for league, sport_key in sports.items():
-              data = fetch_odds(sport_key)
-              for g in data:
-                  if len(g['bookmakers']) == 0: 
-                      continue
-                  odds_data = g['bookmakers'][0]['markets'][0]['outcomes']
-                  if len(odds_data) != 2:
-                      continue
-                  games.append({
-                      'league': league.upper(),
-                      'home': odds_data[0]['name'],
-                      'away': odds_data[1]['name'],
-                      'home_odds': odds_data[0]['price'],
-                      'away_odds': odds_data[1]['price'],
-                      'commence_time': g['commence_time']
-                  })
+              # consensus then renormalize
+              avg = {k: sum(v)/len(v) for k,v in probs.items()}
+              s = sum(avg.values())
+              if s>0: avg = {k:v/s for k,v in avg.items()}
 
-          df = pd.DataFrame(games)
+              for team, opp in [(home,away),(away,home)]:
+                p = avg.get(team); o = best.get(team, 0.0)
+                if not p or o<=1.0: continue
+                evu, k = ev_kelly(p, o)
+                rows.append({
+                  "league": league,
+                  "commence_time_utc": ev.get("commence_time"),
+                  "team": team,
+                  "opponent": opp,
+                  "best_odds": o,
+                  "blended_prob": p,
+                  "ev_per_unit": evu,
+                  "kelly_fraction": k
+                })
+            return rows
 
-          # Apply logic: underdogs and safe favorites
-          def shortlist(df, min_odds, max_odds):
-              return df[((df['home_odds'] >= min_odds) & (df['home_odds'] <= max_odds)) |
-                        ((df['away_odds'] >= min_odds) & (df['away_odds'] <= max_odds))]
+          all_rows = []
+          all_rows += build_rows("basketball_nba", "NBA")
+          all_rows += build_rows("basketball_euroleague", "EuroLeague")
 
-          underdogs = shortlist(df, 2.20, 4.50)
-          favorites = shortlist(df, 1.30, 1.80)
+          # If no live games (off-season), generate a tiny DEMO so you can see the layout
+          if not all_rows:
+            demo = [
+              {"league":"NBA","commence_time_utc":"DEMO","team":"Lakers","opponent":"Warriors","best_odds":1.55,"blended_prob":0.68,"ev_per_unit":1.55*0.68-(1-0.68),"kelly_fraction":((1.55-1)*0.68-(1-0.68))/(1.55-1)},
+              {"league":"NBA","commence_time_utc":"DEMO","team":"Knicks","opponent":"Celtics","best_odds":2.75,"blended_prob":0.42,"ev_per_unit":2.75*0.42-(1-0.42),"kelly_fraction":((2.75-1)*0.42-(1-0.42))/(2.75-1)},
+              {"league":"EuroLeague","commence_time_utc":"DEMO","team":"Real Madrid","opponent":"Barcelona","best_odds":1.65,"blended_prob":0.66,"ev_per_unit":1.65*0.66-(1-0.66),"kelly_fraction":((1.65-1)*0.66-(1-0.66))/(1.65-1)},
+              {"league":"EuroLeague","commence_time_utc":"DEMO","team":"Partizan","opponent":"Olympiacos","best_odds":3.10,"blended_prob":0.37,"ev_per_unit":3.10*0.37-(1-0.37),"kelly_fraction":((3.10-1)*0.37-(1-0.37))/(3.10-1)},
+            ]
+            all_rows = demo
 
-          with open("basketball_picks.md", "w") as f:
-              f.write("## NBA Smart Underdogs (Top 2)\n")
-              f.write(underdogs[underdogs['league'] == 'NBA'].head(2).to_string(index=False) or "None")
-              f.write("\n\n## NBA Safe High-Value Favorite (Top 1)\n")
-              f.write(favorites[favorites['league'] == 'NBA'].head(1).to_string(index=False) or "None")
-              f.write("\n\n## EuroLeague Smart Underdogs (Top 2)\n")
-              f.write(underdogs[underdogs['league'] == 'EUROLEAGUE'].head(2).to_string(index=False) or "None")
-              f.write("\n\n## EuroLeague Safe High-Value Favorite (Top 1)\n")
-              f.write(favorites[favorites['league'] == 'EUROLEAGUE'].head(1).to_string(index=False) or "None")
+          df = pd.DataFrame(all_rows)
+          for c in ["best_odds","blended_prob","ev_per_unit","kelly_fraction"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+          # Dedup per match (keep higher EV)
+          def mid(a,b): return " :: ".join(sorted([str(a),str(b)]))
+          df["match_id"] = df.apply(lambda r: mid(r["team"], r["opponent"]), axis=1)
+          df = df.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
+
+          def shortlist(sub, lo, hi):
+            return sub[(sub["ev_per_unit"]>0) &
+                       (sub["best_odds"].between(lo, hi)) &
+                       (sub["kelly_fraction"]>=MIN_KELLY)] \
+                     .sort_values(["ev_per_unit","blended_prob"], ascending=False)
+
+          def section(league):
+            sub = df[df["league"]==league].copy()
+            favs = shortlist(sub, FAV_MIN, FAV_MAX)
+            dogs = shortlist(sub, DOG_MIN, DOG_MAX)
+
+            def star(lbl, d):
+              if d.empty: return f"**🏆 {lbl}:** _None_"
+              r = d.iloc[0]
+              return f"**🏆 {lbl}:** {r['team']} vs {r['opponent']} @ {r['best_odds']:.2f} (p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, Kelly={r['kelly_fraction']:.2f})"
+
+            def md_table(d):
+              if d.empty: return "_None_"
+              cols = ["commence_time_utc","team","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
+              d = d[cols].round({"best_odds":2,"blended_prob":2,"ev_per_unit":2,"kelly_fraction":2})
+              head = "| " + " | ".join(cols) + " |\n|" + " | ".join(["---"]*len(cols)) + "|\n"
+              body = "\n".join("| " + " | ".join(map(str,row)) + " |" for row in d.values)
+              return head + body
+
+            out = []
+            out.append(f"## {league} Picks (TEST)")
+            out.append(star("Top Favorite", favs))
+            out.append(star("Top Underdog", dogs))
+            out.append("\n**Favorites (EV-sorted)**\n"); out.append(md_table(favs))
+            out.append("\n**Underdogs (EV-sorted)**\n"); out.append(md_table(dogs))
+            out.append("")
+            return "\n".join(out)
+
+          summary = "\n\n".join([section("NBA"), section("EuroLeague")])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write(summary)
           PY
-
-      - name: Upload Picks Summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: basketball-picks
-          path: basketball_picks.md
