@@ -1,14 +1,13 @@
-name: Daily Basketball Picks (NBA & EuroLeague)
+name: Daily Basketball Picks (NBA, WNBA, EuroLeague)
 
 on:
   schedule:
-    - cron: "0 8 * * *"    # runs daily at 08:00 UTC
+    - cron: "0 8 * * *"   # daily at 08:00 UTC
   workflow_dispatch: {}
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,73 +17,72 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (inline)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests
 
-      # ---------------- NBA ELO (from Basketball-Reference CSVs) ----------------
-      - name: Download NBA results (last 2 seasons)
-        run: |
-          mkdir -p nba_games
-          curl -fSL -o nba_games/NBA_2024_games.csv https://www.basketball-reference.com/leagues/NBA_2024_games.csv || true
-          curl -fSL -o nba_games/NBA_2025_games.csv https://www.basketball-reference.com/leagues/NBA_2025_games.csv || true
-          ls -l nba_games || true
-
-      - name: Build NBA team Elo
+      # ---------------- NBA Elo (balldontlie API) ----------------
+      - name: Build NBA team Elo (balldontlie API, last 2 seasons)
         run: |
           python - <<'PY'
-          import pandas as pd, glob, math
+          import requests, pandas as pd, math, time
 
           START_ELO = 1500.0
           K = 20.0
           HOME_BONUS = 60.0
+          SEASONS = [2023, 2024]   # update as new seasons start
+          BASE = "https://www.balldontlie.io/api/v1/games"
 
-          def expected(a,b): return 1.0/(1.0+10.0**((b-a)/400.0))
-          def mov_mult(m): return 1.0 + min(10.0, abs(m)) * 0.02
+          def expected(a,b): return 1.0/(1.0 + 10.0**((b-a)/400.0))
+          def mov_mult(m): return 1.0 + min(10.0, abs(m))*0.02
 
-          files = sorted(glob.glob("nba_games/NBA_*_games.csv"))
-          if not files:
-              pd.DataFrame({"team": [], "elo": []}).to_csv("data_nba_elo.csv", index=False)
-              print("WARN: no NBA logs found; wrote empty Elo.")
-              raise SystemExit(0)
+          def fetch_games(season):
+              games=[]; page=1
+              while True:
+                  r = requests.get(BASE, params={"seasons[]": season, "per_page": 100, "page": page}, timeout=30)
+                  r.raise_for_status()
+                  j = r.json()
+                  data = j.get("data", [])
+                  if not data: break
+                  games.extend(data)
+                  if page >= j.get("meta", {}).get("total_pages", 1): break
+                  page += 1
+                  time.sleep(0.2)
+              return games
 
           elos = {}
-          for fp in files:
-              df = pd.read_csv(fp)
-              v_col = next(c for c in df.columns if c.lower().startswith("visitor"))
-              h_col = next(c for c in df.columns if c.lower().startswith("home"))
-              pts_cols = [c for c in df.columns if c.lower().startswith("pts")]
-              vp_col, hp_col = pts_cols[0], pts_cols[1]
+          for season in SEASONS:
+              for g in fetch_games(season):
+                  home = g["home_team"]["full_name"]
+                  away = g["visitor_team"]["full_name"]
+                  hs   = g["home_team_score"]
+                  as_  = g["visitor_team_score"]
+                  if hs is None or as_ is None: continue
 
-              for _, r in df.dropna(subset=[v_col,h_col,vp_col,hp_col]).iterrows():
-                  away, home = str(r[v_col]).strip(), str(r[h_col]).strip()
-                  ap, hp = float(r[vp_col]), float(r[hp_col])
-                  aE, hE = elos.get(away, START_ELO), elos.get(home, START_ELO)
+                  hE = elos.get(home, START_ELO)
+                  aE = elos.get(away, START_ELO)
 
-                  pa = expected(aE, hE + HOME_BONUS)
                   ph = expected(hE + HOME_BONUS, aE)
+                  pa = 1.0 - ph
 
-                  if hp > ap:
-                      m = mov_mult(hp - ap)
-                      hE += K*m*(1.0 - ph)
-                      aE += K*m*(0.0 - pa)
-                  elif ap > hp:
-                      m = mov_mult(ap - hp)
-                      aE += K*m*(1.0 - pa)
-                      hE += K*m*(0.0 - ph)
+                  if hs > as_:
+                      m = mov_mult(hs - as_)
+                      hE += K*m*(1.0 - ph); aE += K*m*(0.0 - pa)
+                  elif as_ > hs:
+                      m = mov_mult(as_ - hs)
+                      aE += K*m*(1.0 - pa); hE += K*m*(0.0 - ph)
                   else:
-                      hE += K*(0.5 - ph)
-                      aE += K*(0.5 - pa)
+                      hE += K*(0.5 - ph); aE += K*(0.5 - pa)
 
-                  elos[home], elos[away] = hE, aE
+                  elos[home] = hE; elos[away] = aE
 
-          pd.DataFrame([{"team":t,"elo":e} for t,e in elos.items()]) \
-            .sort_values("elo", ascending=False).to_csv("data_nba_elo.csv", index=False)
-          print("✅ NBA Elo built.")
+          pd.DataFrame([{"team":t,"elo":e} for t,e in elos.items()]).sort_values("elo", ascending=False) \
+            .to_csv("data_nba_elo.csv", index=False)
+          print("✅ NBA Elo built from balldontlie. Teams:", len(elos))
           PY
 
-      # ---------------- EUROLEAGUE ELO (live API → results → Elo) ----------------
+      # ---------------- EuroLeague Elo (live API with fallback) ----------------
       - name: Build EuroLeague team Elo (auto-fetch)
         run: |
           python - <<'PY'
@@ -93,89 +91,65 @@ jobs:
           START_ELO = 1500.0
           K = 18.0
           HOME_BONUS = 50.0
-
-          # Seasons to include (EuroLeague season codes use the start year)
-          seasons = [2023, 2024]  # E2023, E2024
+          seasons = [2023, 2024]   # season codes E2023, E2024
 
           def expected(a,b): return 1.0/(1.0+10.0**((b-a)/400.0))
           def mov_mult(m): return 1.0 + min(10.0, abs(m)) * 0.02
 
           elos = {}
 
-          def upd(team, val): 
-              elos[team] = val
-
           def get_schedule(season):
-              # EuroLeague live swagger exists; endpoints can differ by season/deploy.
-              # Try a schedules endpoint first; if it fails, fallback to standings (no Elo update).
               base = "https://api-live.euroleague.net/v1"
-              urls = [
-                  f"{base}/schedules?seasoncode=E{season}",
-                  f"{base}/games?seasoncode=E{season}",
-              ]
-              for url in urls:
+              for url in (f"{base}/schedules?seasoncode=E{season}",
+                          f"{base}/games?seasoncode=E{season}"):
                   try:
                       r = requests.get(url, timeout=30)
                       if r.status_code == 200:
                           j = r.json()
-                          if isinstance(j, dict) and "Data" in j: 
-                              return j.get("Data")
-                          if isinstance(j, list):
-                              return j
+                          if isinstance(j, dict) and "Data" in j: return j["Data"]
+                          if isinstance(j, list): return j
                   except Exception:
                       pass
               return []
 
           for season in seasons:
-              games = get_schedule(season)
-              # We expect entries to have team names & scores; handle common key variants.
-              for g in games:
-                  home = g.get("HomeTeam") or g.get("Home") or g.get("HomeTeamName") or g.get("HomeClubName")
-                  away = g.get("AwayTeam") or g.get("Away") or g.get("AwayTeamName") or g.get("AwayClubName")
-                  hs = g.get("HomeScore") or g.get("HomeScoreFinal") or g.get("ScoreHome") or g.get("Home")
-                  as_ = g.get("AwayScore") or g.get("AwayScoreFinal") or g.get("ScoreAway") or g.get("Away")
-
-                  # sanitize
+              for g in get_schedule(season):
+                  home = g.get("HomeTeam") or g.get("HomeTeamName") or g.get("HomeClubName")
+                  away = g.get("AwayTeam") or g.get("AwayTeamName") or g.get("AwayClubName")
+                  hs   = g.get("HomeScore") or g.get("HomeScoreFinal") or g.get("ScoreHome")
+                  as_  = g.get("AwayScore") or g.get("AwayScoreFinal") or g.get("ScoreAway")
                   try:
-                      if home and away and hs is not None and as_ is not None:
-                          hs = float(hs); as_ = float(as_)
-                      else:
-                          continue
+                      if not(home and away): continue
+                      hs = float(hs); as_ = float(as_)
                   except Exception:
                       continue
 
-                  hE = elos.get(home, START_ELO)
-                  aE = elos.get(away, START_ELO)
-                  ph = expected(hE + HOME_BONUS, aE)
-                  pa = 1.0 - ph
+                  hE = elos.get(home, START_ELO); aE = elos.get(away, START_ELO)
+                  ph = expected(hE + HOME_BONUS, aE); pa = 1.0 - ph
 
                   if hs > as_:
                       m = mov_mult(hs - as_)
-                      hE += K*m*(1.0 - ph)
-                      aE += K*m*(0.0 - pa)
+                      hE += K*m*(1.0 - ph); aE += K*m*(0.0 - pa)
                   elif as_ > hs:
                       m = mov_mult(as_ - hs)
-                      aE += K*m*(1.0 - pa)
-                      hE += K*m*(0.0 - ph)
+                      aE += K*m*(1.0 - pa); hE += K*m*(0.0 - ph)
                   else:
-                      hE += K*(0.5 - ph)
-                      aE += K*(0.5 - pa)
+                      hE += K*(0.5 - ph); aE += K*(0.5 - pa)
 
-                  upd(home, hE); upd(away, aE)
+                  elos[home] = hE; elos[away] = aE
 
           if not elos:
-              # Fallback: placeholder Elo (keeps workflow alive even if API schema changes)
               teams = ["Real Madrid","FC Barcelona","Olympiacos","Panathinaikos","Fenerbahce",
                        "Anadolu Efes","Partizan","Virtus Bologna","Monaco","Maccabi Tel Aviv"]
               elos = {t: START_ELO for t in teams}
 
-          pd.DataFrame([{"team":t,"elo":e} for t,e in elos.items()]) \
-            .sort_values("elo", ascending=False).to_csv("data_euro_elo.csv", index=False)
-          print("✅ EuroLeague Elo built.")
+          pd.DataFrame([{"team":t,"elo":e} for t,e in elos.items()]).sort_values("elo", ascending=False) \
+            .to_csv("data_euro_elo.csv", index=False)
+          print("✅ EuroLeague Elo built. Teams:", len(elos))
           PY
 
-      # ---------------- ODDS → BLEND → EV/KELLY → SHORTLIST ----------------
-      - name: NBA & EuroLeague Shortlists (2 Dogs + 1 Favorite per league)
+      # ---------------- Odds → Blend → EV/Kelly → Shortlists ----------------
+      - name: Basketball Shortlists (WNBA, NBA, EuroLeague)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
@@ -189,45 +163,45 @@ jobs:
           MARKET_W = 0.6
           MODEL_W  = 0.4
           KELLY_CAP = 0.25
-          HOME_BONUS = 60.0   # use a little home edge for NBA; EuroLeague baked into Elo
+          NBA_HOME_BONUS = 60.0
 
-          def logit(p): 
-              p = min(max(float(p),1e-6),1-1e-6); 
-              return math.log(p/(1-p))
+          def logit(p): p=min(max(float(p),1e-6),1-1e-6); return math.log(p/(1-p))
           def sigmoid(x): return 1.0/(1.0+math.exp(-x))
-          def implied_prob(odds): 
-              o = float(odds); 
-              return 1.0/o if o>1.0 else None
-          def ev_kelly(p, o):
+          def implied_prob(odds): o=float(odds); return 1.0/o if o>1.0 else None
+          def ev_kelly(p,o):
               ev = o*p - (1-p)
               b = o-1
               k = ((b*p)-(1-p))/b if b>0 else 0.0
               return ev, max(0.0, min(KELLY_CAP, k))
 
-          def league_shortlist(sport_key, elo_csv, league_name, add_home_bonus=False):
-              elo = pd.read_csv(elo_csv)
-              elo["key"] = elo["team"].str.lower()
+          def league_shortlist(sport_key, elo_csv, league_name, add_home_bonus=False, start_elo=1500.0):
+              # Elo may be empty or missing teams; we’ll default to START_ELO so we never drop games.
+              if os.path.exists(elo_csv):
+                  elo = pd.read_csv(elo_csv)
+              else:
+                  elo = pd.DataFrame(columns=["team","elo"])
+              elo["key"] = elo["team"].astype(str).str.lower()
 
               url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
               params = {"apiKey": API_KEY, "regions": REGION, "markets": "h2h", "oddsFormat": "decimal"}
-              r = requests.get(url, params=params, timeout=30)
-              r.raise_for_status()
-              events = r.json()
+              try:
+                  r = requests.get(url, params=params, timeout=30)
+                  r.raise_for_status()
+                  events = r.json()
+              except Exception as e:
+                  return f"## {league_name}\n_API error: {e}_\n"
 
               rows=[]
               for ev in events:
                   home, away = ev.get("home_team"), ev.get("away_team")
                   if not home or not away: continue
 
-                  he = elo.loc[elo["key"]==home.lower(), "elo"]
-                  ae = elo.loc[elo["key"]==away.lower(), "elo"]
-                  if he.empty or ae.empty: 
-                      # team naming mismatch; skip
-                      continue
-                  helo, aelo = float(he.iloc[0]), float(ae.iloc[0])
+                  he = elo.loc[elo["key"]==str(home).lower(), "elo"]
+                  ae = elo.loc[elo["key"]==str(away).lower(), "elo"]
+                  helo = float(he.iloc[0]) if not he.empty else start_elo
+                  aelo = float(ae.iloc[0]) if not ae.empty else start_elo
 
-                  # market probs + best odds
-                  probs = {}; best={}
+                  probs={}; best={}
                   for b in ev.get("bookmakers", []):
                       for m in b.get("markets", []):
                           if m.get("key") != "h2h": continue
@@ -245,12 +219,10 @@ jobs:
                   home_mkt = sum(probs[home])/len(probs[home])
                   away_mkt = sum(probs[away])/len(probs[away])
 
-                  # model probability from Elo
-                  diff = (helo + (HOME_BONUS if add_home_bonus else 0.0)) - aelo
+                  diff = (helo + (NBA_HOME_BONUS if add_home_bonus else 0.0)) - aelo
                   p_home_model = sigmoid(diff * 0.004)
                   p_away_model = 1.0 - p_home_model
 
-                  # blended
                   p_home = sigmoid(MARKET_W*logit(home_mkt) + MODEL_W*logit(p_home_model))
                   p_away = 1.0 - p_home
 
@@ -266,16 +238,13 @@ jobs:
               if df.empty:
                   return f"## {league_name}\n_No games/picks right now_\n"
 
-              # numeric safety
               for c in ["best_odds","blended_prob","ev_per_unit","kelly_fraction"]:
                   df[c] = pd.to_numeric(df[c], errors="coerce")
               df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob"])
 
-              # pick one side per game
               df["match_id"] = df.apply(lambda r: " :: ".join(sorted([r["team"], r["opponent"]])), axis=1)
               best_side = df.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
 
-              # shortlist rules
               dogs = best_side[(best_side["ev_per_unit"]>0) &
                                (best_side["best_odds"].between(2.20, 4.50)) &
                                (best_side["kelly_fraction"]>=0.01)].sort_values(["ev_per_unit","blended_prob"], ascending=False).head(2)
@@ -293,17 +262,17 @@ jobs:
 
               out = []
               out.append(f"## {league_name} Smart Underdogs (Top 2)")
-              out.append(bullets(dogs))
-              out.append("")
+              out.append(bullets(dogs)); out.append("")
               out.append(f"## {league_name} Safe High-Value Favorite (Top 1)")
-              out.append(bullets(favs))
-              out.append("")
+              out.append(bullets(favs)); out.append("")
               return "\n".join(out)
 
-          summary = []
-          summary.append(league_shortlist("basketball_nba", "data_nba_elo.csv", "NBA", add_home_bonus=True))
-          summary.append(league_shortlist("basketball_euroleague", "data_euro_elo.csv", "EuroLeague", add_home_bonus=False))
+          sections = []
+          # WNBA first (in-season). Elo defaults to neutral if teams aren’t in a file.
+          sections.append(league_shortlist("basketball_wnba", "data_wnba_elo.csv", "WNBA", add_home_bonus=True, start_elo=1500.0))
+          sections.append(league_shortlist("basketball_nba", "data_nba_elo.csv", "NBA", add_home_bonus=True, start_elo=1500.0))
+          sections.append(league_shortlist("basketball_euroleague", "data_euro_elo.csv", "EuroLeague", add_home_bonus=False, start_elo=1500.0))
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("\n".join(summary))
+              f.write("\n".join(sections))
           PY
