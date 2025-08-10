@@ -1,8 +1,8 @@
-name: Daily Tennis Picks (ATP + WTA)
+name: Daily Basketball Picks (NBA + EuroLeague)
 
 on:
   schedule:
-    - cron: "0 8 * * *"       # 08:00 UTC daily
+    - cron: "0 8 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -30,21 +30,19 @@ jobs:
           key = os.getenv("ODDS_API_KEY")
           now = dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
           to  = (dt.datetime.utcnow()+dt.timedelta(hours=72)).replace(microsecond=0).isoformat()+"Z"
-          def ping(sport):
+          for s in ("basketball_nba","basketball_euroleague"):
               r = requests.get(
-                  f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
+                  f"https://api.the-odds-api.com/v4/sports/{s}/odds",
                   params={"apiKey":key,"regions":"eu,us","markets":"h2h","oddsFormat":"decimal",
                           "commenceTimeFrom":now,"commenceTimeTo":to},
                   timeout=30
               )
-              print(sport, "→", r.status_code, "| events:",
+              print(s, "→", r.status_code, "| events:",
                     (len(r.json()) if r.status_code==200 else "ERR"),
                     "| remaining:", r.headers.get("x-requests-remaining"))
-          for s in ("tennis_atp","tennis_wta"):
-              ping(s)
           PY
 
-      - name: Print ATP/WTA shortlists (72h, EU+US)
+      - name: Print NBA & EuroLeague shortlists (72h, EU+US)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
@@ -55,9 +53,9 @@ jobs:
           if not API: raise SystemExit("Set ODDS_API_KEY in repo secrets.")
           REGIONS="eu,us"
 
-          # Slightly looser for more coverage but still sane
-          FAV_MIN,FAV_MAX=1.28,1.78
-          DOG_MIN,DOG_MAX=2.20,4.00
+          # Basketball bands (a tad wider on dogs)
+          FAV_MIN,FAV_MAX=1.30,1.80
+          DOG_MIN,DOG_MAX=2.10,4.50
           MIN_KELLY=0.01
           KELLY_CAP=0.25
 
@@ -77,7 +75,7 @@ jobs:
               if r.status_code==404: return []
               r.raise_for_status(); return r.json()
 
-          def rows_for(key,tour):
+          def rows_for(key,league):
               rows=[]
               for ev in fetch(key):
                   a,b=ev.get("home_team"),ev.get("away_team")
@@ -97,23 +95,23 @@ jobs:
                   avg={k:sum(v)/len(v) for k,v in probs.items()}
                   s=sum(avg.values()); 
                   if s>0: avg={k:v/s for k,v in avg.items()}
-                  for pl,opp in [(a,b),(b,a)]:
-                      p=avg.get(pl); o=best.get(pl,0.0)
+                  for tm,opp in [(a,b),(b,a)]:
+                      p=avg.get(tm); o=best.get(tm,0.0)
                       if not p or o<=1: continue
                       evu,k=evk(p,o)
-                      rows.append({"tour":tour,"commence_time_utc":ev.get("commence_time"),
-                                   "player":pl,"opponent":opp,"best_odds":o,"blended_prob":p,
+                      rows.append({"league":league,"commence_time_utc":ev.get("commence_time"),
+                                   "team":tm,"opponent":opp,"best_odds":o,"blended_prob":p,
                                    "ev_per_unit":evu,"kelly_fraction":k})
               return rows
 
-          cols=["tour","commence_time_utc","player","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
-          data = rows_for("tennis_atp","ATP") + rows_for("tennis_wta","WTA")
+          cols=["league","commence_time_utc","team","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
+          data = rows_for("basketball_nba","NBA") + rows_for("basketball_euroleague","EuroLeague")
           df = pd.DataFrame(data, columns=cols)
           for c in ["best_odds","blended_prob","ev_per_unit","kelly_fraction"]:
               df[c]=pd.to_numeric(df[c],errors="coerce")
           if not df.empty:
               df=df.dropna(subset=["best_odds","blended_prob","ev_per_unit"])
-              df["match_id"]=df.apply(lambda r:" :: ".join(sorted([str(r['player']),str(r['opponent'])])),axis=1)
+              df["match_id"]=df.apply(lambda r:" :: ".join(sorted([str(r['team']),str(r['opponent'])])),axis=1)
               df=df.sort_values("ev_per_unit",ascending=False).groupby("match_id",as_index=False).head(1)
 
           def shortlist(sub,lo,hi):
@@ -121,23 +119,23 @@ jobs:
               return sub[(sub["ev_per_unit"]>0)&(sub["best_odds"].between(lo,hi))&(sub["kelly_fraction"]>=MIN_KELLY)] \
                       .sort_values(["ev_per_unit","blended_prob"],ascending=False)
 
-          def section(tour):
-              sub=df[df["tour"]==tour].copy()
+          def section(league):
+              sub=df[df["league"]==league].copy()
               favs=shortlist(sub,FAV_MIN,FAV_MAX)
               dogs=shortlist(sub,DOG_MIN,DOG_MAX)
               def star(lbl,d):
                   if d.empty: return f"**🏆 {lbl}:** _None_"
                   r=d.iloc[0]
-                  return f"**🏆 {lbl}:** {r.player} vs {r.opponent} @ {r.best_odds:.2f} (p={r.blended_prob:.2f}, EV/u={r.ev_per_unit:.2f}, Kelly={r.kelly_fraction:.2f})"
+                  return f"**🏆 {lbl}:** {r.team} vs {r.opponent} @ {r.best_odds:.2f} (p={r.blended_prob:.2f}, EV/u={r.ev_per_unit:.2f}, Kelly={r.kelly_fraction:.2f})"
               def table(d):
                   if d.empty: return "_None_"
-                  cols=["commence_time_utc","player","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
+                  cols=["commence_time_utc","team","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
                   d=d[cols].round({"best_odds":2,"blended_prob":2,"ev_per_unit":2,"kelly_fraction":2})
                   head="| "+" | ".join(cols)+" |\n|"+" | ".join(["---"]*len(cols))+"|\n"
                   body="\n".join("| "+" | ".join(map(str,row))+" |" for row in d.values)
                   return head+body
               return "\n".join([
-                  f"## {tour} Picks",
+                  f"## {league} Picks",
                   star("Top Favorite",favs),
                   star("Top Underdog",dogs),
                   "\n**Favorites (EV-sorted)**\n", table(favs),
@@ -145,6 +143,6 @@ jobs:
                   ""
               ])
 
-          summary = "\n\n".join([section("ATP"), section("WTA")])
+          summary = "\n\n".join([section("NBA"), section("EuroLeague")])
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary)
           PY
