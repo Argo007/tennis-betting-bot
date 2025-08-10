@@ -1,13 +1,14 @@
-name: Daily Basketball Picks (NBA + EuroLeague) — OFFICIAL
+name: Daily Basketball Picks (TEST via WNBA -> NBA/EuroLeague)
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "0 8 * * *"      # 08:00 UTC daily
-  workflow_dispatch: {}
+    - cron: "0 8 * * *"   # 08:00 UTC daily
 
 jobs:
   picks:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests
 
-      - name: Print NBA & EuroLeague shortlists (Kelly + Odds)
+      - name: Print TEST picks (WNBA standing in for NBA/EuroLeague)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
@@ -33,9 +34,9 @@ jobs:
           if not API:
               raise SystemExit("ERROR: set ODDS_API_KEY in repo Settings → Secrets → Actions")
 
-          # Config
+          # -------- CONFIG --------
           REGIONS        = "eu,us"
-          LOOKAHEAD_H    = 72
+          LOOKAHEAD_H    = 240  # wider window for test so books show up
           # Official filters
           FAV_MIN, FAV_MAX = 1.25, 1.80
           DOG_MIN, DOG_MAX = 2.20, 4.50
@@ -73,7 +74,7 @@ jobs:
               r.raise_for_status()
               return r.json()
 
-          def rows_for(key, league):
+          def rows_for(key, league_label):
               rows = []
               for ev in fetch(key):
                   home, away = ev.get("home_team"), ev.get("away_team")
@@ -105,7 +106,7 @@ jobs:
                           continue
                       evu, k = ev_kelly(p, o)
                       rows.append({
-                          "league": league,
+                          "league": league_label,
                           "commence_time_utc": ev.get("commence_time"),
                           "team": team,
                           "opponent": opp,
@@ -116,8 +117,14 @@ jobs:
                       })
               return rows
 
-          # Build dataframe
-          data = rows_for("basketball_nba", "NBA") + rows_for("basketball_euroleague", "EuroLeague")
+          # ========= TEMP TEST SOURCE =========
+          # Use WNBA for both sections so you SEE output today.
+          # WHEN DONE TESTING, REVERT THE TWO LINES BELOW TO:
+          #   rows_for("basketball_nba", "NBA")
+          #   rows_for("basketball_euroleague", "EuroLeague")
+          data = rows_for("basketball_wnba", "NBA") + rows_for("basketball_wnba", "EuroLeague")
+          # ====================================
+
           if not data:
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                   f.write("## NBA Picks (OFFICIAL)\n**🏆 Top Favorite:** _None_\n**🏆 Top Underdog:** _None_\n\n**Favorites (EV-sorted)**\n_None_\n\n**Underdogs (EV-sorted)**\n_None_\n\n" +
@@ -129,7 +136,7 @@ jobs:
               df[c] = pd.to_numeric(df[c], errors="coerce")
           df = df.dropna(subset=["best_odds","blended_prob","ev_per_unit"])
 
-          # One side per game (keep higher EV)
+          # one side per game (keep higher EV)
           df["match_id"] = df.apply(lambda r: " :: ".join(sorted([str(r["team"]), str(r["opponent"])])), axis=1)
           df = df.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
 
@@ -177,7 +184,6 @@ jobs:
                   "\n**Underdogs (EV-sorted)**\n", md_table(dogs.head(5)),
               ]
 
-              # Near-misses if nothing official
               if favs.empty or dogs.empty:
                   nm = sub.sort_values("ev_per_unit", ascending=False).head(5)
                   cols = ["commence_time_utc","team","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
