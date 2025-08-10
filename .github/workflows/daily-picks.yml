@@ -1,4 +1,4 @@
-name: Daily Tennis Picks (ATP + WTA, direct print)
+name: Daily Tennis Picks (ATP + WTA)
 
 on:
   schedule:
@@ -29,20 +29,20 @@ jobs:
           python - <<'PY'
           import os, math, requests, pandas as pd
 
+          # --- config ---
           API_KEY = os.getenv("ODDS_API_KEY")
           if not API_KEY:
               raise SystemExit("ERROR: Missing ODDS_API_KEY secret (Repo → Settings → Secrets → Actions).")
 
-          REGION = "eu"  # add ",us" if you want US books too: "eu,us"
-
-          # Kelly-safe odds bands (your choice)
+          REGIONS = "eu,us"          # include more books for depth
           FAV_MIN, FAV_MAX = 1.30, 1.70
           DOG_MIN, DOG_MAX = 2.40, 3.50
           MIN_KELLY = 0.01
           KELLY_CAP = 0.25
+          # ---------------
 
-          def implied_prob(odds):
-              o = float(odds)
+          def implied_prob(o):
+              o = float(o)
               return 1.0/o if o > 1.0 else None
 
           def ev_kelly(p, o):
@@ -54,48 +54,50 @@ jobs:
 
           def fetch_odds(sport_key):
               url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-              params = {"apiKey": API_KEY, "regions": REGION, "markets": "h2h", "oddsFormat": "decimal"}
+              params = {"apiKey": API_KEY, "regions": REGIONS, "markets": "h2h", "oddsFormat": "decimal"}
               r = requests.get(url, params=params, timeout=30)
+              if r.status_code in (401, 402):
+                  raise SystemExit(f"Odds API auth/usage error ({r.status_code}): {r.text}")
               if r.status_code == 404:
                   return []
               r.raise_for_status()
               return r.json()
 
-          def build_rows(sport_key, tour_label):
+          def rows_for(sport_key, tour_label):
               events = fetch_odds(sport_key)
               rows = []
               for ev in events:
-                  p1 = ev.get("home_team"); p2 = ev.get("away_team")
-                  if not p1 or not p2: 
+                  a, b = ev.get("home_team"), ev.get("away_team")
+                  if not a or not b:
                       continue
 
-                  # Aggregate consensus probs & best odds across all books
+                  # Collect consensus probs + best odds across all books
                   probs, best = {}, {}
                   for bk in ev.get("bookmakers", []):
                       for m in bk.get("markets", []):
-                          if m.get("key") != "h2h": 
+                          if m.get("key") != "h2h":
                               continue
                           for oc in m.get("outcomes", []):
-                              name, price = oc.get("name"), oc.get("price")
-                              if not name or not price: 
+                              nm, price = oc.get("name"), oc.get("price")
+                              if not nm or not price:
                                   continue
                               ip = implied_prob(price)
-                              if ip is None: 
+                              if ip is None:
                                   continue
-                              probs.setdefault(name, []).append(ip)
-                              best[name] = max(best.get(name, 0.0), float(price))
+                              probs.setdefault(nm, []).append(ip)
+                              best[nm] = max(best.get(nm, 0.0), float(price))
 
-                  if p1 not in probs or p2 not in probs:
+                  if a not in probs or b not in probs:
                       continue
 
-                  # Consensus (avg) then renormalize
+                  # Consensus (avg) then renormalize to sum 1
                   avg = {k: sum(v)/len(v) for k, v in probs.items()}
                   s = sum(avg.values())
                   if s > 0:
                       avg = {k: v/s for k, v in avg.items()}
 
-                  # Record both sides separately
-                  for player, opp in [(p1, p2), (p2, p1)]:
+                  # Record both sides; we’ll dedup later by EV
+                  for player, opp in [(a, b), (b, a)]:
                       p = avg.get(player)
                       o = best.get(player, 0.0)
                       if not p or o <= 1.0:
@@ -115,30 +117,27 @@ jobs:
 
           # Build combined dataframe for ATP + WTA
           all_rows = []
-          all_rows += build_rows("tennis_atp", "ATP")
-          all_rows += build_rows("tennis_wta", "WTA")
+          all_rows += rows_for("tennis_atp", "ATP")
+          all_rows += rows_for("tennis_wta", "WTA")
 
           if not all_rows:
-              # Nothing scheduled/visible right now
-              summary = "## ATP\n_No matches/picks right now_\n\n## WTA\n_No matches/picks right now_\n"
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-                  f.write(summary)
+                  f.write("## ATP\n_No matches/picks right now_\n\n## WTA\n_No matches/picks right now_\n")
               raise SystemExit(0)
 
           df = pd.DataFrame(all_rows)
-          # Numeric safety
           for c in ["best_odds","blended_prob","ev_per_unit","kelly_fraction"]:
               df[c] = pd.to_numeric(df[c], errors="coerce")
           df = df.dropna(subset=["best_odds","blended_prob","ev_per_unit"])
 
-          # Keep only one side per match when ranking by EV (avoid both players of same match)
+          # One side per match (keep the higher-EV side)
           df["match_id"] = df.apply(lambda r: " :: ".join(sorted([r["player"], r["opponent"]])), axis=1)
           df = df.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).head(1)
 
-          def shortlist(sub, odds_min, odds_max):
+          def shortlist(sub, lo, hi):
               return sub[
                   (sub["ev_per_unit"] > 0) &
-                  (sub["best_odds"].between(odds_min, odds_max)) &
+                  (sub["best_odds"].between(lo, hi)) &
                   (sub["kelly_fraction"] >= MIN_KELLY)
               ].sort_values(["ev_per_unit","blended_prob"], ascending=False)
 
@@ -147,10 +146,9 @@ jobs:
               favs = shortlist(sub, FAV_MIN, FAV_MAX)
               dogs = shortlist(sub, DOG_MIN, DOG_MAX)
 
-              # Top picks (🏆) + tables (sorted by EV already)
-              def star_line(label, data):
-                  if data.empty: return f"**🏆 {label}:** _None_"
-                  r = data.iloc[0]
+              def star(label, d):
+                  if d.empty: return f"**🏆 {label}:** _None_"
+                  r = d.iloc[0]
                   return (f"**🏆 {label}:** {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
                           f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, Kelly={r['kelly_fraction']:.2f})")
 
@@ -164,19 +162,14 @@ jobs:
 
               out = []
               out.append(f"## {tour} Picks")
-              out.append(star_line("Top Favorite", favs))
-              out.append(star_line("Top Underdog", dogs))
-              out.append("\n**Favorites (EV-sorted)**\n")
-              out.append(md_table(favs))
-              out.append("\n**Underdogs (EV-sorted)**\n")
-              out.append(md_table(dogs))
-              out.append("")  # spacer
+              out.append(star("Top Favorite", favs))
+              out.append(star("Top Underdog", dogs))
+              out.append("\n**Favorites (EV-sorted)**\n"); out.append(md_table(favs))
+              out.append("\n**Underdogs (EV-sorted)**\n"); out.append(md_table(dogs))
+              out.append("")
               return "\n".join(out)
 
-          summary = []
-          summary.append(section("ATP"))
-          summary.append(section("WTA"))
-
+          summary = "\n\n".join([section("ATP"), section("WTA")])
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("\n\n".join(summary))
+              f.write(summary)
           PY
