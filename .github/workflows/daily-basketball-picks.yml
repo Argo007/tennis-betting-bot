@@ -1,0 +1,125 @@
+name: Daily Basketball Picks (NBA & EuroLeague)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"    # runs daily at 08:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Generate Elo ratings for NBA & EuroLeague
+        run: |
+          mkdir -p data
+          python - <<'PY'
+          import pandas as pd
+
+          # Minimal placeholder Elo (1500 base) since basketball-reference EuroLeague data is not free/public in CSV
+          # We'll use a dummy Elo until we hook a scraper or manual CSV upload.
+          nba_teams = [
+              "Boston Celtics","Milwaukee Bucks","Denver Nuggets","Golden State Warriors",
+              "Los Angeles Lakers","Dallas Mavericks","Phoenix Suns"
+          ]
+          euro_teams = [
+              "Real Madrid","FC Barcelona","Olympiacos","Panathinaikos","Fenerbahce",
+              "Anadolu Efes","Partizan","Virtus Bologna"
+          ]
+
+          nba_elo = pd.DataFrame({"team": nba_teams, "elo": [1500]*len(nba_teams)})
+          euro_elo = pd.DataFrame({"team": euro_teams, "elo": [1500]*len(euro_teams)})
+
+          nba_elo.to_csv("data/nba_elo.csv", index=False)
+          euro_elo.to_csv("data/euro_elo.csv", index=False)
+          PY
+
+      - name: Get picks from Odds API
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, math, pandas as pd, requests
+
+          API_KEY = os.getenv("ODDS_API_KEY")
+          REGION = "eu"
+          KELLY_CAP = 0.25
+          MARKET_W = 0.6
+          MODEL_W  = 0.4
+
+          def logit(p): return math.log(p/(1-p))
+          def sigmoid(x): return 1/(1+math.exp(-x))
+          def implied_prob(odds):
+              return 1.0/float(odds) if float(odds) > 1 else None
+          def ev_and_kelly(p, o):
+              ev = o*p - (1-p)
+              b = o-1
+              k = ((b*p) - (1-p))/b if b>0 else 0
+              return ev, max(0.0, min(KELLY_CAP, k))
+
+          def process_league(sport_key, elo_file, league_name):
+              elo = pd.read_csv(elo_file)
+              elo["key"] = elo["team"].str.lower()
+              url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+              params = {"apiKey": API_KEY, "regions": REGION, "markets":"h2h", "oddsFormat":"decimal"}
+              r = requests.get(url, params=params, timeout=30)
+              events = r.json()
+
+              rows=[]
+              for ev in events:
+                  home = ev.get("home_team")
+                  away = ev.get("away_team")
+                  if not home or not away: continue
+                  he = elo.loc[elo["key"]==home.lower(), "elo"]
+                  ae = elo.loc[elo["key"]==away.lower(), "elo"]
+                  if he.empty or ae.empty: continue
+                  helo, aelo = float(he.iloc[0]), float(ae.iloc[0])
+                  market_probs = {}
+                  best_odds = {}
+                  for b in ev.get("bookmakers", []):
+                      for m in b.get("markets", []):
+                          if m.get("key") != "h2h": continue
+                          for oc in m.get("outcomes", []):
+                              nm, price = oc["name"], oc["price"]
+                              ip = implied_prob(price)
+                              if ip:
+                                  market_probs.setdefault(nm, []).append(ip)
+                                  best_odds[nm] = max(best_odds.get(nm, 0), price)
+                  if home in market_probs and away in market_probs:
+                      home_mkt = sum(market_probs[home])/len(market_probs[home])
+                      away_mkt = sum(market_probs[away])/len(market_probs[away])
+                      home_mdl = sigmoid((helo - aelo) * 0.004)
+                      away_mdl = 1-home_mdl
+                      p_home = sigmoid(MARKET_W*logit(home_mkt) + MODEL_W*logit(home_mdl))
+                      p_away = 1-p_home
+                      evh, kh = ev_and_kelly(p_home, best_odds[home])
+                      eva, ka = ev_and_kelly(p_away, best_odds[away])
+                      rows.append({"team":home,"opponent":away,"best_odds":best_odds[home],"blended_prob":p_home,"ev_per_unit":evh,"kelly":kh})
+                      rows.append({"team":away,"opponent":home,"best_odds":best_odds[away],"blended_prob":p_away,"ev_per_unit":eva,"kelly":ka})
+              df = pd.DataFrame(rows)
+              if df.empty: return f"## {league_name}\n_No picks found_\n"
+              dogs = df[(df["best_odds"]>=2.2)&(df["best_odds"]<=4.5)&(df["ev_per_unit"]>0)].sort_values("ev_per_unit",ascending=False).head(2)
+              fav = df[(df["best_odds"]>=1.3)&(df["best_odds"]<=1.8)&(df["ev_per_unit"]>0)].sort_values("ev_per_unit",ascending=False).head(1)
+              def bullets(x):
+                  return "\n".join([f"- {r['team']} vs {r['opponent']} @ {r['best_odds']:.2f} (p={r['blended_prob']:.2f}, EV={r['ev_per_unit']:.2f}, K={r['kelly']:.2f})" for _,r in x.iterrows()]) or "_None_"
+              return f"## {league_name} Smart Underdogs\n{bullets(dogs)}\n\n## {league_name} Safe Favorite\n{bullets(fav)}\n"
+          
+          summary = ""
+          summary += process_league("basketball_nba", "data/nba_elo.csv", "NBA")
+          summary += process_league("basketball_euroleague", "data/euro_elo.csv", "EuroLeague")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary)
+          PY
