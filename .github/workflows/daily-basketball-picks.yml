@@ -2,121 +2,118 @@ name: Daily Basketball Picks (NBA + EuroLeague)
 
 on:
   schedule:
-    - cron: "0 8 * * *"     # auto daily 08:00 UTC
-  workflow_dispatch: {}      # run anytime for fresh odds
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}
 
 jobs:
   picks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests
-
       - name: Print NBA & EuroLeague shortlists
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
           import os, requests, pandas as pd
+          API=os.getenv("ODDS_API_KEY")
+          if not API: raise SystemExit("Set ODDS_API_KEY in repo secrets.")
+          REGIONS="eu,us"
+          FAV_MIN,FAV_MAX=1.30,1.80
+          DOG_MIN,DOG_MAX=2.20,4.50
+          MIN_KELLY=0.01
+          KELLY_CAP=0.25
 
-          API_KEY = os.getenv("ODDS_API_KEY")
-          if not API_KEY:
-            raise SystemExit("ERROR: set ODDS_API_KEY in Repo → Settings → Secrets → Actions")
+          def ip(o): o=float(o); return 1/o if o>1 else None
+          def evk(p,o):
+              o=float(o); ev=o*p-(1-p); b=o-1
+              k=((b*p)-(1-p))/b if b>0 else 0.0
+              return ev, max(0.0, min(KELLY_CAP, k))
 
-          REGIONS = "eu,us"          # add/remove regions as you like
-          FAV_MIN, FAV_MAX = 1.30, 1.80
-          DOG_MIN, DOG_MAX = 2.20, 4.50
-          MIN_KELLY = 0.01
-          KELLY_CAP = 0.25
+          def fetch(key):
+              r=requests.get(f"https://api.the-odds-api.com/v4/sports/{key}/odds",
+                             params={"apiKey":API,"regions":REGIONS,"markets":"h2h","oddsFormat":"decimal"},timeout=30)
+              if r.status_code==404: return []
+              r.raise_for_status(); return r.json()
 
-          def implied_prob(o): o=float(o); return 1/o if o>1 else None
-          def ev_kelly(p,o):
-            o=float(o); ev = o*p - (1-p); b=o-1
-            k = ((b*p)-(1-p))/b if b>0 else 0.0
-            return ev, max(0.0, min(KELLY_CAP, k))
+          def rows_for(key,league):
+              rows=[]
+              for ev in fetch(key):
+                  a,b=ev.get("home_team"),ev.get("away_team")
+                  if not a or not b: continue
+                  probs,best={},{}
+                  for bk in ev.get("bookmakers",[]):
+                      for m in bk.get("markets",[]):
+                          if m.get("key")!="h2h": continue
+                          for oc in m.get("outcomes",[]):
+                              nm,pr=oc.get("name"),oc.get("price")
+                              if not nm or not pr: continue
+                              p=ip(pr)
+                              if p is None: continue
+                              probs.setdefault(nm,[]).append(p)
+                              best[nm]=max(best.get(nm,0.0),float(pr))
+                  if a not in probs or b not in probs: continue
+                  avg={k:sum(v)/len(v) for k,v in probs.items()}
+                  s=sum(avg.values()); 
+                  if s>0: avg={k:v/s for k,v in avg.items()}
+                  for tm,opp in [(a,b),(b,a)]:
+                      p=avg.get(tm); o=best.get(tm,0.0)
+                      if not p or o<=1: continue
+                      evu,k=evk(p,o)
+                      rows.append({"league":league,"commence_time_utc":ev.get("commence_time"),
+                                   "team":tm,"opponent":opp,"best_odds":o,"blended_prob":p,
+                                   "ev_per_unit":evu,"kelly_fraction":k})
+              return rows
 
-          def fetch(sport_key):
-            url=f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-            r=requests.get(url, params={"apiKey":API_KEY,"regions":REGIONS,"markets":"h2h","oddsFormat":"decimal"}, timeout=30)
-            if r.status_code==404: return []
-            r.raise_for_status(); return r.json()
-
-          def build_rows(sport_key, league):
-            rows=[]
-            for ev in fetch(sport_key):
-              a,b=ev.get("home_team"),ev.get("away_team")
-              if not a or not b: continue
-              probs,best={},{}
-              for bk in ev.get("bookmakers",[]):
-                for m in bk.get("markets",[]):
-                  if m.get("key")!="h2h": continue
-                  for oc in m.get("outcomes",[]):
-                    nm,price=oc.get("name"),oc.get("price")
-                    if not nm or not price: continue
-                    ip=implied_prob(price)
-                    if ip is None: continue
-                    probs.setdefault(nm,[]).append(ip)
-                    best[nm]=max(best.get(nm,0.0),float(price))
-              if a not in probs or b not in probs: continue
-              avg={k:sum(v)/len(v) for k,v in probs.items()}
-              s=sum(avg.values()); 
-              if s>0: avg={k:v/s for k,v in avg.items()}
-              for team,opp in [(a,b),(b,a)]:
-                p=avg.get(team); o=best.get(team,0.0)
-                if not p or o<=1: continue
-                evu,k=ev_kelly(p,o)
-                rows.append({"league":league,"commence_time_utc":ev.get("commence_time"),
-                             "team":team,"opponent":opp,"best_odds":o,"blended_prob":p,
-                             "ev_per_unit":evu,"kelly_fraction":k})
-            return rows
-
-          data=[]
-          data+=build_rows("basketball_nba","NBA")
-          data+=build_rows("basketball_euroleague","EuroLeague")
-
+          data = rows_for("basketball_nba","NBA") + rows_for("basketball_euroleague","EuroLeague")
           if not data:
-            out="## NBA\n_No games/picks right now_\n\n## EuroLeague\n_No games/picks right now_\n"
-            with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(out)
-            raise SystemExit(0)
+              with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
+                  f.write("## NBA\n_No games/picks right now_\n\n## EuroLeague\n_No games/picks right now_\n")
+              raise SystemExit(0)
 
           df=pd.DataFrame(data)
           for c in ["best_odds","blended_prob","ev_per_unit","kelly_fraction"]:
-            df[c]=pd.to_numeric(df[c],errors="coerce")
+              df[c]=pd.to_numeric(df[c],errors="coerce")
           df=df.dropna(subset=["best_odds","blended_prob","ev_per_unit"])
           df["match_id"]=df.apply(lambda r:" :: ".join(sorted([r["team"],r["opponent"]])),axis=1)
           df=df.sort_values("ev_per_unit",ascending=False).groupby("match_id",as_index=False).head(1)
 
           def shortlist(sub,lo,hi):
-            return sub[(sub["ev_per_unit"]>0)&(sub["best_odds"].between(lo,hi))&(sub["kelly_fraction"]>=MIN_KELLY)] \
-                    .sort_values(["ev_per_unit","blended_prob"],ascending=False)
+              return sub[(sub["ev_per_unit"]>0)&(sub["best_odds"].between(lo,hi))&(sub["kelly_fraction"]>=MIN_KELLY)] \
+                      .sort_values(["ev_per_unit","blended_prob"],ascending=False)
 
           def section(league):
-            sub=df[df["league"]==league].copy()
-            favs=shortlist(sub,FAV_MIN,FAV_MAX)
-            dogs=shortlist(sub,DOG_MIN,DOG_MAX)
-            def star(lbl,d):
-              if d.empty: return f"**🏆 {lbl}:** _None_"
-              r=d.iloc[0]
-              return f"**🏆 {lbl}:** {r.team} vs {r.opponent} @ {r.best_odds:.2f} (p={r.blended_prob:.2f}, EV/u={r.ev_per_unit:.2f}, Kelly={r.kelly_fraction:.2f})"
-            def md(d):
-              if d.empty: return "_None_"
-              cols=["commence_time_utc","team","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
-              d=d[cols].round({"best_odds":2,"blended_prob":2,"ev_per_unit":2,"kelly_fraction":2})
-              head="| "+" | ".join(cols)+" |\n|"+" | ".join(["---"]*len(cols))+"|\n"
-              body="\n".join("| "+" | ".join(map(str,row))+" |" for row in d.values)
-              return head+body
-            return "\n".join([f"## {league} Picks",star("Top Favorite",favs),star("Top Underdog",dogs),
-                              "\n**Favorites (EV-sorted)**\n",md(favs),
-                              "\n**Underdogs (EV-sorted)**\n",md(dogs), ""])
-          summary="\n\n".join([section("NBA"),section("EuroLeague")])
+              sub=df[df["league"]==league].copy()
+              favs=shortlist(sub,FAV_MIN,FAV_MAX)
+              dogs=shortlist(sub,DOG_MIN,DOG_MAX)
+              def star(lbl,d):
+                  if d.empty: return f"**🏆 {lbl}:** _None_"
+                  r=d.iloc[0]
+                  return f"**🏆 {lbl}:** {r.team} vs {r.opponent} @ {r.best_odds:.2f} (p={r.blended_prob:.2f}, EV/u={r.ev_per_unit:.2f}, Kelly={r.kelly_fraction:.2f})"
+              def table(d):
+                  if d.empty: return "_None_"
+                  cols=["commence_time_utc","team","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
+                  d=d[cols].round({"best_odds":2,"blended_prob":2,"ev_per_unit":2,"kelly_fraction":2})
+                  head="| "+" | ".join(cols)+" |\n|"+" | ".join(["---"]*len(cols))+"|\n"
+                  body="\n".join("| "+" | ".join(map(str,row))+" |" for row in d.values)
+                  return head+body
+              return "\n".join([
+                  f"## {league} Picks",
+                  star("Top Favorite",favs),
+                  star("Top Underdog",dogs),
+                  "\n**Favorites (EV-sorted)**\n", table(favs),
+                  "\n**Underdogs (EV-sorted)**\n", table(dogs),
+                  ""
+              ])
+
+          summary = "\n\n".join([section("NBA"), section("EuroLeague")])
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary)
           PY
