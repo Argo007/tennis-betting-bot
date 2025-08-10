@@ -22,6 +22,7 @@ jobs:
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
+          python << 'PY'
           import requests, pandas as pd
 
           FAV_MIN, FAV_MAX = 1.15, 2.10
@@ -66,3 +67,4 @@ jobs:
 
           print("\n=== 🐺 Live Underdogs ===")
           print(dogs.sort_values("price", ascending=False).head(5).to_string(index=False))
+          PY
