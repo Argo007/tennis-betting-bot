@@ -5,6 +5,10 @@ on:
     - cron: "0 8 * * *"    # 08:00 UTC daily
   workflow_dispatch: {}
 
+concurrency:
+  group: tennis-picks
+  cancel-in-progress: true
+
 jobs:
   picks:
     runs-on: ubuntu-latest
@@ -16,6 +20,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -31,7 +42,7 @@ jobs:
           curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
           curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
 
-      - name: Generate Elo
+      - name: Generate Elo tables
         run: |
           python - <<'PY'
           import pandas as pd, glob, os
@@ -46,69 +57,292 @@ jobs:
                   w,l = r['winner_name'], r['loser_name']
                   ew, el = E.get(w,START), E.get(l,START)
                   E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
-              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()]).sort_values('elo',ascending=False)
+              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()])
           os.makedirs("data", exist_ok=True)
           calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
           calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
-          print("Elo ready.")
           PY
 
-      # --- run your model script to produce value_picks_pro.csv ---
-      - name: Run model
+      # --- all-in-one model + publishing (upcoming-only, hardened, toggles, retry/backoff) ---
+      - name: Publish Tennis Picks (upcoming-only)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: |
-          python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
-
-      # --- print shortlist: 3 dogs + 2 favs per tour ---
-      - name: Print shortlist (3 Dogs, 2 Favs per tour)
+          REGION: "eu"               # odds API region code
+          LOOKAHEAD_H: "168"         # 7 days
+          START_BUFFER_MIN: "5"      # treat <5m as live-ish
+          MAX_ODDS_AGE_MIN: "30"     # drop odds older than 30m (if timestamp present)
+          MIN_CONF: "50"
+          TOP_DOGS: "3"
+          TOP_FAVS: "2"
+          ODDS_DOG_MIN: "2.20"
+          ODDS_DOG_MAX: "4.50"
+          ODDS_FAV_MIN: "1.30"
+          ODDS_FAV_MAX: "1.80"
+          INCLUDE_CHALLENGER: "true" # toggle Challenger
+          INCLUDE_ITF: "true"        # toggle ITF
         run: |
           python - <<'PY'
-          import pandas as pd, os
-          ODDS_DOG_MIN, ODDS_DOG_MAX = 2.20, 4.50
-          ODDS_FAV_MIN, ODDS_FAV_MAX = 1.30, 1.80
-          MIN_CONF = 50
-          TOP_DOGS, TOP_FAVS = 3, 2
+          import os, sys, time, json, math, re, requests, pandas as pd, datetime as dt
 
-          df = pd.read_csv("value_picks_pro.csv")
-          for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
-              df[c] = pd.to_numeric(df.get(c), errors="coerce")
-          df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob"])
+          # ---------------- config/env ----------------
+          def getenv(k, cast, default):
+              v = os.getenv(k, str(default))
+              try: return cast(v)
+              except: return cast(default)
 
+          ODDS_API_KEY = os.getenv("ODDS_API_KEY","")
+          if not ODDS_API_KEY:
+              print("ERROR: ODDS_API_KEY missing"); sys.exit(1)
+
+          REGION   = os.getenv("REGION","eu")
+          LOOKH    = getenv("LOOKAHEAD_H", int, 168)
+          BUF_MIN  = getenv("START_BUFFER_MIN", int, 5)
+          ODDS_AGE = getenv("MAX_ODDS_AGE_MIN", int, 30)
+          MIN_CONF = getenv("MIN_CONF", int, 50)
+          TOP_DOGS = getenv("TOP_DOGS", int, 3)
+          TOP_FAVS = getenv("TOP_FAVS", int, 2)
+          DOG_MIN  = getenv("ODDS_DOG_MIN", float, 2.20)
+          DOG_MAX  = getenv("ODDS_DOG_MAX", float, 4.50)
+          FAV_MIN  = getenv("ODDS_FAV_MIN", float, 1.30)
+          FAV_MAX  = getenv("ODDS_FAV_MAX", float, 1.80)
+          INC_CHAL = os.getenv("INCLUDE_CHALLENGER","true").lower() == "true"
+          INC_ITF  = os.getenv("INCLUDE_ITF","true").lower() == "true"
+
+          NOW = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+          CUTOFF = NOW + dt.timedelta(hours=LOOKH)
+          BUFFER_CUT = NOW + dt.timedelta(minutes=BUF_MIN)
+
+          # ---------------- utilities ----------------
+          def build_session():
+              s = requests.Session()
+              adapter = requests.adapters.HTTPAdapter(max_retries=3, pool_connections=10, pool_maxsize=10)
+              s.mount("https://", adapter); s.mount("http://", adapter)
+              s.headers.update({"User-Agent":"tennis-picks/1.0"})
+              return s
+
+          def odds_api(sport_key):
+              return f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+
+          def fetch_with_retry(url, params, tries=4, backoff=1.2, timeout=12):
+              sess = build_session()
+              last_err=None
+              for i in range(1, tries+1):
+                  try:
+                      r = sess.get(url, params=params, timeout=timeout)
+                      if r.status_code == 200:
+                          return r.json(), r.headers
+                      if r.status_code in (429, 500, 502, 503, 504):
+                          last_err = f"{r.status_code} {r.text[:200]}"
+                          time.sleep((backoff**i))
+                          continue
+                      r.raise_for_status()
+                  except Exception as e:
+                      last_err = str(e)
+                      time.sleep((backoff**i))
+              raise RuntimeError(f"fetch failed: {last_err}")
+
+          def load_elo(tour):
+              path = f"data/{tour.lower()}_elo.csv"
+              if not os.path.exists(path): return pd.DataFrame(columns=["player","elo"])
+              df = pd.read_csv(path)
+              df["player"] = df["player"].astype(str)
+              return df
+
+          ATP_ELO = load_elo("ATP")
+          WTA_ELO = load_elo("WTA")
+
+          def elo_prob(tour, a, b):
+              E = ATP_ELO if tour=="ATP" else WTA_ELO
+              ea = float(E[E.player==a]["elo"].iloc[0]) if (E.player==a).any() else 1500.0
+              eb = float(E[E.player==b]["elo"].iloc[0]) if (E.player==b).any() else 1500.0
+              return 1.0/(1.0+10**((eb-ea)/400.0))
+
+          def implied_prob(decimal_odds):
+              if not decimal_odds or not math.isfinite(decimal_odds) or decimal_odds<=1: return None
+              return 1.0/decimal_odds
+
+          def kelly_fraction(p, odds):
+              # decimal odds -> b = odds-1
+              b = odds - 1.0
+              q = 1.0 - p
+              return max(0.0, (b*p - q)/b) if b>0 else 0.0
+
+          # ---------------- fetch odds ----------------
+          # sports keys: tennis_atp, tennis_wta (and optional challenger/itf via titles)
+          sports = [("ATP","tennis_atp"), ("WTA","tennis_wta")]
+
+          rows=[]
+          for tour, skey in sports:
+              url = odds_api(skey)
+              params = {
+                  "apiKey": ODDS_API_KEY,
+                  "regions": REGION,
+                  "markets": "h2h",
+                  "oddsFormat": "decimal"
+              }
+              try:
+                  data, headers = fetch_with_retry(url, params)
+              except Exception as e:
+                  print(f"WARNING: failed to fetch {tour}: {e}")
+                  continue
+
+              for ev in data:
+                  # basic fields
+                  commence = pd.to_datetime(ev.get("commence_time"), utc=True, errors="coerce")
+                  if commence is pd.NaT: 
+                      continue
+                  if not (BUFFER_CUT <= commence <= CUTOFF): 
+                      continue  # upcoming-only inside model (with buffer + lookahead)
+
+                  # league/title filter for Challenger/ITF toggles
+                  league = (ev.get("sport_title") or ev.get("league") or "")
+                  title  = (ev.get("title") or ev.get("home_team") or "")  # odds API varies
+                  txt = f"{league} {title}".lower()
+
+                  if ("challenger" in txt and not INC_CHAL): 
+                      continue
+                  if (("itf" in txt or "futures" in txt) and not INC_ITF):
+                      continue
+
+                  # live/status filters (belt-and-suspenders)
+                  status = (ev.get("status") or "").lower()
+                  if re.search(r"(live|in[-\s_]?play|started|progress)", status):
+                      continue
+
+                  # participants
+                  teams = ev.get("participants") or ev.get("teams") or []
+                  home = ev.get("home_team") or (teams[0] if teams else None)
+                  away = ev.get("away_team") or (teams[1] if len(teams)>1 else None)
+                  if not home or not away: 
+                      # some feeds use 'bookmakers' -> last offered h2h keys
+                      home = ev.get("home_team"); away = ev.get("away_team")
+                  if not home or not away:
+                      continue
+
+                  # best odds across books
+                  best = {}
+                  for bm in ev.get("bookmakers",[]):
+                      for mk in bm.get("markets",[]):
+                          if mk.get("key") != "h2h": 
+                              continue
+                          for outcome in mk.get("outcomes", []):
+                              name = outcome.get("name")
+                              price = outcome.get("price")
+                              if name and price:
+                                  best[name] = max(best.get(name, 0), float(price))
+                  if home not in best or away not in best:
+                      continue
+
+                  # odds timestamp if present (freshness)
+                  odds_ts = None
+                  tss = []
+                  for bm in ev.get("bookmakers",[]):
+                      ts = bm.get("last_update")
+                      if ts: 
+                          tss.append(pd.to_datetime(ts, utc=True, errors="coerce"))
+                  if tss:
+                      odds_ts = max([t for t in tss if pd.notna(t)], default=None)
+                      if odds_ts and (NOW - odds_ts) > dt.timedelta(minutes=ODDS_AGE):
+                          continue
+
+                  # build both sides
+                  for player, opponent in [(home, away), (away, home)]:
+                      odds = best.get(player)
+                      if not odds: 
+                          continue
+                      p_mkt = implied_prob(odds)
+                      p_elo = elo_prob(tour, player, opponent)
+                      if p_mkt is None: 
+                          continue
+                      blended = 0.5*p_mkt + 0.5*p_elo
+                      evu = odds*blended - 1.0
+                      kelly = kelly_fraction(blended, odds)
+                      conf = 50 + 50*abs(p_elo - 0.5)  # dumb but stable: more Elo separation -> higher "confidence"
+                      rows.append({
+                          "tour": tour,
+                          "player": player,
+                          "opponent": opponent,
+                          "best_odds": odds,
+                          "blended_prob": blended,
+                          "ev_per_unit": evu,
+                          "kelly_fraction": kelly,
+                          "confidence": conf,
+                          "commence_dt": commence,
+                          "odds_dt": odds_ts,
+                          "status": status,
+                          "league_text": txt,
+                      })
+
+          df = pd.DataFrame(rows)
+          if df.empty:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(f"_No upcoming odds within {LOOKH}h (filtered at {NOW.strftime('%Y-%m-%d %H:%M UTC')})._\n")
+              sys.exit(0)
+
+          # final belt-and-suspenders filters
+          df = df[
+              (df["commence_dt"] >= BUFFER_CUT) &
+              (df["commence_dt"] <= CUTOFF) &
+              (~df["status"].astype(str).str.contains(r"(live|in[-\s_]?play|started|progress)", case=False, regex=True))
+          ].copy()
+
+          if df.empty:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(f"_All events filtered as live/too-soon (cutoff {BUF_MIN}m)._\n")
+              sys.exit(0)
+
+          # dedup per match
           def dedup(d):
-              d = d.copy()
-              d.insert(0,"match_id", d.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1))
-              return d.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).first()
+              key = d.apply(lambda r: " :: ".join(sorted([str(r.get("player","")), str(r.get("opponent",""))])), axis=1)
+              d = d.assign(match_id=key)
+              return d.sort_values(["ev_per_unit","confidence","commence_dt"], ascending=[False, False, True]).groupby("match_id", as_index=False).first()
+
+          base = df.dropna(subset=["best_odds","ev_per_unit"]).copy()
+          base["eta_min"] = (base["commence_dt"] - NOW).dt.total_seconds()/60
 
           def picks(data, lo, hi, n):
-              filt = data[(data["ev_per_unit"]>0) &
-                          (data["best_odds"].between(lo,hi)) &
-                          (data["confidence"]>=MIN_CONF)]
-              return dedup(filt).sort_values(["ev_per_unit","confidence"], ascending=False).head(n)
+              filt = data[
+                  (data["ev_per_unit"]>0) &
+                  (data["best_odds"].between(lo,hi)) &
+                  (data["confidence"]>=MIN_CONF)
+              ]
+              return dedup(filt).head(n)
 
           def bullets(x):
               if x.empty: return "_None_"
               b=[]
               for _,r in x.iterrows():
-                  b.append(f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
-                           f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, "
-                           f"Kelly={r['kelly_fraction']:.2f}) — {r['commence_time_utc']}")
+                  start_iso = r["commence_dt"].strftime("%Y-%m-%d %H:%M UTC")
+                  eta = int(round(r["eta_min"]))
+                  b.append(
+                      f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
+                      f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, "
+                      f"Kelly={r['kelly_fraction']:.2f}, Conf={int(r['confidence'])}) — {start_iso} (ETA {eta}m)"
+                  )
               return "\n".join(b)
 
-          out=[]
+          # metrics
+          total = len(df)
+          dropped = total - len(base)
+          header = [
+              f"_Filtered at {NOW.strftime('%Y-%m-%d %H:%M UTC')} — upcoming-only (≥{BUF_MIN}m, ≤{LOOKH}h), odds age ≤ {ODDS_AGE}m; Challenger={INC_CHAL}, ITF={INC_ITF}_",
+              f"- Source rows: {total}",
+              f"- After cleanse/dedup: {len(base)} (dropped {dropped})",
+              ""
+          ]
+
+          sections=[]
           for tour in ["ATP","WTA"]:
-              sub = df[df["tour"].str.upper()==tour]
-              dogs = picks(sub, ODDS_DOG_MIN, ODDS_DOG_MAX, TOP_DOGS)
-              favs = picks(sub, ODDS_FAV_MIN, ODDS_FAV_MAX, TOP_FAVS)
-              out += [
-                  f"## 🎯 {tour} Smart Underdogs (Top {TOP_DOGS})",
-                  bullets(dogs),
-                  "",
-                  f"## 🛡 {tour} Safe High-Value Favorites (Top {TOP_FAVS})",
-                  bullets(favs),
-                  ""
+              sub = base[base["tour"]==tour]
+              dogs = picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS)
+              favs = picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS)
+              sections += [
+                  f"## 🎯 {tour} Smart Underdogs (Top {TOP_DOGS}) — Upcoming Only",
+                  bullets(dogs), "",
+                  f"## 🛡 {tour} Safe High-Value Favorites (Top {TOP_FAVS}) — Upcoming Only",
+                  bullets(favs), ""
               ]
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("\n".join(out))
+              f.write("\n".join(header + sections))
           PY
