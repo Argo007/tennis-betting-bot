@@ -1,237 +1,168 @@
-name: Tennis Picks QKelly
-
-on:
-  schedule:
-    - cron: "0 8 * * *"   # 08:00 UTC daily
-  workflow_dispatch: {}
-
-concurrency:
-  group: tennis-picks
-  cancel-in-progress: true
-
-jobs:
-  picks:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas requests
-
-      # Build quick Elo tables (2 seasons). Keep or remove as you like.
-      - name: Download ATP/WTA results
-        run: |
-          mkdir -p matches
-          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
-
-      - name: Generate Elo
-        run: |
-          python - <<'PY'
-          import pandas as pd, glob, os
-          START, K = 1500, 32
-          def exp(a,b): return 1/(1+10**((b-a)/400))
-          def upd(a,b,s): return a + K*(s-exp(a,b))
-          def calc(pat):
-              df = pd.concat((pd.read_csv(f) for f in glob.glob(pat)), ignore_index=True)
-              E = {}
-              for _,r in df.iterrows():
-                  w,l = r['winner_name'], r['loser_name']
-                  ew, el = E.get(w,START), E.get(l,START)
-                  E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
-              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()])
-          os.makedirs("data", exist_ok=True)
-          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
-          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
-          PY
-
-      - name: Tennis Picks QKelly
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          REGION: eu
-          LOOKAHEAD_H: "48"
-          MAX_ETA_H: "36"
-          START_BUFFER_MIN: "5"
-          CLV_MIN_PCT: "1.0"
+  -      name:  Tennis Edge 24h QKelly
+          env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # not used here, but harmless if present
+          START_BUFFER_MIN: "5"       # treat <5 min as live-ish
+          MAX_ETA_H: "24"             # only show matches starting within 24h
+          CLV_MIN_PCT: "1.0"          # require best_odds >= 1% above market median (if available)
           MIN_CONF: "50"
+          TOP_DOGS: "3"
+          TOP_FAVS: "2"
           ODDS_DOG_MIN: "2.20"
           ODDS_DOG_MAX: "4.50"
           ODDS_FAV_MIN: "1.30"
           ODDS_FAV_MAX: "1.80"
-          TOP_DOGS: "3"
-          TOP_FAVS: "2"
         run: |
           python - <<'PY'
-          import os, sys, re, statistics
-          import pandas as pd
-          import datetime as dt
-          import requests
+          import os, re, pandas as pd, datetime as dt
 
-          # config
-          def env(k, cast, default):
-              try: return cast(os.getenv(k, str(default)))
-              except: return default
-
-          API = os.getenv("ODDS_API_KEY", "")
-          if not API:
-              sys.exit("Missing ODDS_API_KEY")
-
-          REGION = os.getenv("REGION", "eu")
-          LOOKH = env("LOOKAHEAD_H", int, 48)
-          MAX_ETA_H = env("MAX_ETA_H", int, 36)
-          BUFMIN = env("START_BUFFER_MIN", int, 5)
-          CLV_MIN = env("CLV_MIN_PCT", float, 1.0) / 100.0
-          MIN_CONF = env("MIN_CONF", int, 50)
-          DOG_MIN, DOG_MAX = env("ODDS_DOG_MIN", float, 2.20), env("ODDS_DOG_MAX", float, 4.50)
-          FAV_MIN, FAV_MAX = env("ODDS_FAV_MIN", float, 1.30), env("ODDS_FAV_MAX", float, 1.80)
-          TOP_DOGS, TOP_FAVS = env("TOP_DOGS", int, 3), env("TOP_FAVS", int, 2)
-
-          NOW = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-          FROM = (NOW + dt.timedelta(minutes=BUFMIN)).isoformat()
-          TO = (NOW + dt.timedelta(hours=LOOKH)).isoformat()
-          ETA_CAP = NOW + dt.timedelta(hours=MAX_ETA_H)
-
-          sess = requests.Session()
-          sess.headers.update({"User-Agent": "tpq/1.0"})
-
-          # sports discovery
-          def tennis_keys():
-              r = sess.get("https://api.the-odds-api.com/v4/sports", params={"apiKey": API, "all": "true"}, timeout=20)
-              r.raise_for_status()
-              return [s["key"] for s in r.json() if s.get("group","").lower()=="tennis" or str(s.get("key","")).startswith("tennis_")]
-
-          # odds fetch
-          def odds_for_key(k):
-              url = f"https://api.the-odds-api.com/v4/sports/{k}/odds"
-              p = {"apiKey": API, "regions": REGION, "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso",
-                   "commenceTimeFrom": FROM, "commenceTimeTo": TO}
-              r = sess.get(url, params=p, timeout=25)
-              if r.status_code == 404: return []
-              r.raise_for_status()
-              return r.json()
-
-          # Elo
-          def load_elo(path):
-              if not os.path.exists(path): return {}
-              df = pd.read_csv(path)
-              return dict(zip(df["player"].astype(str), df["elo"].astype(float)))
-          ATP_ELO = load_elo("data/atp_elo.csv")
-          WTA_ELO = load_elo("data/wta_elo.csv")
-
-          def elo_prob(tour, a, b):
-              E = ATP_ELO if tour=="ATP" else WTA_ELO
-              ea, eb = E.get(a,1500.0), E.get(b,1500.0)
-              return 1.0/(1.0+10**((eb-ea)/400.0))
-
-          rows = []
-          live_re = re.compile(r"(live|in[-\\s_]?play|started|progress)", re.I)
-
-          for sk in tennis_keys():
+          # -------- config --------
+          def getenv(k, cast, default):
+              v = os.getenv(k, str(default))
               try:
-                  data = odds_for_key(sk)
+                  return cast(v)
               except Exception:
-                  continue
-              tour = "WTA" if "wta" in sk.lower() else "ATP"
-              for ev in data:
-                  if live_re.search(str(ev.get("status",""))): 
-                      continue
-                  start = pd.to_datetime(ev.get("commence_time"), utc=True, errors="coerce")
-                  if start is pd.NaT or start > ETA_CAP:
-                      continue
-                  home, away = ev.get("home_team"), ev.get("away_team")
-                  if not home or not away:
-                      teams = ev.get("participants") or ev.get("teams") or []
-                      if len(teams) >= 2:
-                          home, away = teams[0], teams[1]
-                  if not home or not away:
-                      continue
+                  return default
 
-                  price_map, best_price = {}, {}
-                  for bm in ev.get("bookmakers", []):
-                      for m in bm.get("markets", []):
-                          if m.get("key") != "h2h": 
-                              continue
-                          for o in m.get("outcomes", []):
-                              name, price = o.get("name"), o.get("price")
-                              if not name or not price: 
-                                  continue
-                              p = float(price)
-                              price_map.setdefault(name, []).append(p)
-                              best_price[name] = max(best_price.get(name, 0.0), p)
+          BUF_MIN   = getenv("START_BUFFER_MIN", int, 5)
+          ETA_H     = getenv("MAX_ETA_H", int, 24)
+          CLV_MIN   = getenv("CLV_MIN_PCT", float, 1.0) / 100.0
+          MIN_CONF  = getenv("MIN_CONF", int, 50)
+          TOP_DOGS  = getenv("TOP_DOGS", int, 3)
+          TOP_FAVS  = getenv("TOP_FAVS", int, 2)
+          DOG_MIN   = getenv("ODDS_DOG_MIN", float, 2.20)
+          DOG_MAX   = getenv("ODDS_DOG_MAX", float, 4.50)
+          FAV_MIN   = getenv("ODDS_FAV_MIN", float, 1.30)
+          FAV_MAX   = getenv("ODDS_FAV_MAX", float, 1.80)
 
-                  if home not in best_price or away not in best_price:
-                      continue
+          # -------- load model output --------
+          df = pd.read_csv("value_picks_pro.csv")
 
-                  def consensus(n):
-                      arr = price_map.get(n, [])
-                      return statistics.median(arr) if arr else None
-                  cons_home, cons_away = consensus(home), consensus(away)
-                  if not cons_home or not cons_away:
-                      continue
+          # numerics (best effort)
+          for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
+              if c in df.columns:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
 
-                  for a,b in [(home,away),(away,home)]:
-                      best = best_price[a]
-                      cons = cons_home if a==home else cons_away
-                      if best <= 1 or cons <= 1:
-                          continue
-                      clv = (best - cons)/cons
-                      if clv < CLV_MIN:
-                          continue
-                      p_mkt = 1.0/cons
-                      p_elo = elo_prob(tour, a, b)
-                      p = 0.5*p_mkt + 0.5*p_elo
-                      b_mult = best - 1.0
-                      evu = best*p - 1.0
-                      kelly = max(0.0, (b_mult*p - (1.0 - p))/b_mult) if b_mult > 0 else 0.0
-                      qkelly = 0.25 * kelly
-                      conf = 50 + 50*abs(p_elo - 0.5)
-                      rows.append({
-                        "tour": tour, "player": a, "opponent": b,
-                        "best_odds": best, "consensus_odds": cons, "clv": clv,
-                        "p": p, "evu": evu, "qkelly": qkelly, "conf": conf,
-                        "start": start
-                      })
+          now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+          cut = now + dt.timedelta(minutes=BUF_MIN)
+          eta_cap = now + dt.timedelta(hours=ETA_H)
 
-          df = pd.DataFrame(rows)
+          # start time
+          if "commence_time_utc" in df.columns:
+              df["commence_dt"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
+          elif "commence_time" in df.columns:
+              df["commence_dt"] = pd.to_datetime(df["commence_time"], utc=True, errors="coerce")
+          else:
+              df["commence_dt"] = pd.NaT
+
+          # drop live/status and keep upcoming within 24h
+          live_re = re.compile(r"(live|in[-\s_]?play|started|progress)", re.I)
+          if "is_live" in df.columns:
+              df = df[~df["is_live"].fillna(False).astype(bool)]
+          if "status" in df.columns:
+              df = df[~df["status"].astype(str).str.contains(live_re, na=False)]
+          df = df[df["commence_dt"].notna() & (df["commence_dt"] >= cut) & (df["commence_dt"] <= eta_cap)]
+
+          # required cols
+          needed = ["player","opponent","tour","best_odds","blended_prob","commence_dt"]
+          if any(col not in df.columns for col in needed):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("Required columns missing in value_picks_pro.csv.\n")
+              raise SystemExit(0)
+
+          # -------- quarter-Kelly --------
+          def kelly_from(p, odds):
+              if pd.isna(p) or pd.isna(odds) or odds <= 1: 
+                  return 0.0
+              b = odds - 1.0
+              return max(0.0, (b*p - (1.0 - p)) / b) if b > 0 else 0.0
+
+          if "kelly_fraction" in df.columns:
+              df["kelly"] = pd.to_numeric(df["kelly_fraction"], errors="coerce").fillna(0.0)
+          else:
+              df["kelly"] = [kelly_from(p, o) for p, o in zip(df["blended_prob"], df["best_odds"])]
+          df["qkelly"] = 0.25 * df["kelly"]
+
+          # EV if missing
+          if "ev_per_unit" not in df.columns:
+              df["ev_per_unit"] = df["best_odds"] * df["blended_prob"] - 1.0
+
+          # -------- optional CLV consensus (median of any extra odds columns) --------
+          ignore = {
+              "best_odds","blended_prob","ev_per_unit","kelly_fraction","kelly","qkelly","confidence",
+              "player","opponent","tour","commence_time_utc","commence_time","commence_dt","status","is_live"
+          }
+          cand = [c for c in df.columns if c not in ignore and ("odds" in c.lower() or "price" in c.lower() or "bk_" in c.lower())]
+          clv_used = False
+          if cand:
+              num_cols = []
+              for c in cand:
+                  try:
+                      df[c] = pd.to_numeric(df[c], errors="coerce")
+                      if df[c].notna().any():
+                          num_cols.append(c)
+                  except Exception:
+                      pass
+              if num_cols:
+                  df["consensus_odds"] = df[num_cols].median(axis=1, skipna=True)
+                  if df["consensus_odds"].notna().any():
+                      df["clv_edge"] = (df["best_odds"] - df["consensus_odds"]) / df["consensus_odds"]
+                      df = df[df["clv_edge"] >= CLV_MIN]
+                      clv_used = True
+
           if df.empty:
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-                  f.write(f"No picks in {LOOKH}h window.\n")
-              sys.exit(0)
+                  f.write(f"No eligible picks in 24h window after filters.\n")
+              raise SystemExit(0)
 
-          df["match_id"] = df.apply(lambda r: " :: ".join(sorted([r["player"], r["opponent"]])), axis=1)
-          df = df.sort_values(["evu","conf","start"], ascending=[False, False, True]).groupby("match_id", as_index=False).first()
-          df["eta_min"] = (df["start"] - NOW).dt.total_seconds() / 60.0
+          # -------- dedupe, rank, print --------
+          df["match_id"] = df.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1)
+          df = df.sort_values(["ev_per_unit","qkelly","confidence","commence_dt"],
+                              ascending=[False, False, False, True]).groupby("match_id", as_index=False).first()
+          df["eta_min"] = (df["commence_dt"] - now).dt.total_seconds() / 60.0
 
-          def picks(sub, lo, hi, n):
-              f = sub[(sub["best_odds"].between(lo,hi)) & (sub["evu"]>0) & (sub["conf"]>=MIN_CONF) & (sub["qkelly"]>0)]
-              return f.sort_values(["evu","qkelly","eta_min"], ascending=[False, False, True]).head(n)
+          def picks(data, lo, hi, n):
+              f = data[
+                  (data["ev_per_unit"] > 0) &
+                  (data["best_odds"].between(lo, hi)) &
+                  (data["confidence"].fillna(0) >= MIN_CONF) &
+                  (data["qkelly"] > 0)
+              ]
+              return f.sort_values(["ev_per_unit","qkelly","eta_min"], ascending=[False, False, True]).head(n)
 
           def bullets(x):
-              if x.empty: return "_None_"
+              if x.empty: 
+                  return "_None_"
               lines = []
-              for _,r in x.iterrows():
-                  lines.append(
-                    f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
-                    f"(cons {r['consensus_odds']:.2f}, CLV {r['clv']*100:.1f}%, "
-                    f"p={r['p']:.2f}, EV/u={r['evu']:.2f}, QKelly={r['qkelly']:.3f}) "
-                    f"- {r['start'].strftime('%Y-%m-%d %H:%M UTC')} (ETA {int(r['eta_min'])}m)"
+              for _, r in x.iterrows():
+                  start_iso = r["commence_dt"].strftime("%Y-%m-%d %H:%M UTC")
+                  line = (
+                      f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
+                      f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, QKelly={r['qkelly']:.3f}"
                   )
+                  if "clv_edge" in r and pd.notna(r["clv_edge"]):
+                      line += f", CLV={r['clv_edge']*100:.1f}%"
+                  line += f") — {start_iso} (ETA {int(r['eta_min'])}m)"
+                  lines.append(line)
               return "\n".join(lines)
 
+          header = [f"Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} - upcoming only (<= {ETA_H}h, buffer {BUF_MIN}m)."]
+          header.append(f"CLV >= {int(CLV_MIN*100)}% vs median." if clv_used else "CLV check skipped (no consensus columns).")
+
+          out = []
+          out.append(" ".join(header) + "\n")
+          for tour in ["ATP","WTA"]:
+              sub = df[df["tour"].astype(str).str.upper() == tour]
+              dogs = picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS)
+              favs = picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS)
+              out += [
+                  f"## {tour} Underdogs (Top {TOP_DOGS})",
+                  bullets(dogs),
+                  "",
+                  f"## {tour} Favorites (Top {TOP_FAVS})",
+                  bullets(favs),
+                  ""
+              ]
+
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(f"Filtered at {NOW.strftime('%Y-%m-%d %H:%M UTC')} - upcoming only (<= {MAX_ETA_H}h), CLV >= {int(CLV_MIN*100)}%, stakes = quarter Kelly\n\n")
-              for tour in ["ATP","WTA"]:
-                  sub = df[df["tour"]==tour]
-                  f.write(f"## {tour} Dogs\n{bullets(picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS))}\n\n")
-                  f.write(f"## {tour} Favs\n{bullets(picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS))}\n\n")
+              f.write("\n".join(out))
           PY
