@@ -1,1 +1,112 @@
 
+name: Tennis Picks (ATP/WTA)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"    # Runs daily at 08:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  picks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Download ATP/WTA results
+        run: |
+          mkdir -p matches
+          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+
+      - name: Generate Elo
+        run: |
+          python - <<'PY'
+          import pandas as pd, glob, os
+          START, K = 1500, 32
+          def exp(a,b): return 1/(1+10**((b-a)/400))
+          def upd(a,b,s): return a + K*(s-exp(a,b))
+          def calc(pattern):
+              files = glob.glob(pattern)
+              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+              E = {}
+              for _,r in df.iterrows():
+                  w,l = r['winner_name'], r['loser_name']
+                  ew, el = E.get(w,START), E.get(l,START)
+                  E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
+              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()]).sort_values('elo',ascending=False)
+          os.makedirs("data", exist_ok=True)
+          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
+          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
+          print("Elo ready.")
+          PY
+
+      - name: Run model
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
+
+      - name: Print shortlist (3 Dogs, 2 Favs per tour, Kelly capped)
+        run: |
+          python - <<'PY'
+          import pandas as pd, os, datetime as dt
+
+          # --- Settings ---
+          BUF_MIN = 5
+          ETA_H = 24
+          MIN_CONF = 50
+          TOP_DOGS, TOP_FAVS = 3, 2
+          DOG_MIN, DOG_MAX = 1.90, 6.00
+          FAV_MIN, FAV_MAX = 1.20, 1.80
+          KELLY_CAP_DOG = 0.25  # cap dogs to micro-stake
+
+          df = pd.read_csv("value_picks_pro.csv")
+          for c in ["blended_prob","best_odds","kelly_fraction","confidence"]:
+              df[c] = pd.to_numeric(df.get(c), errors="coerce")
+          df = df.dropna(subset=["best_odds","blended_prob","kelly_fraction"])
+
+          now = dt.datetime.utcnow()
+          df["commence_time_utc"] = pd.to_datetime(df["commence_time_utc"], utc=True)
+          df["eta_h"] = (df["commence_time_utc"] - now).dt.total_seconds()/3600
+
+          df = df[(df["eta_h"] >= BUF_MIN/60) & (df["eta_h"] <= ETA_H) & (df["confidence"] >= MIN_CONF)]
+
+          def format_pick(r):
+              eta_h = int(r["eta_h"])
+              eta_m = int((r["eta_h"]*60) % 60)
+              note = "✅ Definitely bet it (Kelly match)" if r["kelly_fraction"] > 0 else ""
+              return f"{r['player']} vs {r['opponent']} — {r['best_odds']:.2f} (p={r['blended_prob']:.2f}, Kelly={r['kelly_fraction']:.3f})\n🗓 {r['commence_time_utc'].strftime('%Y-%m-%d %H:%M UTC')} • ETA: {eta_h}h {eta_m}m {note}"
+
+          def top_picks(lo, hi, n, cap_kelly=False):
+              subset = df[(df["best_odds"].between(lo, hi)) & (df["kelly_fraction"] > 0)]
+              if cap_kelly:
+                  subset["kelly_fraction"] = subset["kelly_fraction"].clip(upper=KELLY_CAP_DOG)
+              return subset.sort_values("kelly_fraction", ascending=False).head(n)
+
+          out = []
+          for tour in ["ATP", "WTA"]:
+              sub = df[df["tour"].str.upper() == tour]
+              dogs = top_picks(DOG_MIN, DOG_MAX, TOP_DOGS, cap_kelly=True)
+              favs = top_picks(FAV_MIN, FAV_MAX, TOP_FAVS)
+              out.append(f"🏆 {tour} Underdogs (Top {TOP_DOGS})\n")
+              out += [format_pick(r) for _, r in dogs.iterrows()] or ["None"]
+              out.append(f"\n🏆 {tour} Favorites (Top {TOP_FAVS})\n")
+              out += [format_pick(r) for _, r in favs.iterrows()] or ["None"]
+              out.append("")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(out))
+          PY
