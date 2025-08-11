@@ -1,0 +1,180 @@
+name: Tennis Picks (Challenger + ITF)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"        # 08:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  picks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Challenger/ITF shortlist (3 Dogs, 2 Favs)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python << 'PY'
+          import os, requests, pandas as pd, datetime as dt
+
+          API = os.getenv("ODDS_API_KEY")
+          if not API: raise SystemExit("Set ODDS_API_KEY in repo secrets.")
+
+          REGIONS = "eu,us"
+          LOOKAHEAD_H = 72
+
+          # Selection bands (same “yesterday” vibe)
+          FAV_MIN, FAV_MAX = 1.30, 1.80
+          DOG_MIN, DOG_MAX = 2.20, 4.50
+          TOP_FAVS, TOP_DOGS = 2, 3
+
+          def ip(o):
+              o=float(o); return 1.0/o if o>1.0 else None
+
+          def ev_kelly(p,o):
+              o=float(o); ev=o*p-(1-p); b=o-1.0
+              k=((b*p)-(1-p))/b if b>0 else 0.0
+              return ev, max(0.0, min(0.25, k))
+
+          def get(url, **params):
+              return requests.get(url, params=params, timeout=30)
+
+          # 1) Discover sport keys that look like Challenger/ITF
+          s = get("https://api.the-odds-api.com/v4/sports", apiKey=API)
+          keys = []
+          if s.status_code == 200:
+              for sp in s.json():
+                  k = sp.get("key","").lower()
+                  # grab anything tennis + challenger/itf-ish if present in your plan
+                  if k.startswith("tennis") and ("challenger" in k or "itf" in k):
+                      keys.append(sp["key"])
+          else:
+              keys = []
+
+          # Fallback: if no keys discovered, we still try a couple of common guesses
+          if not keys:
+              keys = [
+                # These are guesses; API may not expose them in your plan
+                "tennis_challenger", "tennis_itf"
+              ]
+
+          def fetch(key):
+              now = dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+              to  = (dt.datetime.utcnow()+dt.timedelta(hours=LOOKAHEAD_H)).replace(microsecond=0).isoformat()+"Z"
+              r = get(f"https://api.the-odds-api.com/v4/sports/{key}/odds",
+                      apiKey=API, regions=REGIONS, markets="h2h", oddsFormat="decimal",
+                      commenceTimeFrom=now, commenceTimeTo=to)
+              if r.status_code == 404: return []
+              if r.status_code != 200: return []
+              return r.json()
+
+          def rows_for(key,label):
+              rows=[]
+              for ev in fetch(key):
+                  a,b=ev.get("home_team"), ev.get("away_team")
+                  if not a or not b: continue
+                  probs,best={},{}
+                  for bk in ev.get("bookmakers",[]):
+                      for m in bk.get("markets",[]):
+                          if m.get("key")!="h2h": continue
+                          for oc in m.get("outcomes",[]):
+                              nm,pr=oc.get("name"), oc.get("price")
+                              if not nm or not pr: continue
+                              p=ip(pr); 
+                              if p is None: continue
+                              probs.setdefault(nm,[]).append(p)
+                              best[nm]=max(best.get(nm,0.0), float(pr))
+                  if a not in probs or b not in probs: continue
+                  avg={k:sum(v)/len(v) for k,v in probs.items()}
+                  s=sum(avg.values())
+                  if s>0: avg={k:v/s for k,v in avg.items()}
+                  for pl,opp in [(a,b),(b,a)]:
+                      p=avg.get(pl); o=best.get(pl,0.0)
+                      if not p or o<=1.0: continue
+                      evu,k=ev_kelly(p,o)
+                      rows.append({
+                        "tour": label,
+                        "commence_time_utc": ev.get("commence_time"),
+                        "player": pl, "opponent": opp,
+                        "best_odds": o, "blended_prob": p,
+                        "ev_per_unit": evu, "kelly_fraction": k
+                      })
+              return rows
+
+          # Map keys to a friendly label (Challenger / ITF)
+          def label_for(k):
+              kl = k.lower()
+              if "challenger" in kl: return "Challenger"
+              if "itf" in kl: return "ITF"
+              return "Challenger/ITF"
+
+          data=[]
+          for k in keys:
+              data += rows_for(k, label_for(k))
+
+          if not data:
+              msg = (
+                "## Challenger + ITF Picks\n"
+                "> No Challenger/ITF odds returned by The Odds API in the next 72h.\n"
+                "> Note: Their published coverage focuses on Grand Slams + ATP/WTA 1000, so Challenger/ITF may not be in your plan.\n"
+              )
+              with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(msg)
+              raise SystemExit(0)
+
+          df = pd.DataFrame(data)
+          for c in ["best_odds","blended_prob","ev_per_unit","kelly_fraction"]:
+              df[c]=pd.to_numeric(df[c], errors="coerce")
+          df = df.dropna(subset=["best_odds","blended_prob","ev_per_unit"])
+
+          # Deduplicate by match (keep higher EV side)
+          df["match_id"]=df.apply(lambda r:" :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1)
+          df=df.sort_values("ev_per_unit", ascending=False).groupby("match_id",as_index=False).head(1)
+
+          def shortlist(sub, lo, hi, n):
+              out = sub[(sub["ev_per_unit"]>0)&(sub["best_odds"].between(lo,hi))] \
+                    .sort_values(["ev_per_unit","blended_prob"], ascending=False) \
+                    .head(n)
+              return out
+
+          def table(d, cols):
+              if d.empty: return "_None_"
+              t=d[cols].round({"best_odds":2,"blended_prob":2,"ev_per_unit":2,"kelly_fraction":2})
+              head="| "+" | ".join(cols)+" |\n|"+" | ".join(["---"]*len(cols))+"|\n"
+              body="\n".join("| "+" | ".join(map(str,row))+" |" for row in t.values)
+              return head+body
+
+          out=[]
+          for tour in ["Challenger","ITF"]:
+              sub=df[df["tour"]==tour].copy()
+              favs = shortlist(sub, FAV_MIN, FAV_MAX, TOP_FAVS)
+              dogs = shortlist(sub, DOG_MIN, DOG_MAX, TOP_DOGS)
+
+              def star(lbl, d):
+                  if d.empty: return f"**🏆 {lbl}:** _None_"
+                  r=d.iloc[0]
+                  return f"**🏆 {lbl}:** {r.player} vs {r.opponent} @ {r.best_odds:.2f} (p={r.blended_prob:.2f}, EV/u={r.ev_per_unit:.2f}, Kelly={r.kelly_fraction:.2f})"
+
+              cols=["commence_time_utc","player","opponent","best_odds","blended_prob","ev_per_unit","kelly_fraction"]
+              out += [
+                f"## {tour} Picks",
+                star("Top Favorite", favs),
+                star("Top Underdog", dogs),
+                "\n**Favorites (Top 2, EV-sorted)**\n", table(favs, cols),
+                "\n**Underdogs (Top 3, EV-sorted)**\n", table(dogs, cols),
+                ""
+              ]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write("\n".join(out))
+          PY
