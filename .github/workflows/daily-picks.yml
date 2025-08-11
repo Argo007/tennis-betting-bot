@@ -1,35 +1,52 @@
-
 name: Tennis Picks (ATP/WTA)
 
 on:
   schedule:
-    - cron: "0 8 * * *"    # Runs daily at 08:00 UTC
+    - cron: "0 8 * * *"   # 08:00 UTC daily
   workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tennis-picks
+  cancel-in-progress: true
+
+env:
+  TZ: Europe/Amsterdam
 
 jobs:
   picks:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install pandas requests pytz
 
+      # --- build Elo ---
       - name: Download ATP/WTA results
         run: |
+          set -euo pipefail
           mkdir -p matches
-          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+          curl -sSLo matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -sSLo matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -sSLo matches/atp_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv || true
+          curl -sSLo matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -sSLo matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+          curl -sSLo matches/wta_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2025.csv || true
 
       - name: Generate Elo
         run: |
@@ -39,11 +56,12 @@ jobs:
           def exp(a,b): return 1/(1+10**((b-a)/400))
           def upd(a,b,s): return a + K*(s-exp(a,b))
           def calc(pattern):
-              files = glob.glob(pattern)
+              files = sorted(glob.glob(pattern))
               df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
-              E = {}
+              E={}
               for _,r in df.iterrows():
-                  w,l = r['winner_name'], r['loser_name']
+                  w,l = r.get('winner_name'), r.get('loser_name')
+                  if pd.isna(w) or pd.isna(l): continue
                   ew, el = E.get(w,START), E.get(l,START)
                   E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
               return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()]).sort_values('elo',ascending=False)
@@ -53,60 +71,114 @@ jobs:
           print("Elo ready.")
           PY
 
-      - name: Run model
+      # --- 24h search window ---
+      - name: Run model (24h)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
+          set -euo pipefail
+          python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out value_picks_pro.csv
 
-      - name: Print shortlist (3 Dogs, 2 Favs per tour, Kelly capped)
+      # --- shortlist with 24h filter + Kelly cap on dogs ---
+      - name: Print shortlist (3 Dogs, 2 Favs per tour)
         run: |
           python - <<'PY'
-          import pandas as pd, os, datetime as dt
+          import pandas as pd, os, sys
+          from datetime import datetime, timedelta, timezone
 
-          # --- Settings ---
-          BUF_MIN = 5
-          ETA_H = 24
+          ODDS_DOG_MIN, ODDS_DOG_MAX = 2.20, 4.50
+          ODDS_FAV_MIN, ODDS_FAV_MAX = 1.30, 1.80
           MIN_CONF = 50
           TOP_DOGS, TOP_FAVS = 3, 2
-          DOG_MIN, DOG_MAX = 1.90, 6.00
-          FAV_MIN, FAV_MAX = 1.20, 1.80
-          KELLY_CAP_DOG = 0.25  # cap dogs to micro-stake
+          DOG_KELLY_CAP = 0.25
+
+          if not os.path.exists("value_picks_pro.csv"):
+              print("No value_picks_pro.csv produced — skipping shortlist.")
+              sys.exit(0)
 
           df = pd.read_csv("value_picks_pro.csv")
-          for c in ["blended_prob","best_odds","kelly_fraction","confidence"]:
-              df[c] = pd.to_numeric(df.get(c), errors="coerce")
-          df = df.dropna(subset=["best_odds","blended_prob","kelly_fraction"])
 
-          now = dt.datetime.utcnow()
-          df["commence_time_utc"] = pd.to_datetime(df["commence_time_utc"], utc=True)
-          df["eta_h"] = (df["commence_time_utc"] - now).dt.total_seconds()/3600
+          # Normalize types
+          for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
+              if c in df.columns:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
 
-          df = df[(df["eta_h"] >= BUF_MIN/60) & (df["eta_h"] <= ETA_H) & (df["confidence"] >= MIN_CONF)]
+          # Required columns
+          need = {"tour","player","opponent","best_odds","ev_per_unit","blended_prob","kelly_fraction","confidence","commence_time_utc"}
+          miss = [c for c in need if c not in df.columns]
+          if miss:
+              print("Missing columns:", ", ".join(miss))
+              sys.exit(0)
 
-          def format_pick(r):
-              eta_h = int(r["eta_h"])
-              eta_m = int((r["eta_h"]*60) % 60)
-              note = "✅ Definitely bet it (Kelly match)" if r["kelly_fraction"] > 0 else ""
-              return f"{r['player']} vs {r['opponent']} — {r['best_odds']:.2f} (p={r['blended_prob']:.2f}, Kelly={r['kelly_fraction']:.3f})\n🗓 {r['commence_time_utc'].strftime('%Y-%m-%d %H:%M UTC')} • ETA: {eta_h}h {eta_m}m {note}"
+          # Hard 24h filter (UTC)
+          now = datetime.now(timezone.utc)
+          in24 = now + timedelta(hours=24)
+          df["commence_time_utc"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
+          df = df[(df["commence_time_utc"] >= now) & (df["commence_time_utc"] <= in24)]
 
-          def top_picks(lo, hi, n, cap_kelly=False):
-              subset = df[(df["best_odds"].between(lo, hi)) & (df["kelly_fraction"] > 0)]
-              if cap_kelly:
-                  subset["kelly_fraction"] = subset["kelly_fraction"].clip(upper=KELLY_CAP_DOG)
-              return subset.sort_values("kelly_fraction", ascending=False).head(n)
+          # Drop junk
+          df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob","kelly_fraction","commence_time_utc"])
 
-          out = []
-          for tour in ["ATP", "WTA"]:
-              sub = df[df["tour"].str.upper() == tour]
-              dogs = top_picks(DOG_MIN, DOG_MAX, TOP_DOGS, cap_kelly=True)
-              favs = top_picks(FAV_MIN, FAV_MAX, TOP_FAVS)
-              out.append(f"🏆 {tour} Underdogs (Top {TOP_DOGS})\n")
-              out += [format_pick(r) for _, r in dogs.iterrows()] or ["None"]
-              out.append(f"\n🏆 {tour} Favorites (Top {TOP_FAVS})\n")
-              out += [format_pick(r) for _, r in favs.iterrows()] or ["None"]
-              out.append("")
+          def dedup(d):
+              d = d.copy()
+              d.insert(0,"match_id", d.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1))
+              return d.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).first()
+
+          def picks(data, lo, hi, n):
+              filt = data[
+                  (data["ev_per_unit"] > 0) &
+                  (data["best_odds"].between(lo, hi, inclusive="both")) &
+                  (data["confidence"] >= MIN_CONF)
+              ]
+              return dedup(filt).sort_values(["ev_per_unit","confidence"], ascending=[False, False]).head(n)
+
+          def stake_fraction(row):
+              # Cap underdogs at 25% Kelly, favorites use full Kelly
+              is_dog = row["best_odds"] >= ODDS_DOG_MIN
+              k = float(row["kelly_fraction"])
+              return min(k, DOG_KELLY_CAP) if is_dog else k
+
+          def def_bet(row):
+              # "Definitely bet" if raw Kelly >= 0.25
+              return "YES" if float(row["kelly_fraction"]) >= 0.25 else "NO"
+
+          def bullets(x):
+              if x.empty: return "_None_"
+              lines=[]
+              for _,r in x.iterrows():
+                  sf = stake_fraction(r)
+                  lines.append(
+                      f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
+                      f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, "
+                      f"Kelly={r['kelly_fraction']:.2f}, Stake={sf:.2f}) "
+                      f"— {r['commence_time_utc'].strftime('%Y-%m-%d %H:%M UTC')} "
+                      f"[Def bet: {def_bet(r)}]"
+                  )
+              return "\n".join(lines)
+
+          out=[]
+          for tour in ["ATP","WTA"]:
+              sub = df[df["tour"].str.upper()==tour]
+              dogs = picks(sub, ODDS_DOG_MIN, ODDS_DOG_MAX, TOP_DOGS)
+              favs = picks(sub, ODDS_FAV_MIN, ODDS_FAV_MAX, TOP_FAVS)
+              out += [
+                  f"## 🎯 {tour} Smart Underdogs (Top {TOP_DOGS}) — Kelly cap {DOG_KELLY_CAP:.0%}",
+                  bullets(dogs),
+                  "",
+                  f"## 🛡 {tour} Safe High-Value Favorites (Top {TOP_FAVS}) — Full Kelly",
+                  bullets(favs),
+                  ""
+              ]
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write("\n".join(out))
+          print("Shortlist written to job summary.")
           PY
+
+      - name: Upload artifact (CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: value_picks_pro
+          path: value_picks_pro.csv
+          if-no-files-found: warn
