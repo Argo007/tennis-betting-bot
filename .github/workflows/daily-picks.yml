@@ -53,27 +53,27 @@ jobs:
           print("Elo ready.")
           PY
 
-      # --- your model: produces value_picks_pro.csv ---
+      # --- run your model script to produce value_picks_pro.csv ---
       - name: Run model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
 
-      # --- pretty shortlist: upcoming-only (24h), Kelly-only, optional CLV ---
+      # --- pretty shortlist: upcoming-only (24h), Kelly-only, optional CLV; dedup inside buckets ---
       - name: Print shortlist (3 Dogs, 2 Favs per tour)
         run: |
           python - <<'PY'
           import pandas as pd, os, re, datetime as dt
 
-          # settings (keep simple inside code to avoid YAML issues)
-          BUF_MIN = 5               # ignore <5m (live-ish)
-          ETA_H   = 24              # only matches starting next 24h
-          CLV_MIN = 0.01            # require best_odds >= 1% above consensus (if consensus exists)
-          MIN_CONF = 50
+          # Settings
+          BUF_MIN   = 5          # treat <5m as live-ish
+          ETA_H     = 24         # only show matches starting within 24h
+          MIN_CONF  = 50
+          CLV_MIN   = 0.01       # apply only if 'consensus_odds' exists (>=1% advantage)
           TOP_DOGS, TOP_FAVS = 3, 2
-          DOG_MIN, DOG_MAX = 2.20, 4.50
-          FAV_MIN, FAV_MAX = 1.30, 1.80
+          DOG_MIN, DOG_MAX = 1.90, 6.00   # widened so dogs actually show
+          FAV_MIN, FAV_MAX = 1.15, 2.00
 
           now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
           cut = now + dt.timedelta(minutes=BUF_MIN)
@@ -96,7 +96,7 @@ jobs:
           else:
               df["commence_dt"] = pd.NaT
 
-          # remove live/in-play
+          # drop live/in-play
           live_re = re.compile(r"(live|in[-\\s_]?play|started|progress)", re.I)
           if "is_live" in df.columns:
               df = df[~df["is_live"].fillna(False).astype(bool)]
@@ -113,7 +113,7 @@ jobs:
                   f.write("Required columns missing in value_picks_pro.csv.\n")
               raise SystemExit(0)
 
-          # Kelly (use provided; else compute). decimal odds
+          # Kelly (use provided; else compute) — decimal odds
           def kelly_from(p, odds):
               if pd.isna(p) or pd.isna(odds) or odds <= 1: return 0.0
               b = odds - 1.0
@@ -123,42 +123,41 @@ jobs:
           else:
               df["kelly"] = [kelly_from(p, o) for p, o in zip(df["blended_prob"], df["best_odds"])]
 
-          # Optional CLV from any extra odds columns (median consensus)
-          ignore = {"best_odds","blended_prob","ev_per_unit","kelly_fraction","kelly","confidence",
-                    "player","opponent","tour","commence_time_utc","commence_time","commence_dt","status","is_live"}
-          cand = [c for c in df.columns if c not in ignore and ("odds" in c.lower() or "price" in c.lower() or "bk_" in c.lower())]
+          # Optional CLV (only if consensus_odds exists)
           clv_used = False
-          if cand:
-              num_cols = []
-              for c in cand:
-                  try:
-                      df[c] = pd.to_numeric(df[c], errors="coerce")
-                      if df[c].notna().any(): num_cols.append(c)
-                  except: pass
-              if num_cols:
-                  df["consensus_odds"] = df[num_cols].median(axis=1, skipna=True)
-                  if df["consensus_odds"].notna().any():
-                      df["clv_edge"] = (df["best_odds"] - df["consensus_odds"]) / df["consensus_odds"]
-                      df = df[df["clv_edge"].notna() & (df["clv_edge"] >= CLV_MIN)]
-                      clv_used = True
+          if "consensus_odds" in df.columns:
+              df["consensus_odds"] = pd.to_numeric(df["consensus_odds"], errors="coerce")
+              if df["consensus_odds"].notna().any():
+                  df["clv_edge"] = (df["best_odds"] - df["consensus_odds"]) / df["consensus_odds"]
+                  df = df[df["clv_edge"].notna() & (df["clv_edge"] >= CLV_MIN)]
+                  clv_used = True
 
-          # ranking (EV/u only for ordering if missing; not displayed)
-          if "ev_per_unit" not in df.columns or df["ev_per_unit"].isna().all():
-              df["ev_per_unit"] = df["best_odds"]*df["blended_prob"] - 1.0
+          if df.empty:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("No eligible picks in 24h window after filters.\n")
+              raise SystemExit(0)
 
-          # dedupe per match
+          # Keep both sides; dedup happens inside bucket picks
           df["match_id"] = df.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1)
-          df = df.sort_values(["ev_per_unit","confidence","commence_dt"], ascending=[False, False, True]).groupby("match_id", as_index=False).first()
-
-          # formatting helpers
           df["eta_min"] = (df["commence_dt"] - now).dt.total_seconds()/60.0
-          def eta_fmt(m): 
-              m = int(round(m)); h,mm = divmod(m,60)
+
+          # helpers
+          def eta_fmt(m):
+              m = int(round(m)); h, mm = divmod(m, 60)
               return f"{h}h {mm:02d}m" if h else f"{mm}m"
           def ts_fmt(ts): return ts.strftime("%Y-%m-%d %H:%M UTC")
 
-          def section(title, picks_md):
-              return f"## 🎾 **{title}**\n\n{picks_md}\n"
+          # Filter -> sort -> dedup per match inside each bucket
+          def bucket_picks(sub, lo, hi, n):
+              f = sub[(sub["best_odds"].between(lo, hi)) &
+                      (sub["confidence"].fillna(0) >= MIN_CONF)]
+              if f.empty: return f
+              f = f.sort_values(["kelly","eta_min"], ascending=[False, True])
+              f = f.groupby("match_id", as_index=False).first()
+              return f.head(n)
+
+          def section(title, content):
+              return f"## 🏆 **{title}**\n\n{content}\n"
 
           def list_block(x):
               if x.empty: return "_None_"
@@ -168,24 +167,21 @@ jobs:
                       f"{i}. **{r['player']}** vs *{r['opponent']}* — **{r['best_odds']:.2f}** "
                       f"_(p={r['blended_prob']:.2f}, Kelly={r['kelly']:.3f}"
                   )
-                  if 'clv_edge' in r and pd.notna(r['clv_edge']):
-                      ln += f", CLV=+{r['clv_edge']*100:.1f}%"
+                  if "clv_edge" in r and pd.notna(r["clv_edge"]): ln += f", CLV=+{r['clv_edge']*100:.1f}%"
                   ln += f")_\n   🗓 **{ts_fmt(r['commence_dt'])}** • ETA: {eta_fmt(r['eta_min'])}"
                   lines.append(ln)
               return "\n".join(lines)
 
-          def picks(sub, lo, hi, n):
-              f = sub[(sub["best_odds"].between(lo, hi)) & (sub["confidence"].fillna(0) >= MIN_CONF)]
-              return f.sort_values(["ev_per_unit","eta_min"], ascending=[False, True]).head(n)
-
           header = f"_Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} · upcoming-only (≤ {ETA_H}h, buffer {BUF_MIN}m)._"
-          header += f" _CLV ≥ {int(CLV_MIN*100)}% applied._" if clv_used else " _CLV check skipped (no consensus columns)._"
+          header += f" _CLV ≥ {int(CLV_MIN*100)}% applied._" if clv_used else " _CLV check skipped (no consensus_odds column)._"
           out = [header, ""]
 
           for tour in ["ATP","WTA"]:
               sub = df[df["tour"].astype(str).str.upper()==tour]
-              out.append(section(f"{tour} Underdogs (Top {TOP_DOGS})", list_block(picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS))))
-              out.append(section(f"{tour} Favorites (Top {TOP_FAVS})",   list_block(picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS))))
+              dogs = bucket_picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS)
+              favs = bucket_picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS)
+              out.append(section(f"{tour} Underdogs (Top {TOP_DOGS})", list_block(dogs)))
+              out.append(section(f"{tour} Favorites (Top {TOP_FAVS})",   list_block(favs)))
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write("\n".join(out))
