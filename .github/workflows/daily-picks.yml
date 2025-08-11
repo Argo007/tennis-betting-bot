@@ -53,23 +53,23 @@ jobs:
           print("Elo ready.")
           PY
 
-      # --- run your model script to produce value_picks_pro.csv ---
+      # --- your model: produces value_picks_pro.csv ---
       - name: Run model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
 
-      # --- print shortlist: upcoming-only (24h), Kelly-only display, optional CLV ---
+      # --- pretty shortlist: upcoming-only (24h), Kelly-only, optional CLV ---
       - name: Print shortlist (3 Dogs, 2 Favs per tour)
         run: |
           python - <<'PY'
           import pandas as pd, os, re, datetime as dt
 
-          # Settings (edit if you want)
-          BUF_MIN = 5            # ignore <5 minutes (treat as live-ish)
-          ETA_H   = 24           # show only matches starting within 24h
-          CLV_MIN = 0.01         # keep only if best_odds >= 1% above consensus (if consensus exists)
+          # settings (keep simple inside code to avoid YAML issues)
+          BUF_MIN = 5               # ignore <5m (live-ish)
+          ETA_H   = 24              # only matches starting next 24h
+          CLV_MIN = 0.01            # require best_odds >= 1% above consensus (if consensus exists)
           MIN_CONF = 50
           TOP_DOGS, TOP_FAVS = 3, 2
           DOG_MIN, DOG_MAX = 2.20, 4.50
@@ -81,12 +81,14 @@ jobs:
 
           df = pd.read_csv("value_picks_pro.csv")
 
-          # Coerce numerics
+          # numeric coercion
           for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
-              if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-          if "confidence" not in df.columns: df["confidence"] = 0
+              if c in df.columns:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
+          if "confidence" not in df.columns:
+              df["confidence"] = 0
 
-          # Parse start time (prefer UTC)
+          # start time (prefer explicit UTC)
           if "commence_time_utc" in df.columns:
               df["commence_dt"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
           elif "commence_time" in df.columns:
@@ -94,22 +96,24 @@ jobs:
           else:
               df["commence_dt"] = pd.NaT
 
-          # Drop live/in-play
+          # remove live/in-play
           live_re = re.compile(r"(live|in[-\\s_]?play|started|progress)", re.I)
-          if "is_live" in df.columns: df = df[~df["is_live"].fillna(False).astype(bool)]
-          if "status"  in df.columns: df = df[~df["status"].astype(str).str.contains(live_re, na=False)]
+          if "is_live" in df.columns:
+              df = df[~df["is_live"].fillna(False).astype(bool)]
+          if "status" in df.columns:
+              df = df[~df["status"].astype(str).str.contains(live_re, na=False)]
 
-          # Upcoming-only window
+          # upcoming-only within 24h
           df = df[df["commence_dt"].notna() & (df["commence_dt"] >= cut) & (df["commence_dt"] <= eta_cap)]
 
-          # Required columns
+          # required columns
           need = ["player","opponent","tour","best_odds","blended_prob","commence_dt"]
           if any(col not in df.columns for col in need):
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                   f.write("Required columns missing in value_picks_pro.csv.\n")
               raise SystemExit(0)
 
-          # Kelly (use provided; else compute). Kelly = max(0, (b*p - (1-p))/b), decimal odds
+          # Kelly (use provided; else compute). decimal odds
           def kelly_from(p, odds):
               if pd.isna(p) or pd.isna(odds) or odds <= 1: return 0.0
               b = odds - 1.0
@@ -119,7 +123,7 @@ jobs:
           else:
               df["kelly"] = [kelly_from(p, o) for p, o in zip(df["blended_prob"], df["best_odds"])]
 
-          # Optional CLV (median of any extra odds columns)
+          # Optional CLV from any extra odds columns (median consensus)
           ignore = {"best_odds","blended_prob","ev_per_unit","kelly_fraction","kelly","confidence",
                     "player","opponent","tour","commence_time_utc","commence_time","commence_dt","status","is_live"}
           cand = [c for c in df.columns if c not in ignore and ("odds" in c.lower() or "price" in c.lower() or "bk_" in c.lower())]
@@ -138,56 +142,50 @@ jobs:
                       df = df[df["clv_edge"].notna() & (df["clv_edge"] >= CLV_MIN)]
                       clv_used = True
 
-          if df.empty:
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-                  f.write("No eligible picks in 24h window after filters.\n")
-              raise SystemExit(0)
-
-          # Ranking (EV/u just for ordering if present; not displayed)
+          # ranking (EV/u only for ordering if missing; not displayed)
           if "ev_per_unit" not in df.columns or df["ev_per_unit"].isna().all():
               df["ev_per_unit"] = df["best_odds"]*df["blended_prob"] - 1.0
 
+          # dedupe per match
           df["match_id"] = df.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1)
           df = df.sort_values(["ev_per_unit","confidence","commence_dt"], ascending=[False, False, True]).groupby("match_id", as_index=False).first()
 
+          # formatting helpers
           df["eta_min"] = (df["commence_dt"] - now).dt.total_seconds()/60.0
-          def eta_fmt(m): m=int(round(m)); h,mm=divmod(m,60); return f"{h}h {mm:02d}m" if h else f"{mm}m"
+          def eta_fmt(m): 
+              m = int(round(m)); h,mm = divmod(m,60)
+              return f"{h}h {mm:02d}m" if h else f"{mm}m"
           def ts_fmt(ts): return ts.strftime("%Y-%m-%d %H:%M UTC")
+
+          def section(title, picks_md):
+              return f"## 🎾 **{title}**\n\n{picks_md}\n"
+
+          def list_block(x):
+              if x.empty: return "_None_"
+              lines=[]
+              for i,(_,r) in enumerate(x.iterrows(), start=1):
+                  ln = (
+                      f"{i}. **{r['player']}** vs *{r['opponent']}* — **{r['best_odds']:.2f}** "
+                      f"_(p={r['blended_prob']:.2f}, Kelly={r['kelly']:.3f}"
+                  )
+                  if 'clv_edge' in r and pd.notna(r['clv_edge']):
+                      ln += f", CLV=+{r['clv_edge']*100:.1f}%"
+                  ln += f")_\n   🗓 **{ts_fmt(r['commence_dt'])}** • ETA: {eta_fmt(r['eta_min'])}"
+                  lines.append(ln)
+              return "\n".join(lines)
 
           def picks(sub, lo, hi, n):
               f = sub[(sub["best_odds"].between(lo, hi)) & (sub["confidence"].fillna(0) >= MIN_CONF)]
               return f.sort_values(["ev_per_unit","eta_min"], ascending=[False, True]).head(n)
 
-          def bullets(x):
-              if x.empty: return "_None_"
-              lines=[]
-              show_clv = "clv_edge" in x.columns
-              for _,r in x.iterrows():
-                  parts = [
-                      f"- {r['player']} vs {r['opponent']}",
-                      f"odds {r['best_odds']:.2f}",
-                      f"p {r['blended_prob']:.2f}",
-                      f"Kelly {r['kelly']:.3f}"
-                  ]
-                  if show_clv and pd.notna(r["clv_edge"]):
-                      parts.append(f"CLV +{r['clv_edge']*100:.1f}%")
-                  lines.append(" — ".join([" | ".join(parts), f"{ts_fmt(r['commence_dt'])} (ETA {eta_fmt(r['eta_min'])})"]))
-              return "\n".join(lines)
-
-          header = f"Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} — upcoming only (<= {ETA_H}h, buffer {BUF_MIN}m)."
-          header += f" CLV >= {int(CLV_MIN*100)}%." if clv_used else " CLV check skipped (no consensus columns)."
-
+          header = f"_Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} · upcoming-only (≤ {ETA_H}h, buffer {BUF_MIN}m)._"
+          header += f" _CLV ≥ {int(CLV_MIN*100)}% applied._" if clv_used else " _CLV check skipped (no consensus columns)._"
           out = [header, ""]
+
           for tour in ["ATP","WTA"]:
               sub = df[df["tour"].astype(str).str.upper()==tour]
-              out += [
-                  f"## {tour} Underdogs (Top {TOP_DOGS})",
-                  bullets(picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS)),
-                  "",
-                  f"## {tour} Favorites (Top {TOP_FAVS})",
-                  bullets(picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS)),
-                  ""
-              ]
+              out.append(section(f"{tour} Underdogs (Top {TOP_DOGS})", list_block(picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS))))
+              out.append(section(f"{tour} Favorites (Top {TOP_FAVS})",   list_block(picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS))))
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write("\n".join(out))
