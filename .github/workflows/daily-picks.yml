@@ -1,128 +1,114 @@
-name: Daily Tennis Picks (ATP/WTA Shortlist)
+name: Tennis Picks (ATP/WTA)
 
 on:
   schedule:
-    - cron: "0 8 * * *"   # runs daily at 08:00 UTC
+    - cron: "0 8 * * *"    # 08:00 UTC daily
   workflow_dispatch: {}
 
 jobs:
-  build:
+  picks:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (no requirements.txt)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests
 
-      # ---- Generate Elo from last two seasons ----
-      - name: Download ATP/WTA match data
+      # --- build Elo from last two seasons (simple but effective) ---
+      - name: Download ATP/WTA results
         run: |
           mkdir -p matches
-          curl -L -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -L -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -L -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -L -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
 
-      - name: Generate Elo ratings
+      - name: Generate Elo
         run: |
           python - <<'PY'
           import pandas as pd, glob, os
-          START_ELO, K = 1500, 32
+          START, K = 1500, 32
           def exp(a,b): return 1/(1+10**((b-a)/400))
-          def upd(a,b,s): return a + K*(s - exp(a,b))
+          def upd(a,b,s): return a + K*(s-exp(a,b))
           def calc(pattern):
               files = glob.glob(pattern)
-              df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-              elos = {}
+              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+              E = {}
               for _,r in df.iterrows():
                   w,l = r['winner_name'], r['loser_name']
-                  ew, el = elos.get(w, START_ELO), elos.get(l, START_ELO)
-                  elos[w] = upd(ew, el, 1)
-                  elos[l] = upd(el, ew, 0)
-              return pd.DataFrame([{"player":k,"elo":v} for k,v in elos.items()]).sort_values("elo", ascending=False)
+                  ew, el = E.get(w,START), E.get(l,START)
+                  E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
+              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()]).sort_values('elo',ascending=False)
           os.makedirs("data", exist_ok=True)
-          atp = calc("matches/atp_matches_*.csv")
-          wta = calc("matches/wta_matches_*.csv")
-          atp.to_csv("data/atp_elo.csv", index=False); atp.to_csv("atp_elo.csv", index=False)
-          wta.to_csv("data/wta_elo.csv", index=False); wta.to_csv("wta_elo.csv", index=False)
-          print("✅ Elo generated.")
+          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
+          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
+          print("Elo ready.")
           PY
 
-      # ---- Run your value model (must exist in repo root) ----
-      - name: Run tennis value picks
+      # --- run your model script to produce value_picks_pro.csv ---
+      - name: Run model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
 
-      # ---- Print SHORTLIST by Tour (ATP/WTA): 2 dogs + 1 favorite per tour ----
-      - name: Print SHORTLIST by Tour (ATP/WTA)
+      # --- print shortlist: 3 dogs + 2 favs per tour ---
+      - name: Print shortlist (3 Dogs, 2 Favs per tour)
         run: |
           python - <<'PY'
           import pandas as pd, os
-
-          # thresholds
           ODDS_DOG_MIN, ODDS_DOG_MAX = 2.20, 4.50
           ODDS_FAV_MIN, ODDS_FAV_MAX = 1.30, 1.80
           MIN_CONF = 50
+          TOP_DOGS, TOP_FAVS = 3, 2
 
-          # load picks
           df = pd.read_csv("value_picks_pro.csv")
-
-          # force numeric to avoid type errors
           for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
               df[c] = pd.to_numeric(df.get(c), errors="coerce")
           df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob"])
 
-          # deduplicate: keep higher-EV side per match
           def dedup(d):
               d = d.copy()
-              d.insert(0, "match_id",
-                       d.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1))
+              d.insert(0,"match_id", d.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1))
               return d.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).first()
 
-          # generic selector
-          def select_picks(data, odds_min, odds_max, top_n):
-              filt = data[
-                  (data["ev_per_unit"] > 0) &
-                  (data["best_odds"].between(odds_min, odds_max)) &
-                  (data["confidence"] >= MIN_CONF)
-              ]
-              return dedup(filt).sort_values(["ev_per_unit","confidence"], ascending=False).head(top_n)
+          def picks(data, lo, hi, n):
+              filt = data[(data["ev_per_unit"]>0) &
+                          (data["best_odds"].between(lo,hi)) &
+                          (data["confidence"]>=MIN_CONF)]
+              return dedup(filt).sort_values(["ev_per_unit","confidence"], ascending=False).head(n)
 
-          # build sections
-          sections = []
+          def bullets(x):
+              if x.empty: return "_None_"
+              b=[]
+              for _,r in x.iterrows():
+                  b.append(f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
+                           f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, "
+                           f"Kelly={r['kelly_fraction']:.2f}) — {r['commence_time_utc']}")
+              return "\n".join(b)
+
+          out=[]
           for tour in ["ATP","WTA"]:
-              sub = df[df["tour"].str.upper() == tour]
-
-              dogs = select_picks(sub, ODDS_DOG_MIN, ODDS_DOG_MAX, 2)
-              favs = select_picks(sub, ODDS_FAV_MIN, ODDS_FAV_MAX, 1)
-
-              def bullets(x):
-                  if x.empty: return "_None_"
-                  out=[]
-                  for _,r in x.iterrows():
-                      out.append(f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
-                                 f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, "
-                                 f"Kelly={r['kelly_fraction']:.2f}) — {r['commence_time_utc']}")
-                  return "\n".join(out)
-
-              sections.append(f"## 🎯 {tour} Smart Underdogs (Top 2)")
-              sections.append(bullets(dogs))
-              sections.append("")
-              sections.append(f"## 🛡 {tour} Safe High-Value Favorite (Top 1)")
-              sections.append(bullets(favs))
-              sections.append("")
+              sub = df[df["tour"].str.upper()==tour]
+              dogs = picks(sub, ODDS_DOG_MIN, ODDS_DOG_MAX, TOP_DOGS)
+              favs = picks(sub, ODDS_FAV_MIN, ODDS_FAV_MAX, TOP_FAVS)
+              out += [
+                  f"## 🎯 {tour} Smart Underdogs (Top {TOP_DOGS})",
+                  bullets(dogs),
+                  "",
+                  f"## 🛡 {tour} Safe High-Value Favorites (Top {TOP_FAVS})",
+                  bullets(favs),
+                  ""
+              ]
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("\n".join(sections))
+              f.write("\n".join(out))
           PY
