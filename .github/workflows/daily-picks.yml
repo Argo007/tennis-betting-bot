@@ -1,9 +1,71 @@
-  -      name:  Tennis Edge 24h QKelly
-          env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # not used here, but harmless if present
-          START_BUFFER_MIN: "5"       # treat <5 min as live-ish
-          MAX_ETA_H: "24"             # only show matches starting within 24h
-          CLV_MIN_PCT: "1.0"          # require best_odds >= 1% above market median (if available)
+name: Tennis Picks (ATP/WTA)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"    # 08:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  picks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      # --- build Elo from last two seasons (simple but effective) ---
+      - name: Download ATP/WTA results
+        run: |
+          mkdir -p matches
+          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+
+      - name: Generate Elo
+        run: |
+          python - <<'PY'
+          import pandas as pd, glob, os
+          START, K = 1500, 32
+          def exp(a,b): return 1/(1+10**((b-a)/400))
+          def upd(a,b,s): return a + K*(s-exp(a,b))
+          def calc(pattern):
+              files = glob.glob(pattern)
+              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+              E = {}
+              for _,r in df.iterrows():
+                  w,l = r['winner_name'], r['loser_name']
+                  ew, el = E.get(w,START), E.get(l,START)
+                  E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
+              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()]).sort_values('elo',ascending=False)
+          os.makedirs("data", exist_ok=True)
+          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
+          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
+          print("Elo ready.")
+          PY
+
+      # --- run your model script to produce value_picks_pro.csv ---
+      - name: Run model
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python tennis_value_picks_pro.py --region eu --lookahead-h 168 --out value_picks_pro.csv
+
+      # --- print shortlist: upcoming-only (24h) + quarter-Kelly + optional CLV ---
+      - name: Tennis Edge 24h QKelly
+        env:
+          START_BUFFER_MIN: "5"      # treat <5 min as live-ish
+          MAX_ETA_H: "24"            # only show matches starting in next 24h
+          CLV_MIN_PCT: "1.0"         # keep only if best_odds beats market median by >=1% (if consensus available)
           MIN_CONF: "50"
           TOP_DOGS: "3"
           TOP_FAVS: "2"
@@ -15,13 +77,11 @@
           python - <<'PY'
           import os, re, pandas as pd, datetime as dt
 
-          # -------- config --------
+          # config
           def getenv(k, cast, default):
               v = os.getenv(k, str(default))
-              try:
-                  return cast(v)
-              except Exception:
-                  return default
+              try: return cast(v)
+              except: return default
 
           BUF_MIN   = getenv("START_BUFFER_MIN", int, 5)
           ETA_H     = getenv("MAX_ETA_H", int, 24)
@@ -34,10 +94,9 @@
           FAV_MIN   = getenv("ODDS_FAV_MIN", float, 1.30)
           FAV_MAX   = getenv("ODDS_FAV_MAX", float, 1.80)
 
-          # -------- load model output --------
           df = pd.read_csv("value_picks_pro.csv")
 
-          # numerics (best effort)
+          # coerce numerics if present
           for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
               if c in df.columns:
                   df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -46,7 +105,7 @@
           cut = now + dt.timedelta(minutes=BUF_MIN)
           eta_cap = now + dt.timedelta(hours=ETA_H)
 
-          # start time
+          # parse start time
           if "commence_time_utc" in df.columns:
               df["commence_dt"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
           elif "commence_time" in df.columns:
@@ -54,25 +113,26 @@
           else:
               df["commence_dt"] = pd.NaT
 
-          # drop live/status and keep upcoming within 24h
+          # drop live/started
           live_re = re.compile(r"(live|in[-\s_]?play|started|progress)", re.I)
           if "is_live" in df.columns:
               df = df[~df["is_live"].fillna(False).astype(bool)]
           if "status" in df.columns:
               df = df[~df["status"].astype(str).str.contains(live_re, na=False)]
+
+          # keep only upcoming within 24h window
           df = df[df["commence_dt"].notna() & (df["commence_dt"] >= cut) & (df["commence_dt"] <= eta_cap)]
 
-          # required cols
-          needed = ["player","opponent","tour","best_odds","blended_prob","commence_dt"]
-          if any(col not in df.columns for col in needed):
+          # essentials
+          need = ["player","opponent","tour","best_odds","blended_prob","commence_dt"]
+          if any(col not in df.columns for col in need):
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                   f.write("Required columns missing in value_picks_pro.csv.\n")
               raise SystemExit(0)
 
-          # -------- quarter-Kelly --------
+          # quarter-Kelly (use provided kelly_fraction if present; else compute)
           def kelly_from(p, odds):
-              if pd.isna(p) or pd.isna(odds) or odds <= 1: 
-                  return 0.0
+              if pd.isna(p) or pd.isna(odds) or odds <= 1: return 0.0
               b = odds - 1.0
               return max(0.0, (b*p - (1.0 - p)) / b) if b > 0 else 0.0
 
@@ -84,13 +144,11 @@
 
           # EV if missing
           if "ev_per_unit" not in df.columns:
-              df["ev_per_unit"] = df["best_odds"] * df["blended_prob"] - 1.0
+              df["ev_per_unit"] = df["best_odds"]*df["blended_prob"] - 1.0
 
-          # -------- optional CLV consensus (median of any extra odds columns) --------
-          ignore = {
-              "best_odds","blended_prob","ev_per_unit","kelly_fraction","kelly","qkelly","confidence",
-              "player","opponent","tour","commence_time_utc","commence_time","commence_dt","status","is_live"
-          }
+          # optional CLV consensus (median of any extra odds columns if present)
+          ignore = {"best_odds","blended_prob","ev_per_unit","kelly_fraction","kelly","qkelly","confidence",
+                    "player","opponent","tour","commence_time_utc","commence_time","commence_dt","status","is_live"}
           cand = [c for c in df.columns if c not in ignore and ("odds" in c.lower() or "price" in c.lower() or "bk_" in c.lower())]
           clv_used = False
           if cand:
@@ -98,8 +156,7 @@
               for c in cand:
                   try:
                       df[c] = pd.to_numeric(df[c], errors="coerce")
-                      if df[c].notna().any():
-                          num_cols.append(c)
+                      if df[c].notna().any(): num_cols.append(c)
                   except Exception:
                       pass
               if num_cols:
@@ -111,14 +168,15 @@
 
           if df.empty:
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-                  f.write(f"No eligible picks in 24h window after filters.\n")
+                  f.write("No eligible picks in 24h window after filters.\n")
               raise SystemExit(0)
 
-          # -------- dedupe, rank, print --------
+          # dedupe by match
           df["match_id"] = df.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1)
           df = df.sort_values(["ev_per_unit","qkelly","confidence","commence_dt"],
                               ascending=[False, False, False, True]).groupby("match_id", as_index=False).first()
-          df["eta_min"] = (df["commence_dt"] - now).dt.total_seconds() / 60.0
+
+          df["eta_min"] = (df["commence_dt"] - now).dt.total_seconds()/60.0
 
           def picks(data, lo, hi, n):
               f = data[
@@ -130,28 +188,25 @@
               return f.sort_values(["ev_per_unit","qkelly","eta_min"], ascending=[False, False, True]).head(n)
 
           def bullets(x):
-              if x.empty: 
-                  return "_None_"
-              lines = []
-              for _, r in x.iterrows():
+              if x.empty: return "_None_"
+              out=[]
+              for _,r in x.iterrows():
                   start_iso = r["commence_dt"].strftime("%Y-%m-%d %H:%M UTC")
-                  line = (
-                      f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
-                      f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, QKelly={r['qkelly']:.3f}"
-                  )
+                  line = (f"- {r['player']} vs {r['opponent']} @ {r['best_odds']:.2f} "
+                          f"(p={r['blended_prob']:.2f}, EV/u={r['ev_per_unit']:.2f}, QKelly={r['qkelly']:.3f}")
                   if "clv_edge" in r and pd.notna(r["clv_edge"]):
                       line += f", CLV={r['clv_edge']*100:.1f}%"
                   line += f") — {start_iso} (ETA {int(r['eta_min'])}m)"
-                  lines.append(line)
-              return "\n".join(lines)
+                  out.append(line)
+              return "\n".join(out)
 
           header = [f"Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} - upcoming only (<= {ETA_H}h, buffer {BUF_MIN}m)."]
-          header.append(f"CLV >= {int(CLV_MIN*100)}% vs median." if clv_used else "CLV check skipped (no consensus columns).")
+          header.append("CLV >= {}% vs median.".format(int(CLV_MIN*100)) if clv_used else "CLV check skipped (no consensus columns).")
 
-          out = []
+          out=[]
           out.append(" ".join(header) + "\n")
           for tour in ["ATP","WTA"]:
-              sub = df[df["tour"].astype(str).str.upper() == tour]
+              sub = df[df["tour"].astype(str).str.upper()==tour]
               dogs = picks(sub, DOG_MIN, DOG_MAX, TOP_DOGS)
               favs = picks(sub, FAV_MIN, FAV_MAX, TOP_FAVS)
               out += [
