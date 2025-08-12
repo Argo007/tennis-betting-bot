@@ -38,7 +38,7 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
       - name: Download ATP/WTA results
@@ -83,6 +83,7 @@ jobs:
           set -euo pipefail
           python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out value_picks_pro.csv
 
-      - name: Print shortlist (3 Dogs, 2 Favs per tour)
-        run: |
-          python scripts/print_shortlist.py
+      - name: Print shortlist (YES picks only)
+        env:
+          PICKS_CSV: value_picks_pro.csv
+        run: python -X utf8 scripts/print_shortlist.py
