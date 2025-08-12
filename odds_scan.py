@@ -86,11 +86,62 @@ def dual_times(start_iso):
     except Exception:
         return start_iso, start_iso
 
+
 def analyze_event(ev):
     rows = []
     commence = ev.get("commence_time")
     if not within_lookahead(commence):
         return rows
+
+    home = ev.get("home_team") or ""
+    away = ev.get("away_team") or ""
+    sport_title = ev.get("sport_title") or ""
+
+    for b in ev.get("bookmakers", []):
+        book = b.get("title")
+        for mk in b.get("markets", []):
+            mkey = mk.get("key")
+            outcomes = mk.get("outcomes", [])
+            if not outcomes:
+                continue
+            prices = [o.get("price") for o in outcomes]
+            probs = normalize_probs([implied_prob_decimal(pr) for pr in prices])
+
+            for o, pr, p_mkt in zip(outcomes, prices, probs):
+                if pr is None or p_mkt is None:
+                    continue
+                p_adj = min(p_mkt + edge_pp_for_price(pr), 0.99)
+                f = kelly_fraction(pr, p_adj)
+                evu = p_adj * pr - 1.0
+                local_str, utc_str = dual_times(commence)
+
+                market = {"h2h":"moneyline","spreads":"spread","totals":"total_games"}.get(mkey, mkey)
+                line = o.get("point") if mkey in ("spreads","totals") else ""
+
+                # Heuristics:
+                # - Totals: if point <= 7.5 we treat it as total_sets (e.g., 2.5, 3.5, 4.5).
+                if mkey == "totals" and isinstance(line, (int,float)) and line <= 7.5:
+                    market = "total_sets"
+
+                # - Spreads: if abs(point) in {1.5, 2.5, 3.5}, label as set_spread (common in Bo3/Bo5).
+                if mkey == "spreads" and isinstance(line, (int,float)) and abs(line) in (1.5, 2.5, 3.5):
+                    market = "set_spread"
+
+                rows.append({
+                    "Tournament": sport_title,
+                    "Match": f"{away} vs {home}",
+                    "Market": market,
+                    "Line": "" if line is None else line,
+                    "Odds": round(pr,2),
+                    "p_mkt": round(p_mkt,3),
+                    "p_adj": round(p_adj,3),
+                    "EV/u": round(evu,3),
+                    "Kelly": round(f,3),
+                    "Start (CEST)": local_str,
+                    "Start (UTC)": utc_str,
+                    "Book": book,
+                })
+    return rows
 
     home = ev.get("home_team") or ""
     away = ev.get("away_team") or ""
