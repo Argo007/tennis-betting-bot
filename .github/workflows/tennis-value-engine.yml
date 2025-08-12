@@ -1,0 +1,92 @@
+name: Tennis Value Engine (Unified)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 08:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tennis-value-engine
+  cancel-in-progress: true
+
+env:
+  TZ: Europe/Amsterdam
+  LOOKAHEAD_HOURS: "24"
+  KELLY_MIN: "0.05"
+  MODEL_EV_MIN: "0.00"
+  MARKET_EV_MIN: "0.00"
+  REGIONS: "eu,uk,us,au"
+  MARKETS: "h2h,spreads,totals"
+  TOURS: "ATP,WTA"
+  OUT_DIR: "outputs"
+  SHORTLIST_FILE: "value_engine_shortlist.md"
+  TOP_DOGS: "3"
+  TOP_FAVS: "2"
+
+jobs:
+  value:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prep requirements
+        run: |
+          printf "pandas\nrequests\n" > requirements.txt
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch recent results (for Elo)
+        run: |
+          set -euo pipefail
+          mkdir -p matches data scripts outputs
+          curl -sSLo matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -sSLo matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -sSLo matches/atp_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv || true
+          curl -sSLo matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -sSLo matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+          curl -sSLo matches/wta_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2025.csv || true
+
+      - name: Run unified engine
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          LOOKAHEAD_HOURS: ${{ env.LOOKAHEAD_HOURS }}
+          KELLY_MIN: ${{ env.KELLY_MIN }}
+          MODEL_EV_MIN: ${{ env.MODEL_EV_MIN }}
+          MARKET_EV_MIN: ${{ env.MARKET_EV_MIN }}
+          REGIONS: ${{ env.REGIONS }}
+          MARKETS: ${{ env.MARKETS }}
+          TOURS: ${{ env.TOURS }}
+          TZ: ${{ env.TZ }}
+          OUT_DIR: ${{ env.OUT_DIR }}
+          SHORTLIST_FILE: ${{ env.SHORTLIST_FILE }}
+          TOP_DOGS: ${{ env.TOP_DOGS }}
+          TOP_FAVS: ${{ env.TOP_FAVS }}
+        run: |
+          python scripts/tennis_value_engine.py
+
+      - name: Commit & push outputs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add outputs/${{ env.SHORTLIST_FILE }} scripts/tennis_value_engine.py requirements.txt
+          git diff --staged --quiet && { echo "No changes to commit."; exit 0; }
+          git commit -m "Update unified tennis shortlist [skip ci]"
+          git pull --rebase --autostash || true
+          git push
