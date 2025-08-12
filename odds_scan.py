@@ -3,8 +3,12 @@
 """
 Tennis Kelly Sweet Spots Scanner
 --------------------------------
-Scans ATP/WTA/Challenger/ITF markets for +EV spreads & totals.
-Shops best odds, removes vig, filters pre-match, computes Kelly.
+Scans ATP/WTA/Challenger/ITF spreads & totals (pre-match only).
+- Best-price shopping across books
+- No-vig fair probabilities
+- Kelly filter (full Kelly)
+- CET/CEST-correct timestamps via zoneinfo
+- Clean Markdown output in your existing column order
 
 Author: Optimized by ChatGPT
 """
@@ -20,22 +24,22 @@ import requests
 # =========================
 API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 
-# Kelly threshold: report only if full Kelly fraction >= this
+# Only include outcomes whose Full Kelly fraction >= this value
 KELLY_THRESHOLD = float(os.getenv("KELLY_THRESHOLD", "0.10"))
 
-# Pre-match only: look ahead this many hours
+# Pre-match lookahead window (hours)
 LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "24"))
 
 # Output file name
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "kelly_sweet_spots.md")
 
-# Regions (books) to search for best odds
+# Regions/books to search
 REGIONS = os.getenv("REGIONS", "eu,uk,us")
 
-# Markets to check (spreads & totals for now)
+# Markets to analyze
 MARKETS = os.getenv("MARKETS", "spreads,totals")
 
-# Tennis ladders to scan
+# Tennis ladders
 SPORTS = [
     "tennis_atp",
     "tennis_wta",
@@ -50,8 +54,9 @@ DATE_FORMAT = "iso"
 # Local timezone for display
 LOCAL_TZ = ZoneInfo(os.getenv("TZ", "Europe/Amsterdam"))
 
+
 # =========================
-# Helper functions
+# Helpers
 # =========================
 def within_window(commence_iso: str) -> bool:
     """True if match starts within [now, now+LOOKAHEAD_HOURS] UTC."""
@@ -81,7 +86,10 @@ def fetch_odds(sport_key: str) -> List[Dict]:
     return []
 
 def best_price_shop(bookmakers: List[Dict], market_key: str) -> Dict[Tuple[float, str], Dict]:
-    """Track best odds across all books for (points, outcome_name)."""
+    """
+    Track the best (max) odds across all books for each (points, outcome_name).
+    Return {(points, outcome): {"price": float, "books": set(str)}}
+    """
     grid: Dict[Tuple[float, str], Dict] = {}
     for bm in bookmakers:
         bm_name = bm.get("title", "?")
@@ -101,7 +109,12 @@ def best_price_shop(bookmakers: List[Dict], market_key: str) -> Dict[Tuple[float
 
 def pair_two_way_by_line(price_map: Dict[Tuple[float, str], Dict],
                          outcomes_pair: Tuple[str, str]) -> List[Tuple[float, Dict, Dict]]:
-    """Pair Over/Under or two spread sides for same line."""
+    """
+    Pair Over/Under or two spread sides for the same line.
+    For totals: ('Over','Under') pairs cleanly.
+    For spreads (book naming varies), fallback: if exactly 2 outcomes on a line, pair them.
+    Returns: list of (points, sideA_dict, sideB_dict)
+    """
     pairs = []
     by_pts: Dict[float, List[Tuple[str, Dict]]] = {}
     for (pts, name), cell in price_map.items():
@@ -117,7 +130,7 @@ def pair_two_way_by_line(price_map: Dict[Tuple[float, str], Dict],
     return pairs
 
 def fair_probs_two_way(price_a: float, price_b: float):
-    """Return raw implied & vig-free probabilities."""
+    """Return raw implied & no-vig fair probabilities for a 2-way market."""
     ia, ib = 1.0 / price_a, 1.0 / price_b
     total = ia + ib
     if total <= 0:
@@ -130,7 +143,7 @@ def kelly_fraction(p_true: float, odds: float) -> float:
     return max(0.0, (b * p_true - (1 - p_true)) / b) if b > 0 else 0.0
 
 def local_time_strings(commence_iso: str) -> Tuple[str, str]:
-    """Return local & UTC time strings with correct tz abbreviation."""
+    """Return local & UTC time strings with correct tz abbreviation (CET/CEST)."""
     start_utc = datetime.fromisoformat(commence_iso.replace("Z", "+00:00"))
     start_local = start_utc.astimezone(LOCAL_TZ)
     return (
@@ -139,9 +152,9 @@ def local_time_strings(commence_iso: str) -> Tuple[str, str]:
     )
 
 # =========================
-# Markdown writer (your style, tz fixed)
+# Markdown writer (your format preserved)
 # =========================
-def write_markdown(hits):
+def write_markdown(hits: List[Dict]):
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(LOCAL_TZ)
     header = (
@@ -248,7 +261,7 @@ def main():
                             "Book": ", ".join(sorted(bookset)),
                         })
 
-    # Sort: highest Kelly, then earliest UTC start
+    # Sort: highest Kelly first, then earliest UTC start
     all_hits.sort(key=lambda r: (-float(r["Kelly"]), r["Start (UTC)"]))
     write_markdown(all_hits)
 
