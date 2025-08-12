@@ -183,4 +183,12 @@ jobs:
                   lines.append("_None_")
                   continue
               for o in tdf:
-                  lines.append(f"- {o['playe]()
+                  lines.append(f"- {o['player']} vs {o['opponent']} @ {o['best_odds']:.2f} "
+                               f"(p={o['p_sane']}, Δp={o['delta_p']}, Kelly={o['kelly_sane']}) — Bet: {o['bet']}"
+                               + (f" ❌ {o['reason']}" if o['reason'] else "")
+                               + f" • {o['start']}")
+              lines.append("")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines))
+          PY
