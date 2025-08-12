@@ -1,6 +1,8 @@
-# Tennis Kelly Sweet Spots (≥ 0.25)
+# Tennis Kelly Sweet Spots (>= 0.10)
 
-Last updated: 2025-08-12 11:45 CEST  
-(2025-08-12 09:45 UTC)
+Last updated: 2025-08-12 21:16 CEST  
+(2025-08-12 19:16 UTC)
 
-_No qualifying pre-match opportunities in the next 12 hours._
+| Tournament | Match | Market | Line | Odds | p_mkt | p_adj | EV/u | Kelly | Start (CEST) | Start (UTC) | Book |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| No qualifying pre-match opportunities in the next 24 hours | – | – | – | – | – | – | – | – | – | – | – |
