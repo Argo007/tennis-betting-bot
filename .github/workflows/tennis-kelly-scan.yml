@@ -12,17 +12,18 @@ concurrency:
   group: tennis-kelly-scan
   cancel-in-progress: true
 
+env:
+  TZ: Europe/Amsterdam
+  # Tunables (override in repo/Org env if you like)
+  LOOKAHEAD_HOURS: "24"
+  KELLY_THRESHOLD: "0.10"
+  REGIONS: "eu,uk,us"
+  MARKETS: "spreads,totals"
+  OUTPUT_FILE: "kelly_sweet_spots.md"
+
 jobs:
   scan:
     runs-on: ubuntu-latest
-    env:
-      TZ: Europe/Amsterdam
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
-      PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
-      # Tunables
-      WINDOW_HOURS: "24"        # only matches starting in next N hours
-      EDGE_THRESHOLD: "0.20"    # show bets with edge >= 20%
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -38,18 +39,38 @@ jobs:
 
       - name: Install deps
         run: |
+          printf "requests\n" > requirements.txt
           python -m pip install --upgrade pip
-          printf "requests\npython-dotenv\npytz\n" > requirements.txt
           pip install -r requirements.txt
 
       - name: Run scan
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          LOOKAHEAD_HOURS: ${{ env.LOOKAHEAD_HOURS }}
+          KELLY_THRESHOLD: ${{ env.KELLY_THRESHOLD }}
+          REGIONS: ${{ env.REGIONS }}
+          MARKETS: ${{ env.MARKETS }}
+          OUTPUT_FILE: ${{ env.OUTPUT_FILE }}
         run: |
-          python odds_scan.py
+          python odds_scan.py || exit 1
+          # If The Odds API returns quota headers, print them (nice for debugging usage):
+          echo "---- Quota (if present) ----"
+          curl -sS -I "https://api.the-odds-api.com/v4/sports/tennis_atp/odds?apiKey=${ODDS_API_KEY}&regions=${REGIONS}&markets=${MARKETS}&oddsFormat=decimal&dateFormat=iso" \
+            | grep -iE "x-requests-remaining|x-requests-used|x-requests-reset" || true
+          echo "----------------------------"
 
       - name: Commit & push Markdown table
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add kelly_sweet_spots.md requirements.txt odds_scan.py
-          git commit -m "Update Kelly sweet spots table [skip ci]" || echo "Nothing to commit"
+
+          # Only add the files we actually expect to change
+          git add ${{ env.OUTPUT_FILE }} odds_scan.py requirements.txt
+
+          # Skip commit if nothing changed
+          git diff --staged --quiet && { echo "No changes to commit."; exit 0; }
+
+          git commit -m "Update Kelly sweet spots table [skip ci]"
+          # Rebase to avoid push races if schedule overlaps
+          git pull --rebase --autostash || true
           git push
