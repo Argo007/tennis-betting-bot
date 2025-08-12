@@ -25,10 +25,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      # create deps file so setup-python cache doesn't error
+      # minimal deps so setup-python cache is happy
       - name: Prepare dependencies
         run: |
-          printf "pandas\nrequests\n" > requirements.txt
+          printf "pandas\nrequests\npytz\n" > requirements.txt
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -42,7 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- build Elo ---
+      # --- build Elo (last 2–3 seasons) ---
       - name: Download ATP/WTA results
         run: |
           set -euo pipefail
@@ -78,7 +78,7 @@ jobs:
           print("Elo ready.")
           PY
 
-      # --- 24h search window ---
+      # --- run your model with a strict 24h window ---
       - name: Run model (24h)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out value_picks_pro.csv
 
-      # --- shortlist with 24h filter + Kelly cap on dogs ---
+      # --- print shortlist: stake removed, Bet: YES/NO instead ---
       - name: Print shortlist (3 Dogs, 2 Favs per tour)
         run: |
           python - <<'PY'
@@ -97,13 +97,16 @@ jobs:
           ODDS_FAV_MIN, ODDS_FAV_MAX = 1.30, 1.80
           MIN_CONF = 50
           TOP_DOGS, TOP_FAVS = 3, 2
-          DOG_KELLY_CAP = 0.25
+
+          # Odds "goodness" threshold -> YES if EV>0 and Kelly>=this
+          BET_KELLY_MIN = 0.05
 
           if not os.path.exists("value_picks_pro.csv"):
               print("No value_picks_pro.csv produced — skipping shortlist.")
               sys.exit(0)
 
           df = pd.read_csv("value_picks_pro.csv")
+
           for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
               if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -112,9 +115,11 @@ jobs:
           if miss:
               print("Missing columns:", ", ".join(miss)); sys.exit(0)
 
+          # Hard 24h filter (UTC)
           now = datetime.now(timezone.utc); in24 = now + timedelta(hours=24)
           df["commence_time_utc"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
           df = df[(df["commence_time_utc"] >= now) & (df["commence_time_utc"] <= in24)]
+
           df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob","kelly_fraction","commence_time_utc"])
 
           def dedup(d):
@@ -130,8 +135,8 @@ jobs:
               ]
               return dedup(filt).sort_values(["ev_per_unit","confidence"], ascending=[False, False]).head(n)
 
-          def stake_fraction(row):
-              return min(float(row["kelly_fraction"]), DOG_KELLY_CAP) if row["best_odds"] >= ODDS_DOG_MIN else float(row["kelly_fraction"])
+          def bet_yes_no(row):
+              return "YES" if (row["ev_per_unit"] > 0) and (row["kelly_fraction"] >= BET_KELLY_MIN) else "NO"
 
           def bullets(x):
               if x.empty: return "_None_"
@@ -139,7 +144,7 @@ jobs:
               for _,r in x.iterrows():
                   lines.append(
                       f"- {r['player']} vs {r['opponent']} — {r['best_odds']:.2f} "
-                      f"(p={r['blended_prob']:.2f}, Kelly={r['kelly_fraction']:.3f}, Stake={stake_fraction(r):.3f})\n"
+                      f"(p={r['blended_prob']:.2f}, Kelly={r['kelly_fraction']:.3f}, Bet: {bet_yes_no(r)})\n"
                       f"  🗓 {r['commence_time_utc'].strftime('%Y-%m-%d %H:%M UTC')}"
                   )
               return "\n".join(lines)
@@ -160,11 +165,3 @@ jobs:
               f.write("\n".join(out))
           print("Shortlist written to job summary.")
           PY
-
-      - name: Upload artifact (CSV)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: value_picks_pro
-          path: value_picks_pro.csv
-          if-no-files-found: warn
