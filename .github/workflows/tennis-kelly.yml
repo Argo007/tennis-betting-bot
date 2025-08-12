@@ -3,7 +3,7 @@ name: Tennis Kelly Scan (Spreads & Totals)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "5 * * * *"   # hourly at minute 5
+    - cron: "5 * * * *"   # hourly at :05
 
 permissions:
   contents: write
@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Amsterdam
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+      PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,7 +30,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          echo "requests\npython-dotenv\n" > requirements.txt
+          printf "requests\npython-dotenv\n" > requirements.txt
           pip install -r requirements.txt
 
       - name: Run scan
