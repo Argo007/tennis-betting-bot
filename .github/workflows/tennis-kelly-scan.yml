@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: tennis-kelly-scan
+  cancel-in-progress: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -16,6 +20,9 @@ jobs:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
       PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
       PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+      # Tunables
+      WINDOW_HOURS: "24"        # only matches starting in next N hours
+      EDGE_THRESHOLD: "0.20"    # show bets with edge >= 20%
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,11 +33,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          printf "requests\npython-dotenv\n" > requirements.txt
+          printf "requests\npython-dotenv\npytz\n" > requirements.txt
           pip install -r requirements.txt
 
       - name: Run scan
