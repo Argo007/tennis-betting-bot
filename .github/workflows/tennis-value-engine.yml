@@ -65,12 +65,12 @@ jobs:
       - name: Run unified engine
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          LOOKAHEAD_HOURS: ${{ env.LOOKAHEAD_HOURS }}
-          KELLY_MIN: ${{ env.KELLY_MIN }}
-          MODEL_EV_MIN: ${{ env.MODEL_EV_MIN }}
-          MARKET_EV_MIN: ${{ env.MARKET_EV_MIN }}
-          REGIONS: ${{ env.REGIONS }}
-          MARKETS: ${{ env.MARKETS }}
+          REGIONS: "eu,uk,us,au"
+          MARKETS: "h2h,spreads,totals"
+          LOOKAHEAD_HOURS: "36"
+          KELLY_MIN: "0.00"
+          MODEL_EV_MIN: "-0.02"
+          MARKET_EV_MIN: "-0.02"
           TOURS: ${{ env.TOURS }}
           TZ: ${{ env.TZ }}
           OUT_DIR: ${{ env.OUT_DIR }}
