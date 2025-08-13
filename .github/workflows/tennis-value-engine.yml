@@ -14,18 +14,17 @@ concurrency:
 
 env:
   TZ: Europe/Amsterdam
-  LOOKAHEAD_HOURS: "24"
-  KELLY_MIN: "0.05"
-  MODEL_EV_MIN: "0.00"
-  MARKET_EV_MIN: "0.00"
-  REGIONS: "eu,uk,us,au"
-  MARKETS: "h2h,spreads,totals"
+  LOOKAHEAD_HOURS: "36"     # widen window
+  KELLY_MIN: "0.00"         # show even tiny edges
+  MODEL_EV_MIN: "-0.02"     # allow slight negative to inspect
+  MARKET_EV_MIN: "-0.02"
+  REGIONS: "eu,uk,us,au"    # more books = more markets
+  MARKETS: "h2h,spreads,totals"  # include ML so we actually get markets
   TOURS: "ATP,WTA"
   OUT_DIR: "outputs"
   SHORTLIST_FILE: "value_engine_shortlist.md"
   TOP_DOGS: "3"
   TOP_FAVS: "2"
-
 jobs:
   value:
     runs-on: ubuntu-latest
