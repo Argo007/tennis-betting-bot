@@ -1,6 +1,6 @@
 # Tennis Value Engine
 
-Updated: 2025-08-13 08:56 Amsterdam (2025-08-13 06:56 UTC)
+Updated: 2025-08-13 10:15 Amsterdam (2025-08-13 08:15 UTC)
 
 ## 🏆 ATP — Model Underdogs (Top 3)
 _None_
