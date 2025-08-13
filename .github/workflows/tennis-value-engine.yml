@@ -43,21 +43,22 @@ jobs:
       # Secrets MUST be set in this step's env (just like your working workflow)
       - name: Run unified engine
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # <-- critical
-          # Engine settings (tweak as you like)
-          REGIONS: "eu,uk,us,au"
-          MARKETS: "h2h,spreads,totals"
-          LOOKAHEAD_HOURS: "36"
-          KELLY_MIN: "0.05"
-          EV_MIN: "0.00"
-          TOP_ROWS: "25"
-          TZ: "Europe/Amsterdam"
-          OUT_DIR: "outputs"
-          SHORTLIST_FILE: "value_engine_shortlist.md"
+         ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # critical
+         SPORT_KEYS: "tennis"                        # generic key your plan supports
+         REGIONS: "eu,uk,us,au"
+         MARKETS: "h2h,spreads,totals"
+         LOOKAHEAD_HOURS: "36"                       # widen if needed
+         KELLY_MIN: "0.05"
+         EV_MIN: "0.00"
+         TOP_ROWS: "25"
+         TZ: "Europe/Amsterdam"
+         OUT_DIR: "outputs"
+         SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
-          set -euo pipefail
-          [ -n "${ODDS_API_KEY:-}" ] || { echo "ERROR: ODDS_API_KEY is not set"; exit 1; }
-          python scripts/tennis_value_engine.py
+         set -euo pipefail
+         [ -n "${ODDS_API_KEY:-}" ] || { echo "ERROR: ODDS_API_KEY is not set"; exit 1; }
+         python scripts/tennis_value_engine.py
+
 
       - name: Commit & push shortlist
         run: |
