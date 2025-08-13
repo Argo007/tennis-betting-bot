@@ -2,15 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Tennis Value Engine — Table Edition
------------------------------------
-- Builds Elo if missing (ATP/WTA, last 2–3 seasons from Sackmann).
-- Pulls ATP & WTA odds (H2H + spreads + totals) from The Odds API.
-- Computes:
-    * Model vs Market (Elo vs best H2H)
-    * Market vs Market (no-vig Kelly on H2H/Spreads/Totals)
-- ALWAYS writes a Markdown table with rows (top candidates),
-  even if nothing clears thresholds (they’ll show Bet:NO).
+Tennis Value Engine — with API Diagnostics
+- Builds Elo if missing (ATP/WTA from Sackmann 2023–2025).
+- Fetches ATP & WTA odds (h2h, spreads, totals) from The Odds API.
+- Computes model vs market (Elo vs H2H) and market no-vig edges.
+- ALWAYS writes a Markdown table.
+- If no rows, appends a clear API diagnostics section so you see WHY.
 """
 
 import os, io, unicodedata, requests, pandas as pd
@@ -18,29 +15,28 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-# ===================== ENV =====================
+# ---------------- ENV ----------------
 API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 if not API_KEY:
     raise SystemExit("ODDS_API_KEY not set")
 
 LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "24"))
-REGIONS         = os.getenv("REGIONS", "eu,uk,us,au")
-MARKETS         = os.getenv("MARKETS", "h2h,spreads,totals")
+REGIONS         = os.getenv("REGIONS", "eu,uk,us,au")            # NO SPACES
+MARKETS         = os.getenv("MARKETS", "h2h,spreads,totals")     # NO SPACES
 
-# Recommendation gates (Bet = YES iff both gates pass)
-KELLY_MIN       = float(os.getenv("KELLY_MIN", "0.05"))
-EV_MIN          = float(os.getenv("EV_MIN", "0.00"))          # unified EV gate
+KELLY_MIN = float(os.getenv("KELLY_MIN", "0.05"))
+EV_MIN    = float(os.getenv("EV_MIN", "0.00"))
+TOP_ROWS  = int(os.getenv("TOP_ROWS", "25"))
 
-TOP_ROWS        = int(os.getenv("TOP_ROWS", "25"))            # rows to show even if NO
-OUT_DIR         = Path(os.getenv("OUT_DIR", "outputs"))
-SHORTLIST_FILE  = os.getenv("SHORTLIST_FILE", "value_engine_shortlist.md")
-LOCAL_TZ        = ZoneInfo(os.getenv("TZ", "Europe/Amsterdam"))
+OUT_DIR        = Path(os.getenv("OUT_DIR", "outputs"))
+SHORTLIST_FILE = os.getenv("SHORTLIST_FILE", "value_engine_shortlist.md")
+LOCAL_TZ       = ZoneInfo(os.getenv("TZ", "Europe/Amsterdam"))
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SPORT_KEYS = ["tennis_atp", "tennis_wta"]
 
-# ===================== Elo =====================
+# ---------------- Elo ----------------
 START_ELO, K = 1500, 32
 def _exp(a,b): return 1/(1+10**((b-a)/400))
 def _upd(a,b,s): return a + K*(s-_exp(a,b))
@@ -108,19 +104,34 @@ def p_model(player_a: str, player_b: str, idx: dict):
     if e1 is None or e2 is None: return None
     return _exp(e1, e2)
 
-# ===================== Odds API =====================
-def fetch_odds(sport_key: str):
+# ------------- Odds API (with diagnostics) -------------
+def fetch_odds_with_diag(sport_key: str):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = dict(apiKey=API_KEY, regions=REGIONS, markets=MARKETS,
-                  oddsFormat="decimal", dateFormat="iso")
+    params = dict(
+        apiKey=API_KEY,
+        regions=REGIONS.replace(" ", ""),   # sanitize
+        markets=MARKETS.replace(" ", ""),
+        oddsFormat="decimal",
+        dateFormat="iso",
+    )
+    status = None
+    headers = {}
+    body_snippet = ""
+    data = []
     try:
         r = requests.get(url, params=params, timeout=25)
-        if r.status_code==200:
+        status = r.status_code
+        headers = {k.lower(): v for k,v in r.headers.items()}
+        if status == 200:
             j = r.json()
-            return j if isinstance(j, list) else []
-    except requests.RequestException:
-        pass
-    return []
+            data = j if isinstance(j, list) else []
+        else:
+            txt = r.text or ""
+            body_snippet = (txt[:400] + "...") if len(txt) > 400 else txt
+    except requests.RequestException as e:
+        status = 0
+        body_snippet = str(e)
+    return data, status, headers, body_snippet
 
 def within_window(commence_iso: str) -> bool:
     if not commence_iso: return False
@@ -138,43 +149,74 @@ def kelly(p: float, o: float):
     b = o-1.0
     return max(0.0, (b*p-(1-p))/b) if b>0 else 0.0
 
-# ===================== Engine =====================
-def row_recommendation(kf: float, evu: float) -> str:
-    return "YES" if (kf >= KELLY_MIN and evu >= EV_MIN) else "NO"
+# ---------------- Engine ----------------
+def rowline(r):
+    return "| {tour} | {market} | {sel} | {opp} | {odds:.2f} | {pm} | {pf:.3f} | {ev} | {kel} | {bet} | {start} | {books} | {src} |".format(
+        tour=r["tour"],
+        market=r["market"],
+        sel=r["selection"],
+        opp=(r["opponent"] or "—"),
+        odds=r["odds"],
+        pm=(f"{r['p_model']:.3f}" if isinstance(r["p_model"], float) else (r["p_model"] or "")),
+        pf=r["p_fair"],
+        ev=(f"{r['evu']:.3f}" if r["evu"] != "" else ""),
+        kel=(f"{r['kelly']:.3f}" if r["kelly"] != "" else ""),
+        bet=(r["bet"] if r["bet"] != "" else "NO"),
+        start=r["start_utc"],
+        books=r.get("books",""),
+        src=r["source"],
+    )
 
-def write_table(rows):
+def write_output(table_rows, diag_lines):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     now_loc = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime(f"%Y-%m-%d %H:%M {LOCAL_TZ.key.split('/')[-1]}")
-    header = [
-        f"# Tennis Value Engine",
+    head = [
+        "# Tennis Value Engine",
         "",
         f"Updated: {now_loc} ({now_utc})",
         "",
-        f"| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Bet | Start (UTC) | Books | Source |",
-        f"|---|---|---|---|---:|---:|---:|---:|---:|:---:|---|---|---|",
+        "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Bet | Start (UTC) | Books | Source |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|:---:|---|---|---|",
     ]
-    lines = header + rows
+    rows = head + (table_rows if table_rows else [
+        "| – | – | – | – | – | – | – | – | – | – | – | – | – |",
+        "",
+        "_No markets returned by the API in your window/regions. See diagnostics below._",
+    ])
+    if diag_lines:
+        rows += ["", "## API Diagnostics", *diag_lines]
     out_path = OUT_DIR / SHORTLIST_FILE
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # Also push to Actions summary if available
+    out_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write("\n".join(rows) + "\n")
     print(f"Wrote {out_path}")
 
 def run():
+    # Build/load Elo
     ensure_elo()
     elo_atp = load_elo_index("data/atp_elo.csv")
     elo_wta = load_elo_index("data/wta_elo.csv")
 
-    # pull ATP+WTA events
-    events=[]
+    # Fetch with diagnostics
+    diag = []
+    events_all = []
     for key in SPORT_KEYS:
-        events += fetch_odds(key)
+        data, status, hdrs, body = fetch_odds_with_diag(key)
+        events_all += data
+        diag.append(f"- `{key}` status: **{status}**, events: **{len(data)}**")
+        rem = hdrs.get("x-requests-remaining")
+        used = hdrs.get("x-requests-used")
+        if rem or used:
+            diag.append(f"  quota: remaining={rem or '?'} used={used or '?'}")
+        if status != 200:
+            diag.append("  error body: " + (body or "(empty)"))
 
-    candidates = []  # collect EVERYTHING, then sort and take top N
+    # Build candidates
+    cands = []
+    now = datetime.now(timezone.utc)
 
-    for ev in events:
+    for ev in events_all:
         ct = ev.get("commence_time")
         if not ct or not within_window(ct):
             continue
@@ -189,8 +231,8 @@ def run():
         else:
             continue
 
-        # H2H best prices
-        h2h_best={}
+        # H2H best prices across books
+        best={}
         for bm in ev.get("bookmakers", []):
             bname=bm.get("title","?")
             for mk in bm.get("markets", []):
@@ -199,153 +241,95 @@ def run():
                     name, price = out.get("name"), out.get("price")
                     if not name or price is None: continue
                     k = norm_name(name)
-                    if k not in h2h_best or price>h2h_best[k]["price"]:
-                        h2h_best[k]={"name":name,"price":float(price),"books":{bname}}
-                    elif abs(price-h2h_best[k]["price"])<1e-9:
-                        h2h_best[k]["books"].add(bname)
+                    if k not in best or price>best[k]["price"]:
+                        best[k]={"name":name,"price":float(price),"books":{bname}}
+                    elif abs(price-best[k]["price"])<1e-9:
+                        best[k]["books"].add(bname)
 
-        if len(h2h_best)==2:
-            a,b = list(h2h_best.values())
+        if len(best)==2:
+            a,b = list(best.values())
             pmA = p_model(a["name"], b["name"], elo_idx)
             pmB = p_model(b["name"], a["name"], elo_idx)
             _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
-            # Model rows (even if pm is None, we still show p_model = '')
+
+            # Model rows (may be blank p_model if name not found)
             for name, opp, price, pmod, pfair, books in [
                 (a["name"], b["name"], a["price"], pmA, pfA, a["books"]),
                 (b["name"], a["name"], b["price"], pmB, pfB, b["books"]),
             ]:
-                evu = (pmod*price - 1.0) if (pmod is not None) else float("nan")
-                kf  = kelly(pmod, price) if (pmod is not None) else 0.0
-                candidates.append({
+                evu = (pmod*price - 1.0) if (pmod is not None) else ""
+                kf  = (max(0.0, ((price-1)*pmod - (1-pmod))/(price-1)) if (pmod is not None) else "")
+                bet = ("YES" if (pmod is not None and float(kf)>=KELLY_MIN and float(evu)>=EV_MIN) else ("NO" if pmod is not None else "NO"))
+                cands.append({
                     "tour": tour, "market": "H2H", "selection": name, "opponent": opp,
-                    "odds": price,
-                    "p_model": ("" if pmod is None else round(pmod,3)),
-                    "p_fair": round(pfair,3),
-                    "evu": ("" if pmod is None else round(evu,3)),
-                    "kelly": ("" if pmod is None else round(kf,3)),
-                    "bet": ("" if pmod is None else row_recommendation(kf, evu)),
-                    "start_utc": start_utc_str,
-                    "books": ", ".join(sorted(books)),
-                    "source": ("Elo" if pmod is not None else "—"),
-                    "score": (evu if (pmod is not None) else -1e9)  # for sorting
+                    "odds": price, "p_model": ("" if pmod is None else pmod),
+                    "p_fair": pfair, "evu": ("" if evu=="" else float(evu)), "kelly": ("" if kf=="" else float(kf)),
+                    "bet": bet, "start_utc": start_utc_str, "books": ", ".join(sorted(books)), "source": ("Elo" if pmod is not None else "—"),
+                    "score": (float(evu) if evu!="" else -1e9)
                 })
 
-            # Also include pure market (no-vig) H2H Kelly rows
-            for name, opp, price, pfair, books in [
-                (a["name"], b["name"], a["price"], pfA, a["books"]),
-                (b["name"], a["name"], b["price"], pfB, b["books"]),
-            ]:
-                evu = pfair*price - 1.0
-                kf  = kelly(pfair, price)
-                candidates.append({
-                    "tour": tour, "market": "H2H", "selection": name, "opponent": opp,
-                    "odds": price, "p_model": "", "p_fair": round(pfair,3),
-                    "evu": round(evu,3), "kelly": round(kf,3),
-                    "bet": row_recommendation(kf, evu),
-                    "start_utc": start_utc_str,
-                    "books": ", ".join(sorted(books)),
-                    "source": "Kelly H2H",
-                    "score": evu
-                })
+        # Totals & Spreads market edges
+        def add_market_rows(mkey, market_name):
+            lines={}
+            for bm in ev.get("bookmakers", []):
+                bname=bm.get("title","?")
+                for mk in bm.get("markets", []):
+                    if mk.get("key")!=mkey: continue
+                    for out in mk.get("outcomes", []):
+                        if mkey=="totals":
+                            side, pts, price = out.get("name"), out.get("point"), out.get("price")
+                            if side not in ("Over","Under") or pts is None or price is None: continue
+                            lines.setdefault(float(pts), {})
+                            prev = lines[float(pts)].get(side)
+                            if prev is None or price>prev["price"]:
+                                lines[float(pts)][side]={"price":float(price),"books":{bname}}
+                            elif abs(price-prev["price"])<1e-9:
+                                lines[float(pts)][side]["books"].add(bname)
+                        else:  # spreads
+                            name, pts, price = out.get("name"), out.get("point"), out.get("price")
+                            if name is None or pts is None or price is None: continue
+                            arr = lines.setdefault(float(pts), [])
+                            found=False
+                            for rec in arr:
+                                if rec["name"]==name:
+                                    if price>rec["price"]: rec["price"]=float(price); rec["books"]={bname}
+                                    elif abs(price-rec["price"])<1e-9: rec["books"].add(bname)
+                                    found=True; break
+                            if not found:
+                                arr.append({"name":name,"price":float(price),"books":{bname}})
+            if mkey=="totals":
+                for pts, sides in lines.items():
+                    if "Over" in sides and "Under" in sides:
+                        po,pu = sides["Over"]["price"], sides["Under"]["price"]
+                        _,_,pfO,pfU = fair_two_way(po,pu)
+                        for side, price, pfair, cell in [("Over",po,pfO,sides["Over"]),("Under",pu,pfU,sides["Under"])]:
+                            evu = pfair*price - 1.0; kf = kelly(pfair, price)
+                            cands.append({
+                                "tour": tour, "market": market_name, "selection": f"{side} {pts}", "opponent": "",
+                                "odds": price, "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf, "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
+                                "start_utc": start_utc_str, "books": ", ".join(sorted(cell["books"])), "source": "Kelly Totals", "score": evu
+                            })
+            else:
+                for pts, arr in lines.items():
+                    if len(arr)==2:
+                        a,b=arr
+                        _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
+                        for tag, rec, pfair in [("A",a,pfA),("B",b,pfB)]:
+                            evu = pfair*rec["price"] - 1.0; kf = kelly(pfair, rec["price"])
+                            cands.append({
+                                "tour": tour, "market": market_name, "selection": f"{pts:+.1f} ({tag})", "opponent": "",
+                                "odds": rec["price"], "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf, "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
+                                "start_utc": start_utc_str, "books": ", ".join(sorted(rec["books"])), "source": "Kelly Spread", "score": evu
+                            })
+        add_market_rows("totals", "Totals")
+        add_market_rows("spreads", "Spread")
 
-        # Totals best prices
-        totals={}
-        for bm in ev.get("bookmakers", []):
-            bname=bm.get("title","?")
-            for mk in bm.get("markets", []):
-                if mk.get("key")!="totals": continue
-                for out in mk.get("outcomes", []):
-                    side, pts, price = out.get("name"), out.get("point"), out.get("price")
-                    if side not in ("Over","Under") or pts is None or price is None: continue
-                    totals.setdefault(float(pts), {})
-                    prev = totals[float(pts)].get(side)
-                    if prev is None or price>prev["price"]:
-                        totals[float(pts)][side]={"price":float(price), "books":{bname}}
-                    elif abs(price-prev["price"])<1e-9:
-                        totals[float(pts)][side]["books"].add(bname)
-        for pts, sides in totals.items():
-            if "Over" in sides and "Under" in sides:
-                po, pu = sides["Over"]["price"], sides["Under"]["price"]
-                _,_,pfO,pfU = fair_two_way(po, pu)
-                for side, price, pfair, cell in [("Over", po, pfO, sides["Over"]), ("Under", pu, pfU, sides["Under"])]:
-                    evu = pfair*price - 1.0; kf = kelly(pfair, price)
-                    candidates.append({
-                        "tour": tour, "market": "Totals", "selection": f"{side} {pts}", "opponent": "",
-                        "odds": price, "p_model": "", "p_fair": round(pfair,3),
-                        "evu": round(evu,3), "kelly": round(kf,3),
-                        "bet": row_recommendation(kf, evu),
-                        "start_utc": start_utc_str,
-                        "books": ", ".join(sorted(cell["books"])),
-                        "source": "Kelly Totals",
-                        "score": evu
-                    })
+    # Sort & limit
+    cands.sort(key=lambda r: (r["score"] if isinstance(r["score"], (int,float)) else -1e9), reverse=True)
+    top = cands[:TOP_ROWS]
+    rows = [rowline(r) for r in top]
 
-        # Spreads best prices
-        spreads={}
-        for bm in ev.get("bookmakers", []):
-            bname=bm.get("title","?")
-            for mk in bm.get("markets", []):
-                if mk.get("key")!="spreads": continue
-                for out in mk.get("outcomes", []):
-                    name, pts, price = out.get("name"), out.get("point"), out.get("price")
-                    if name is None or pts is None or price is None: continue
-                    arr = spreads.setdefault(float(pts), [])
-                    found=False
-                    for rec in arr:
-                        if rec["name"]==name:
-                            if price>rec["price"]: rec["price"]=float(price); rec["books"]={bname}
-                            elif abs(price-rec["price"])<1e-9: rec["books"].add(bname)
-                            found=True; break
-                    if not found:
-                        arr.append({"name":name,"price":float(price),"books":{bname}})
-        for pts, arr in spreads.items():
-            if len(arr)==2:
-                a,b = arr
-                _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
-                for tag, rec, pfair in [("A",a,pfA),("B",b,pfB)]:
-                    evu = pfair*rec["price"] - 1.0; kf = kelly(pfair, rec["price"])
-                    candidates.append({
-                        "tour": tour, "market": "Spread", "selection": f"{pts:+.1f} ({tag})", "opponent": "",
-                        "odds": rec["price"], "p_model": "", "p_fair": round(pfair,3),
-                        "evu": round(evu,3), "kelly": round(kf,3),
-                        "bet": row_recommendation(kf, evu),
-                        "start_utc": start_utc_str,
-                        "books": ", ".join(sorted(rec["books"])),
-                        "source": "Kelly Spread",
-                        "score": evu
-                    })
-
-    # Sort by EV desc (score), take top N for display
-    candidates.sort(key=lambda r: (r["score"] if isinstance(r["score"], (int,float)) else -1e9), reverse=True)
-    top = candidates[:TOP_ROWS]
-
-    # Materialize rows (strings)
-    rows=[]
-    for r in top:
-        rows.append("| {tour} | {market} | {sel} | {opp} | {odds:.2f} | {pm} | {pf:.3f} | {ev} | {kel} | {bet} | {start} | {books} | {src} |".format(
-            tour=r["tour"],
-            market=r["market"],
-            sel=r["selection"],
-            opp=(r["opponent"] or "—"),
-            odds=r["odds"],
-            pm=(f"{r['p_model']:.3f}" if isinstance(r["p_model"], float) else (r["p_model"] or ""))
-               if r["p_model"] != "" else "",
-            pf=r["p_fair"],
-            ev=(f"{r['evu']:.3f}" if r["evu"] != "" else ""),
-            kel=(f"{r['kelly']:.3f}" if r["kelly"] != "" else ""),
-            bet=(r["bet"] if r["bet"] != "" else "NO"),
-            start=r["start_utc"],
-            books=r.get("books",""),
-            src=r["source"],
-        ))
-
-    # If absolutely nothing at all was found, still write header + empty note.
-    if not rows:
-        rows = ["| – | – | – | – | – | – | – | – | – | – | – | – | – |",
-                "",
-                "_No markets found in the window/regions. Consider widening LOOKAHEAD_HOURS or adding regions (eu,uk,us,au)._"]
-
-    write_table(rows)
+    write_output(rows, diag)
 
 if __name__ == "__main__":
     run()
