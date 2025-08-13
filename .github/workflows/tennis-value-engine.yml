@@ -12,30 +12,18 @@ concurrency:
   group: tennis-value-engine
   cancel-in-progress: true
 
-env:
-  TZ: Europe/Amsterdam
-  LOOKAHEAD_HOURS: "36"     # widen window
-  KELLY_MIN: "0.00"         # show even tiny edges
-  MODEL_EV_MIN: "-0.02"     # allow slight negative to inspect
-  MARKET_EV_MIN: "-0.02"
-  REGIONS: "eu,uk,us,au"    # more books = more markets
-  MARKETS: "h2h,spreads,totals"  # include ML so we actually get markets
-  TOURS: "ATP,WTA"
-  OUT_DIR: "outputs"
-  SHORTLIST_FILE: "value_engine_shortlist.md"
-  TOP_DOGS: "3"
-  TOP_FAVS: "2"
 jobs:
   value:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
+      # fetch-depth:0 so we can commit later without weird histories
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Prep requirements
+      - name: Prepare requirements
         run: |
           printf "pandas\nrequests\n" > requirements.txt
 
@@ -51,40 +39,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch recent results (for Elo)
-        run: |
-          set -euo pipefail
-          mkdir -p matches data scripts outputs
-          curl -sSLo matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -sSLo matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -sSLo matches/atp_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv || true
-          curl -sSLo matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -sSLo matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
-          curl -sSLo matches/wta_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2025.csv || true
-
+      # ==== RUN THE ENGINE ====
+      # Secrets MUST be set in this step's env (just like your working workflow)
       - name: Run unified engine
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # <-- critical
+          # Engine settings (tweak as you like)
           REGIONS: "eu,uk,us,au"
           MARKETS: "h2h,spreads,totals"
           LOOKAHEAD_HOURS: "36"
-          KELLY_MIN: "0.00"
-          MODEL_EV_MIN: "-0.02"
-          MARKET_EV_MIN: "-0.02"
-          TOURS: ${{ env.TOURS }}
-          TZ: ${{ env.TZ }}
-          OUT_DIR: ${{ env.OUT_DIR }}
-          SHORTLIST_FILE: ${{ env.SHORTLIST_FILE }}
-          TOP_DOGS: ${{ env.TOP_DOGS }}
-          TOP_FAVS: ${{ env.TOP_FAVS }}
+          KELLY_MIN: "0.05"
+          EV_MIN: "0.00"
+          TOP_ROWS: "25"
+          TZ: "Europe/Amsterdam"
+          OUT_DIR: "outputs"
+          SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
+          set -euo pipefail
+          [ -n "${ODDS_API_KEY:-}" ] || { echo "ERROR: ODDS_API_KEY is not set"; exit 1; }
           python scripts/tennis_value_engine.py
 
-      - name: Commit & push outputs
+      - name: Commit & push shortlist
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add outputs/${{ env.SHORTLIST_FILE }} scripts/tennis_value_engine.py requirements.txt
+          git add outputs/value_engine_shortlist.md scripts/tennis_value_engine.py requirements.txt
           git diff --staged --quiet && { echo "No changes to commit."; exit 0; }
           git commit -m "Update unified tennis shortlist [skip ci]"
           git pull --rebase --autostash || true
