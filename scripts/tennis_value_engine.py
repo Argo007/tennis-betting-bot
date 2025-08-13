@@ -2,12 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Tennis Value Engine — with API Diagnostics
-- Builds Elo if missing (ATP/WTA from Sackmann 2023–2025).
-- Fetches ATP & WTA odds (h2h, spreads, totals) from The Odds API.
-- Computes model vs market (Elo vs H2H) and market no-vig edges.
-- ALWAYS writes a Markdown table.
-- If no rows, appends a clear API diagnostics section so you see WHY.
+Tennis Value Engine — generic 'tennis' compatible
+-------------------------------------------------
+- Supports Odds API plans that only expose the generic "tennis" sport key.
+- SPORT_KEYS is env-driven (defaults to "tennis,tennis_atp,tennis_wta").
+- Builds Elo for ATP/WTA from Sackmann (2023–2025) if not present.
+- Computes:
+    • Model vs Market (Elo vs best H2H) when names/tours can be matched
+    • Market vs Market (no-vig Kelly for H2H / Totals / Spreads) always
+- ALWAYS writes a Markdown table. If nothing qualifies, includes API diagnostics.
 """
 
 import os, io, unicodedata, requests, pandas as pd
@@ -21,11 +24,13 @@ if not API_KEY:
     raise SystemExit("ODDS_API_KEY not set")
 
 LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "24"))
-REGIONS         = os.getenv("REGIONS", "eu,uk,us,au")            # NO SPACES
-MARKETS         = os.getenv("MARKETS", "h2h,spreads,totals")     # NO SPACES
+REGIONS         = os.getenv("REGIONS", "eu,uk,us,au").replace(" ", "")
+MARKETS         = os.getenv("MARKETS", "h2h,spreads,totals").replace(" ", "")
+# IMPORTANT: default includes generic 'tennis' first (for basic plans), then ATP/WTA if available
+SPORT_KEYS      = [s.strip() for s in os.getenv("SPORT_KEYS", "tennis,tennis_atp,tennis_wta").split(",") if s.strip()]
 
-KELLY_MIN = float(os.getenv("KELLY_MIN", "0.05"))
-EV_MIN    = float(os.getenv("EV_MIN", "0.00"))
+KELLY_MIN = float(os.getenv("KELLY_MIN", "0.05"))  # recommend YES only if Kelly >= this
+EV_MIN    = float(os.getenv("EV_MIN", "0.00"))     # and EV/u >= this
 TOP_ROWS  = int(os.getenv("TOP_ROWS", "25"))
 
 OUT_DIR        = Path(os.getenv("OUT_DIR", "outputs"))
@@ -33,8 +38,6 @@ SHORTLIST_FILE = os.getenv("SHORTLIST_FILE", "value_engine_shortlist.md")
 LOCAL_TZ       = ZoneInfo(os.getenv("TZ", "Europe/Amsterdam"))
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-SPORT_KEYS = ["tennis_atp", "tennis_wta"]
 
 # ---------------- Elo ----------------
 START_ELO, K = 1500, 32
@@ -109,8 +112,8 @@ def fetch_odds_with_diag(sport_key: str):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = dict(
         apiKey=API_KEY,
-        regions=REGIONS.replace(" ", ""),   # sanitize
-        markets=MARKETS.replace(" ", ""),
+        regions=REGIONS,
+        markets=MARKETS,
         oddsFormat="decimal",
         dateFormat="iso",
     )
@@ -137,17 +140,17 @@ def within_window(commence_iso: str) -> bool:
     if not commence_iso: return False
     start = datetime.fromisoformat(commence_iso.replace("Z","+00:00"))
     now = datetime.now(timezone.utc)
-    return (start-now) >= timedelta(0) and (start-now) <= timedelta(hours=LOOKAHEAD_HOURS)
+    return timedelta(0) <= (start - now) <= timedelta(hours=LOOKAHEAD_HOURS)
 
 def fair_two_way(odds_a: float, odds_b: float):
     ia, ib = 1/odds_a, 1/odds_b
     s = ia+ib
     if s <= 0: return 0.5,0.5,0.5,0.5
-    return ia, ib, ia/s, ib/s
+    return ia, ib, ia/s, ib/s  # raw implied, raw implied, no-vig pA, no-vig pB
 
 def kelly(p: float, o: float):
     b = o-1.0
-    return max(0.0, (b*p-(1-p))/b) if b>0 else 0.0
+    return max(0.0, (b*p - (1-p))/b) if b>0 else 0.0
 
 # ---------------- Engine ----------------
 def rowline(r):
@@ -198,23 +201,24 @@ def run():
     elo_atp = load_elo_index("data/atp_elo.csv")
     elo_wta = load_elo_index("data/wta_elo.csv")
 
-    # Fetch with diagnostics
+    # Fetch with diagnostics across configured sport keys
     diag = []
     events_all = []
+    seen_keys = []
     for key in SPORT_KEYS:
         data, status, hdrs, body = fetch_odds_with_diag(key)
+        seen_keys.append(key)
         events_all += data
-        diag.append(f"- `{key}` status: **{status}**, events: **{len(data)}**")
-        rem = hdrs.get("x-requests-remaining")
-        used = hdrs.get("x-requests-used")
+        line = f"- `{key}` status: **{status}**, events: **{len(data)}**"
+        rem = hdrs.get("x-requests-remaining"); used = hdrs.get("x-requests-used")
         if rem or used:
-            diag.append(f"  quota: remaining={rem or '?'} used={used or '?'}")
-        if status != 200:
-            diag.append("  error body: " + (body or "(empty)"))
+            line += f"  | quota remaining={rem or '?'} used={used or '?'}"
+        diag.append(line)
+        if status != 200 and body:
+            diag.append("  error body: " + body)
 
     # Build candidates
     cands = []
-    now = datetime.now(timezone.utc)
 
     for ev in events_all:
         ct = ev.get("commence_time")
@@ -223,15 +227,11 @@ def run():
         start_utc = datetime.fromisoformat(ct.replace("Z","+00:00"))
         start_utc_str = start_utc.strftime("%Y-%m-%d %H:%M UTC")
 
+        # Try to identify tour; if unknown, we'll still compute market edges
         stitle = (ev.get("sport_title") or "").upper()
-        if "ATP" in stitle:
-            tour="ATP"; elo_idx=elo_atp
-        elif "WTA" in stitle:
-            tour="WTA"; elo_idx=elo_wta
-        else:
-            continue
+        tour_hint = "ATP" if "ATP" in stitle else ("WTA" if "WTA" in stitle else "GEN")
 
-        # H2H best prices across books
+        # ---------- H2H: best prices across books ----------
         best={}
         for bm in ev.get("bookmakers", []):
             bname=bm.get("title","?")
@@ -241,88 +241,127 @@ def run():
                     name, price = out.get("name"), out.get("price")
                     if not name or price is None: continue
                     k = norm_name(name)
-                    if k not in best or price>best[k]["price"]:
-                        best[k]={"name":name,"price":float(price),"books":{bname}}
-                    elif abs(price-best[k]["price"])<1e-9:
-                        best[k]["books"].add(bname)
+                    cell = best.get(k)
+                    if cell is None or price > cell["price"]:
+                        best[k] = {"name":name,"price":float(price),"books":{bname}}
+                    elif abs(price - cell["price"]) < 1e-9:
+                        cell["books"].add(bname)
 
         if len(best)==2:
             a,b = list(best.values())
-            pmA = p_model(a["name"], b["name"], elo_idx)
-            pmB = p_model(b["name"], a["name"], elo_idx)
+            # Model probabilities (try tour_hint first; if GEN, try ATP then WTA)
+            pmA = pmB = None
+            model_tour = None
+            def try_tour(tour_code):
+                idx = elo_atp if tour_code=="ATP" else (elo_wta if tour_code=="WTA" else None)
+                if not idx: return None, None, None
+                p1 = p_model(a["name"], b["name"], idx)
+                p2 = p_model(b["name"], a["name"], idx)
+                if p1 is not None and p2 is not None:
+                    return p1, p2, tour_code
+                return None, None, None
+
+            if tour_hint in ("ATP","WTA"):
+                pmA, pmB, model_tour = try_tour(tour_hint)
+            if model_tour is None:  # fallback when sport_title doesn't say ATP/WTA
+                pmA, pmB, model_tour = try_tour("ATP")
+            if model_tour is None:
+                pmA, pmB, model_tour = try_tour("WTA")
+
+            # Market no-vig fair probs for diagnostics + market edges
             _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
 
-            # Model rows (may be blank p_model if name not found)
+            # Model rows (may be blank p_model if names not in Elo)
             for name, opp, price, pmod, pfair, books in [
                 (a["name"], b["name"], a["price"], pmA, pfA, a["books"]),
                 (b["name"], a["name"], b["price"], pmB, pfB, b["books"]),
             ]:
                 evu = (pmod*price - 1.0) if (pmod is not None) else ""
-                kf  = (max(0.0, ((price-1)*pmod - (1-pmod))/(price-1)) if (pmod is not None) else "")
+                kf  = (kelly(pmod, price) if (pmod is not None) else "")
                 bet = ("YES" if (pmod is not None and float(kf)>=KELLY_MIN and float(evu)>=EV_MIN) else ("NO" if pmod is not None else "NO"))
                 cands.append({
-                    "tour": tour, "market": "H2H", "selection": name, "opponent": opp,
+                    "tour": model_tour or tour_hint, "market": "H2H", "selection": name, "opponent": opp,
                     "odds": price, "p_model": ("" if pmod is None else pmod),
                     "p_fair": pfair, "evu": ("" if evu=="" else float(evu)), "kelly": ("" if kf=="" else float(kf)),
                     "bet": bet, "start_utc": start_utc_str, "books": ", ".join(sorted(books)), "source": ("Elo" if pmod is not None else "—"),
                     "score": (float(evu) if evu!="" else -1e9)
                 })
 
-        # Totals & Spreads market edges
-        def add_market_rows(mkey, market_name):
-            lines={}
-            for bm in ev.get("bookmakers", []):
-                bname=bm.get("title","?")
-                for mk in bm.get("markets", []):
-                    if mk.get("key")!=mkey: continue
-                    for out in mk.get("outcomes", []):
-                        if mkey=="totals":
-                            side, pts, price = out.get("name"), out.get("point"), out.get("price")
-                            if side not in ("Over","Under") or pts is None or price is None: continue
-                            lines.setdefault(float(pts), {})
-                            prev = lines[float(pts)].get(side)
-                            if prev is None or price>prev["price"]:
-                                lines[float(pts)][side]={"price":float(price),"books":{bname}}
-                            elif abs(price-prev["price"])<1e-9:
-                                lines[float(pts)][side]["books"].add(bname)
-                        else:  # spreads
-                            name, pts, price = out.get("name"), out.get("point"), out.get("price")
-                            if name is None or pts is None or price is None: continue
-                            arr = lines.setdefault(float(pts), [])
-                            found=False
-                            for rec in arr:
-                                if rec["name"]==name:
-                                    if price>rec["price"]: rec["price"]=float(price); rec["books"]={bname}
-                                    elif abs(price-rec["price"])<1e-9: rec["books"].add(bname)
-                                    found=True; break
-                            if not found:
-                                arr.append({"name":name,"price":float(price),"books":{bname}})
-            if mkey=="totals":
-                for pts, sides in lines.items():
-                    if "Over" in sides and "Under" in sides:
-                        po,pu = sides["Over"]["price"], sides["Under"]["price"]
-                        _,_,pfO,pfU = fair_two_way(po,pu)
-                        for side, price, pfair, cell in [("Over",po,pfO,sides["Over"]),("Under",pu,pfU,sides["Under"])]:
-                            evu = pfair*price - 1.0; kf = kelly(pfair, price)
-                            cands.append({
-                                "tour": tour, "market": market_name, "selection": f"{side} {pts}", "opponent": "",
-                                "odds": price, "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf, "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
-                                "start_utc": start_utc_str, "books": ", ".join(sorted(cell["books"])), "source": "Kelly Totals", "score": evu
-                            })
-            else:
-                for pts, arr in lines.items():
-                    if len(arr)==2:
-                        a,b=arr
-                        _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
-                        for tag, rec, pfair in [("A",a,pfA),("B",b,pfB)]:
-                            evu = pfair*rec["price"] - 1.0; kf = kelly(pfair, rec["price"])
-                            cands.append({
-                                "tour": tour, "market": market_name, "selection": f"{pts:+.1f} ({tag})", "opponent": "",
-                                "odds": rec["price"], "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf, "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
-                                "start_utc": start_utc_str, "books": ", ".join(sorted(rec["books"])), "source": "Kelly Spread", "score": evu
-                            })
-        add_market_rows("totals", "Totals")
-        add_market_rows("spreads", "Spread")
+            # Pure market (no-vig) H2H rows
+            for name, opp, price, pfair, books in [
+                (a["name"], b["name"], a["price"], pfA, a["books"]),
+                (b["name"], a["name"], b["price"], pfB, b["books"]),
+            ]:
+                evu = pfair*price - 1.0
+                kf  = kelly(pfair, price)
+                cands.append({
+                    "tour": model_tour or tour_hint, "market": "H2H", "selection": name, "opponent": opp,
+                    "odds": price, "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf,
+                    "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
+                    "start_utc": start_utc_str, "books": ", ".join(sorted(books)), "source": "Kelly H2H",
+                    "score": evu
+                })
+
+        # ---------- Totals best prices ----------
+        totals={}
+        for bm in ev.get("bookmakers", []):
+            bname=bm.get("title","?")
+            for mk in bm.get("markets", []):
+                if mk.get("key")!="totals": continue
+                for out in mk.get("outcomes", []):
+                    side, pts, price = out.get("name"), out.get("point"), out.get("price")
+                    if side not in ("Over","Under") or pts is None or price is None: continue
+                    totals.setdefault(float(pts), {})
+                    prev = totals[float(pts)].get(side)
+                    if prev is None or price>prev["price"]:
+                        totals[float(pts)][side]={"price":float(price), "books":{bname}}
+                    elif abs(price-prev["price"])<1e-9:
+                        totals[float(pts)][side]["books"].add(bname)
+        for pts, sides in totals.items():
+            if "Over" in sides and "Under" in sides:
+                po, pu = sides["Over"]["price"], sides["Under"]["price"]
+                _,_,pfO,pfU = fair_two_way(po, pu)
+                for side, price, pfair, cell in [("Over", po, pfO, sides["Over"]), ("Under", pu, pfU, sides["Under"])]:
+                    evu = pfair*price - 1.0; kf = kelly(pfair, price)
+                    cands.append({
+                        "tour": tour_hint, "market": "Totals", "selection": f"{side} {pts}", "opponent": "",
+                        "odds": price, "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf,
+                        "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
+                        "start_utc": start_utc_str, "books": ", ".join(sorted(cell["books"])), "source": "Kelly Totals",
+                        "score": evu
+                    })
+
+        # ---------- Spreads best prices ----------
+        spreads={}
+        for bm in ev.get("bookmakers", []):
+            bname=bm.get("title","?")
+            for mk in bm.get("markets", []):
+                if mk.get("key")!="spreads": continue
+                for out in mk.get("outcomes", []):
+                    name, pts, price = out.get("name"), out.get("point"), out.get("price")
+                    if name is None or pts is None or price is None: continue
+                    arr = spreads.setdefault(float(pts), [])
+                    found=False
+                    for rec in arr:
+                        if rec["name"]==name:
+                            if price>rec["price"]: rec["price"]=float(price); rec["books"]={bname}
+                            elif abs(price-rec["price"])<1e-9: rec["books"].add(bname)
+                            found=True; break
+                    if not found:
+                        arr.append({"name":name,"price":float(price),"books":{bname}})
+        for pts, arr in spreads.items():
+            if len(arr)==2:
+                a,b=arr
+                _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
+                for tag, rec, pfair in [("A",a,pfA),("B",b,pfB)]:
+                    evu = pfair*rec["price"] - 1.0; kf = kelly(pfair, rec["price"])
+                    cands.append({
+                        "tour": tour_hint, "market": "Spread", "selection": f"{pts:+.1f} ({tag})", "opponent": "",
+                        "odds": rec["price"], "p_model": "", "p_fair": pfair, "evu": evu, "kelly": kf,
+                        "bet": "YES" if (kf>=KELLY_MIN and evu>=EV_MIN) else "NO",
+                        "start_utc": start_utc_str, "books": ", ".join(sorted(rec["books"])), "source": "Kelly Spread",
+                        "score": evu
+                    })
 
     # Sort & limit
     cands.sort(key=lambda r: (r["score"] if isinstance(r["score"], (int,float)) else -1e9), reverse=True)
