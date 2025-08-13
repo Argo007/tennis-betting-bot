@@ -1,6 +1,6 @@
 # Tennis Value Engine
 
-Updated: 2025-08-13 13:10 Amsterdam (2025-08-13 11:10 UTC)
+Updated: 2025-08-13 13:24 Amsterdam (2025-08-13 11:24 UTC)
 
 | Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Bet | Start (UTC) | Books | Source |
 |---|---|---|---|---:|---:|---:|---:|---:|:---:|---|---|---|
