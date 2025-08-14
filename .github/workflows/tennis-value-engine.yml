@@ -3,7 +3,7 @@ name: Tennis Value Engine (Clean H2H)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "5 6 * * *"
+    - cron: "5 6 * * *"   # change when you like
 
 permissions:
   contents: read
@@ -35,14 +35,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests pytz
 
-      # 0) Print repo tree early (so you see actual paths)
+      # 0) Show tree so we see real filenames/paths
       - name: List workspace (before run)
         run: |
           echo "==== FILES (top 3 levels) ===="
           find . -maxdepth 3 -type f | sed 's|^\./||' | sort
           echo "==============================="
 
-      # 1) Run your producer script (auto-detect path & name)
+      # 1) Run your producer script (auto-detects *tennis*value*engine*.py)
       - name: Run model (produce shortlist)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -57,29 +57,23 @@ jobs:
           SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
           set -euo pipefail
-
-          # Try to locate the engine script automatically
           CAND=$(ls -1 **/*.py | grep -Ei '(tennis.*value.*engine|value.*engine).*\.py$' | head -n 1 || true)
           if [ -z "${CAND:-}" ]; then
             echo "ERROR: Could not find a producer script matching *tennis*value*engine*.py"
-            echo "Repo files hint:"
             find . -maxdepth 3 -type f -name '*.py' | sed 's|^\./||' | sort
             exit 1
           fi
           echo "Producer script: $CAND"
+          python "$CAND" || { echo "Producer script failed."; exit 1; }
 
-          python "$CAND"
-
-          # Not all repos write to outputs/… — keep going, converter will search .md files
-
-      # 2) Convert shortlist Markdown -> CSV (auto-detect .md with the table header)
+      # 2) Convert shortlist Markdown -> CSV (auto-detects shortlist MD by header)
       - name: Convert shortlist MD to CSV
         run: |
           python - <<'PY'
-          import pandas as pd, re, os, sys, glob
+          import pandas as pd, os, sys, glob
 
-          # Find a markdown file that contains the expected header row
           HEADER = "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) | Books | Source |"
+
           md_files = glob.glob("**/*.md", recursive=True)
           if not md_files:
               print("ERROR: No markdown files found to convert.", file=sys.stderr); sys.exit(1)
@@ -90,19 +84,17 @@ jobs:
                   with open(f, encoding="utf-8") as fh:
                       text = fh.read()
                   if HEADER in text:
-                      src_md = f
-                      break
+                      src_md = f; break
               except Exception:
                   continue
           if src_md is None:
               print("ERROR: Could not find a markdown file with the value-engine table header.", file=sys.stderr)
-              print("Searched MD files:", len(md_files))
               sys.exit(1)
 
           print("Using shortlist:", src_md)
 
+          # Parse pipe table
           lines = [l.rstrip("\n") for l in open(src_md, encoding="utf-8")]
-          # Locate header line index precisely
           start = None
           for i, l in enumerate(lines):
               if l.strip().startswith(HEADER):
@@ -111,8 +103,7 @@ jobs:
               print("ERROR: Header not found after open.", file=sys.stderr); sys.exit(1)
 
           header = [c.strip() for c in lines[start].strip().strip("|").split("|")]
-          data = []
-          i = start + 2  # skip separator '|'---'|'
+          data, i = [], start + 2  # skip separator line
           while i < len(lines):
               l = lines[i].strip()
               if not l or not l.startswith("|"): break
@@ -122,11 +113,8 @@ jobs:
               data.append(dict(zip(header, parts)))
               i += 1
 
-          if not data:
-              print("WARNING: No rows parsed from shortlist table.")
-
           df = pd.DataFrame(data)
-          # coerce numeric
+          # numeric coercion
           for col in ["Odds","p_model","p_fair","EV/u","Kelly","Conf"]:
               if col in df.columns:
                   df[col] = pd.to_numeric(df[col].replace({"": None}), errors="coerce")
@@ -157,9 +145,12 @@ jobs:
 
           df = pd.read_csv(src)
 
+          # tolerant column locator
           def col(df, *names):
+              # exact first
               for n in names:
                   if n in df.columns: return n
+              # case-insensitive fallback
               lower = {c.lower(): c for c in df.columns}
               for n in names:
                   if n.lower() in lower: return lower[n.lower()]
@@ -169,9 +160,12 @@ jobs:
           c_sel    = col(df, "Selection","selection")
           c_opp    = col(df, "Opponent","opponent")
           c_kelly  = col(df, "Kelly","kelly")
-          c_evu    = col(df, "EV/u","evu","EVU","EV")
-          c_odds   = df.columns[df.columns.str.lower().eq("odds")][0] if any(df.columns.str.lower().eq("odds")) else None
+          c_evu    = col(df, "EV/u","ev/u","evu","EVU","EV")
 
+          # 'Odds' detection without the broken .eq
+          c_odds = next((c for c in df.columns if str(c).lower()=="odds"), None)
+
+          # numeric coercion
           df[c_kelly] = pd.to_numeric(df[c_kelly], errors="coerce")
           df[c_evu]   = pd.to_numeric(df[c_evu], errors="coerce")
           if c_odds: df[c_odds] = pd.to_numeric(df[c_odds], errors="coerce")
