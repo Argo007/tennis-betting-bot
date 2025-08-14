@@ -3,7 +3,7 @@ name: Tennis Value Engine (Clean H2H)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "5 6 * * *"   # change when you like
+    - cron: "5 6 * * *"   # UTC; change as you like
 
 permissions:
   contents: read
@@ -35,14 +35,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests pytz
 
-      # 0) Show tree so we see real filenames/paths
       - name: List workspace (before run)
         run: |
           echo "==== FILES (top 3 levels) ===="
           find . -maxdepth 3 -type f | sed 's|^\./||' | sort
           echo "==============================="
 
-      # 1) Run your producer script (auto-detects *tennis*value*engine*.py)
+      # 1) Run producer, but BLOCK it from writing to the Actions summary
       - name: Run model (produce shortlist)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -50,11 +49,13 @@ jobs:
           REGIONS: "eu,uk,us,au"
           MARKETS: "h2h,spreads,totals"
           SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
-          KELLY_MIN: "0.05"
+          KELLY_MIN: "0.00"
           EV_MIN: "0.00"
-          MIN_CONF: "0.40"
+          MIN_CONF: "0.00"
           OUT_DIR: "outputs"
           SHORTLIST_FILE: "value_engine_shortlist.md"
+          # prevent the producer from polluting the summary with Totals/Books/Source
+          GITHUB_STEP_SUMMARY: "/dev/null"
         run: |
           set -euo pipefail
           CAND=$(ls -1 **/*.py | grep -Ei '(tennis.*value.*engine|value.*engine).*\.py$' | head -n 1 || true)
@@ -64,46 +65,29 @@ jobs:
             exit 1
           fi
           echo "Producer script: $CAND"
-          python "$CAND" || { echo "Producer script failed."; exit 1; }
+          python "$CAND"
 
-      # 2) Convert shortlist Markdown -> CSV (auto-detects shortlist MD by header)
+      # 2) Convert shortlist Markdown -> CSV (autodetect header)
       - name: Convert shortlist MD to CSV
         run: |
           python - <<'PY'
           import pandas as pd, os, sys, glob
-
           HEADER = "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) | Books | Source |"
-
           md_files = glob.glob("**/*.md", recursive=True)
-          if not md_files:
-              print("ERROR: No markdown files found to convert.", file=sys.stderr); sys.exit(1)
-
+          if not md_files: sys.exit("ERROR: No markdown files found to convert.")
           src_md = None
           for f in sorted(md_files):
               try:
-                  with open(f, encoding="utf-8") as fh:
-                      text = fh.read()
-                  if HEADER in text:
+                  if HEADER in open(f, encoding="utf-8").read():
                       src_md = f; break
               except Exception:
-                  continue
-          if src_md is None:
-              print("ERROR: Could not find a markdown file with the value-engine table header.", file=sys.stderr)
-              sys.exit(1)
-
-          print("Using shortlist:", src_md)
-
-          # Parse pipe table
+                  pass
+          if src_md is None: sys.exit("ERROR: Could not find shortlist table in any .md")
           lines = [l.rstrip("\n") for l in open(src_md, encoding="utf-8")]
-          start = None
-          for i, l in enumerate(lines):
-              if l.strip().startswith(HEADER):
-                  start = i; break
-          if start is None:
-              print("ERROR: Header not found after open.", file=sys.stderr); sys.exit(1)
-
+          start = next((i for i,l in enumerate(lines) if l.strip().startswith(HEADER)), None)
+          if start is None: sys.exit("ERROR: header not found after open")
           header = [c.strip() for c in lines[start].strip().strip("|").split("|")]
-          data, i = [], start + 2  # skip separator line
+          data, i = [], start + 2
           while i < len(lines):
               l = lines[i].strip()
               if not l or not l.startswith("|"): break
@@ -112,48 +96,37 @@ jobs:
               if len(parts) != len(header): break
               data.append(dict(zip(header, parts)))
               i += 1
-
           df = pd.DataFrame(data)
-          # numeric coercion
           for col in ["Odds","p_model","p_fair","EV/u","Kelly","Conf"]:
               if col in df.columns:
                   df[col] = pd.to_numeric(df[col].replace({"": None}), errors="coerce")
-
           out_csv = "Tennis Value Engine Unified.csv"
           df.to_csv(out_csv, index=False)
           print("Wrote", out_csv, "rows:", len(df))
+          # optional: remove MD so it can't be rendered elsewhere
+          try: os.remove(src_md)
+          except Exception: pass
           PY
 
-      # 3) Filter H2H + Kelly/EV, dedupe per matchup, publish summary
+      # 3) Clean H2H only; Kelly >= 0.05; EV/u > 0; dedupe per match; drop Books/Source; publish summary
       - name: Filter & dedupe H2H; publish summary
         run: |
           python - <<'PY'
           import pandas as pd, glob, os, sys, re
-
           def norm(s): return re.sub(r'[^a-z0-9]', '', str(s).lower())
-
           csvs = glob.glob("**/*.csv", recursive=True)
-          if not csvs:
-              print("ERROR: No CSV files found.", file=sys.stderr); sys.exit(1)
-
-          def score(p):
-              b = norm(os.path.basename(p))
-              prefer = all(k in b for k in ["tennis","value","engine","unified"])
-              return (prefer, os.path.getsize(p))
-          csvs.sort(key=score, reverse=True)
+          if not csvs: sys.exit("ERROR: No CSV files found.")
+          csvs.sort(key=lambda p: (all(k in norm(os.path.basename(p)) for k in ["tennis","value","engine","unified"]), os.path.getsize(p)), reverse=True)
           src = csvs[0]
-
           df = pd.read_csv(src)
 
-          # tolerant column locator
+          # tolerant column resolver
           def col(df, *names):
-              # exact first
               for n in names:
                   if n in df.columns: return n
-              # case-insensitive fallback
-              lower = {c.lower(): c for c in df.columns}
+              low = {c.lower(): c for c in df.columns}
               for n in names:
-                  if n.lower() in lower: return lower[n.lower()]
+                  if n.lower() in low: return low[n.lower()]
               raise KeyError(f"Missing column: {names}")
 
           c_market = col(df, "Market","market")
@@ -161,33 +134,37 @@ jobs:
           c_opp    = col(df, "Opponent","opponent")
           c_kelly  = col(df, "Kelly","kelly")
           c_evu    = col(df, "EV/u","ev/u","evu","EVU","EV")
+          c_odds   = next((c for c in df.columns if str(c).lower()=="odds"), None)
 
-          # 'Odds' detection without the broken .eq
-          c_odds = next((c for c in df.columns if str(c).lower()=="odds"), None)
-
-          # numeric coercion
+          # numerics
           df[c_kelly] = pd.to_numeric(df[c_kelly], errors="coerce")
           df[c_evu]   = pd.to_numeric(df[c_evu], errors="coerce")
           if c_odds: df[c_odds] = pd.to_numeric(df[c_odds], errors="coerce")
 
-          # H2H only + filters
-          df = df[df[c_market].astype(str).str.upper().eq("H2H")].copy()
-          df = df[(df[c_kelly] > 0.05) & (df[c_evu] > 0)].copy()
+          # H2H only (kills Totals) + filters
+          df = df[df[c_market].astype(str).str.strip().str.upper().eq("H2H")].copy()
+          df = df[(df[c_kelly] >= 0.05) & (df[c_evu] > 0)].copy()
 
-          # Dedupe per unordered matchup
-          def k(a,b):
+          # Dedupe per unordered matchup (keep highest Kelly, then EV/u, then Odds)
+          def pair(a,b):
               a,b = str(a).strip(), str(b).strip()
               return " | ".join(sorted([a,b]))
-          df["__pair__"] = [k(a,b) for a,b in zip(df[c_sel], df[c_opp])]
-
-          order_cols, asc = [c_kelly, c_evu], [False, False]
-          if c_odds: order_cols.append(c_odds); asc.append(False)
-          df.sort_values(order_cols, ascending=asc, inplace=True)
+          df["__pair__"] = [pair(a,b) for a,b in zip(df[c_sel], df[c_opp])]
+          order, asc = [c_kelly, c_evu], [False, False]
+          if c_odds: order.append(c_odds); asc.append(False)
+          df.sort_values(order, ascending=asc, inplace=True)
           df = df.drop_duplicates(["__pair__"], keep="first").copy()
           df.drop(columns="__pair__", inplace=True)
 
+          # Drop Books/Source (any case)
+          for name in list(df.columns):
+              if name.lower() in ("books","source"):
+                  df.drop(columns=name, inplace=True)
+
           df["Bet"] = "YES"
-          preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)','Books','Source']
+
+          # compact order (no Books/Source)
+          preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)']
           cols_out = [c for c in preferred if c in df.columns] or df.columns.tolist()
           df = df[cols_out]
 
@@ -202,7 +179,8 @@ jobs:
                   lines.append("| " + " | ".join(str(r[c]) for c in t.columns) + " |")
               return "\n".join(lines)
 
-          with open(os.environ.get("GITHUB_STEP_SUMMARY","/tmp/gh_summary.md"), "a") as fh:
+          # overwrite summary with ONLY the clean table
+          with open(os.environ.get("GITHUB_STEP_SUMMARY","/tmp/gh_summary.md"), "w") as fh:
               fh.write(f"# Clean H2H Picks (source: {src})\n\n" + gfm(df) + "\n")
           print(f"Source: {src} -> value_filtered_h2h.csv (rows kept: {len(df)})")
           PY
