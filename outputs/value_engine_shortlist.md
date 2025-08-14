@@ -1,31 +1,34 @@
 # Tennis Value Engine (Realism-weighted)
 
-Updated: 2025-08-13 21:24 Amsterdam (2025-08-13 19:24 UTC)
+Updated: 2025-08-14 07:44 Amsterdam (2025-08-14 05:44 UTC)
 
 | Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) | Books | Source |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|:---:|---|---|---|
-| ATP | H2H | Francisco Comesana | Andrey Rublev | 5.10 | 0.327 | 0.194 | 0.668 | 0.163 | 0.37 | NO | 2025-08-13 22:20 UTC | Betfair, Matchbook | Elo |
-| WTA | H2H | Jasmine Paolini | Barbora Krejcikova | 1.80 | 0.622 | 0.550 | 0.119 | 0.148 | 1.00 | YES | 2025-08-14 00:00 UTC | BetOnline.ag, Betfair, LowVig.ag | Elo |
-| ATP | H2H | Carlos Alcaraz | Luca Nardi | 1.07 | 0.948 | 0.933 | 0.014 | 0.202 | 0.83 | YES | 2025-08-13 23:00 UTC | Betfair, Matchbook | Elo |
-| WTA | Totals | Over 22.5 | — | 2.02 |  | 0.482 | -0.026 | 0.000 | 0.40 | NO | 2025-08-13 19:45 UTC | Pinnacle | Kelly Totals |
-| WTA | Totals | Under 22.5 | — | 1.88 |  | 0.518 | -0.026 | 0.000 | 0.40 | NO | 2025-08-13 19:45 UTC | Pinnacle | Kelly Totals |
-| ATP | H2H | Benjamin Bonzi | Felix Auger-Aliassime | 3.20 |  | 0.310 | -0.007 | 0.000 | 0.30 | NO | 2025-08-13 20:00 UTC | Betfair, Matchbook, Winamax (DE) | Kelly H2H |
-| ATP | H2H | Felix Auger-Aliassime | Benjamin Bonzi | 1.44 |  | 0.690 | -0.007 | 0.000 | 0.30 | NO | 2025-08-13 20:00 UTC | Betfair, Matchbook | Kelly H2H |
-| ATP | Totals | Over 23.0 | — | 1.98 |  | 0.491 | -0.028 | 0.000 | 0.40 | NO | 2025-08-13 20:00 UTC | Pinnacle | Kelly Totals |
-| ATP | Totals | Under 23.0 | — | 1.91 |  | 0.509 | -0.028 | 0.000 | 0.40 | NO | 2025-08-13 20:00 UTC | Pinnacle | Kelly Totals |
-| ATP | H2H | Andrey Rublev | Francisco Comesana | 1.23 | 0.673 | 0.806 | -0.172 | 0.000 | 0.37 | NO | 2025-08-13 22:20 UTC | Betfair, GTbets, Matchbook | Elo |
-| ATP | H2H | Andrey Rublev | Francisco Comesana | 1.23 |  | 0.806 | -0.009 | 0.000 | 0.30 | NO | 2025-08-13 22:20 UTC | Betfair, GTbets, Matchbook | Kelly H2H |
-| ATP | H2H | Francisco Comesana | Andrey Rublev | 5.10 |  | 0.194 | -0.009 | 0.000 | 0.30 | NO | 2025-08-13 22:20 UTC | Betfair, Matchbook | Kelly H2H |
-| ATP | Totals | Over 21.5 | — | 1.73 |  | 0.545 | -0.058 | 0.000 | 0.40 | NO | 2025-08-13 22:20 UTC | Casumo, Grosvenor, TABtouch, Unibet, Unibet (IT), Unibet (NL) | Kelly Totals |
-| ATP | Totals | Under 21.5 | — | 2.07 |  | 0.455 | -0.058 | 0.000 | 0.40 | NO | 2025-08-13 22:20 UTC | Casumo, Grosvenor, TABtouch, Unibet, Unibet (IT), Unibet (NL) | Kelly Totals |
-| ATP | H2H | Luca Nardi | Carlos Alcaraz | 15.00 | 0.052 | 0.067 | -0.217 | 0.000 | 0.83 | NO | 2025-08-13 23:00 UTC | BoyleSports | Elo |
-| ATP | H2H | Carlos Alcaraz | Luca Nardi | 1.07 |  | 0.933 | -0.001 | 0.000 | 0.30 | NO | 2025-08-13 23:00 UTC | Betfair, Matchbook | Kelly H2H |
-| ATP | H2H | Luca Nardi | Carlos Alcaraz | 15.00 |  | 0.067 | -0.001 | 0.000 | 0.30 | NO | 2025-08-13 23:00 UTC | BoyleSports | Kelly H2H |
-| WTA | H2H | Barbora Krejcikova | Jasmine Paolini | 2.20 | 0.378 | 0.450 | -0.167 | 0.000 | 1.00 | NO | 2025-08-14 00:00 UTC | Betfair, Matchbook | Elo |
-| WTA | H2H | Barbora Krejcikova | Jasmine Paolini | 2.20 |  | 0.450 | -0.010 | 0.000 | 0.30 | NO | 2025-08-14 00:00 UTC | Betfair, Matchbook | Kelly H2H |
-| WTA | H2H | Jasmine Paolini | Barbora Krejcikova | 1.80 |  | 0.550 | -0.010 | 0.000 | 0.30 | NO | 2025-08-14 00:00 UTC | BetOnline.ag, Betfair, LowVig.ag | Kelly H2H |
-| WTA | Totals | Over 22.0 | — | 1.94 |  | 0.499 | -0.033 | 0.000 | 0.40 | NO | 2025-08-14 00:00 UTC | Pinnacle | Kelly Totals |
-| WTA | Totals | Under 22.0 | — | 1.93 |  | 0.501 | -0.033 | 0.000 | 0.40 | NO | 2025-08-14 00:00 UTC | Pinnacle | Kelly Totals |
+| WTA | H2H | Magda Linette | Veronika Kudermetova | 2.52 | 0.651 | 0.408 | 0.641 | 0.422 | 1.00 | YES | 2025-08-14 23:00 UTC | Betfair | Elo |
+| WTA | H2H | Lucia Bronzetti | Coco Gauff | 9.60 | 0.137 | 0.104 | 0.318 | 0.037 | 1.00 | NO | 2025-08-14 15:00 UTC | Betfair, Matchbook | Elo |
+| ATP | H2H | Jiri Lehecka | Ben Shelton | 2.40 | 0.459 | 0.419 | 0.102 | 0.073 | 1.00 | YES | 2025-08-14 20:30 UTC | FanDuel | Elo |
+| ATP | H2H | Jannik Sinner | Felix Auger-Aliassime | 1.19 |  | 0.861 | 0.025 | 0.132 | 0.30 | NO | 2025-08-14 19:00 UTC | DraftKings | Kelly H2H |
+| WTA | H2H | Veronika Kudermetova | Magda Linette | 1.74 |  | 0.592 | 0.029 | 0.040 | 0.30 | NO | 2025-08-14 23:00 UTC | DraftKings | Kelly H2H |
+| WTA | H2H | Magda Linette | Veronika Kudermetova | 2.52 |  | 0.408 | 0.029 | 0.019 | 0.30 | NO | 2025-08-14 23:00 UTC | Betfair | Kelly H2H |
+| ATP | H2H | Felix Auger-Aliassime | Jannik Sinner | 7.40 |  | 0.139 | 0.025 | 0.004 | 0.30 | NO | 2025-08-14 19:00 UTC | Betfair | Kelly H2H |
+| ATP | H2H | Ben Shelton | Jiri Lehecka | 1.73 |  | 0.581 | 0.005 | 0.007 | 0.30 | NO | 2025-08-14 20:30 UTC | Betfair | Kelly H2H |
+| ATP | H2H | Jiri Lehecka | Ben Shelton | 2.40 |  | 0.419 | 0.005 | 0.004 | 0.30 | NO | 2025-08-14 20:30 UTC | FanDuel | Kelly H2H |
+| WTA | H2H | Coco Gauff | Lucia Bronzetti | 1.11 | 0.863 | 0.896 | -0.042 | 0.000 | 1.00 | NO | 2025-08-14 15:00 UTC | 1xBet, Betfair, Matchbook | Elo |
+| WTA | H2H | Coco Gauff | Lucia Bronzetti | 1.11 |  | 0.896 | -0.005 | 0.000 | 0.30 | NO | 2025-08-14 15:00 UTC | 1xBet, Betfair, Matchbook | Kelly H2H |
+| WTA | H2H | Lucia Bronzetti | Coco Gauff | 9.60 |  | 0.104 | -0.005 | 0.000 | 0.30 | NO | 2025-08-14 15:00 UTC | Betfair, Matchbook | Kelly H2H |
+| WTA | Totals | Over 18.5 | — | 1.95 |  | 0.504 | -0.018 | 0.000 | 0.20 | NO | 2025-08-14 15:00 UTC | 1xBet | Kelly Totals |
+| WTA | Totals | Under 18.5 | — | 1.98 |  | 0.496 | -0.018 | 0.000 | 0.20 | NO | 2025-08-14 15:00 UTC | GTbets | Kelly Totals |
+| WTA | Totals | Over 19.5 | — | 2.10 |  | 0.447 | -0.061 | 0.000 | 0.20 | NO | 2025-08-14 15:00 UTC | Coral, Ladbrokes | Kelly Totals |
+| WTA | Totals | Under 19.5 | — | 1.70 |  | 0.553 | -0.061 | 0.000 | 0.20 | NO | 2025-08-14 15:00 UTC | Coral, Ladbrokes | Kelly Totals |
+| WTA | Totals | Over 22.0 | — | 1.94 |  | 0.500 | -0.030 | 0.000 | 0.40 | NO | 2025-08-14 17:00 UTC | Pinnacle | Kelly Totals |
+| WTA | Totals | Under 22.0 | — | 1.94 |  | 0.500 | -0.030 | 0.000 | 0.40 | NO | 2025-08-14 17:00 UTC | Pinnacle | Kelly Totals |
+| WTA | Totals | Over 22.0 | — | 1.98 |  | 0.491 | -0.028 | 0.000 | 0.40 | NO | 2025-08-14 19:00 UTC | Pinnacle | Kelly Totals |
+| WTA | Totals | Under 22.0 | — | 1.91 |  | 0.509 | -0.028 | 0.000 | 0.40 | NO | 2025-08-14 19:00 UTC | Pinnacle | Kelly Totals |
+| ATP | Totals | Over 21.5 | — | 1.91 |  | 0.506 | -0.033 | 0.000 | 0.20 | NO | 2025-08-14 19:00 UTC | Coolbet | Kelly Totals |
+| ATP | Totals | Under 21.5 | — | 1.96 |  | 0.494 | -0.033 | 0.000 | 0.20 | NO | 2025-08-14 19:00 UTC | 1xBet | Kelly Totals |
+| ATP | H2H | Ben Shelton | Jiri Lehecka | 1.73 | 0.541 | 0.581 | -0.064 | 0.000 | 1.00 | NO | 2025-08-14 20:30 UTC | Betfair | Elo |
+| ATP | Totals | Over 24.5 | — | 1.93 |  | 0.499 | -0.038 | 0.000 | 0.20 | NO | 2025-08-14 20:30 UTC | Coolbet | Kelly Totals |
+| ATP | Totals | Under 24.5 | — | 1.92 |  | 0.501 | -0.038 | 0.000 | 0.20 | NO | 2025-08-14 20:30 UTC | 1xBet | Kelly Totals |
 
 ## API Diagnostics
-- `tennis` status: **200**, events: **11**  | quota remaining=307 used=193
+- `tennis` status: **200**, events: **8**  | quota remaining=295 used=205
