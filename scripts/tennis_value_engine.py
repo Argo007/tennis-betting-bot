@@ -157,6 +157,21 @@ def fetch_odds_with_diag(sport_key: str):
         body_snippet = str(e)
     return data, status, headers, body_snippet
 
+
+# --- helper: list active tennis keys (ATP/WTA) from Odds API ---
+def list_tennis_keys(api_key: str):
+    try:
+        r = requests.get("https://api.the-odds-api.com/v4/sports", params={"apiKey": API_KEY}, timeout=30)
+        if r.status_code != 200:
+            return []
+        out = []
+        for s in r.json():
+            key = str(s.get("key",""))
+            if key.startswith("tennis_") and (("atp" in key) or ("wta" in key)) and s.get("active", True):
+                out.append(key)
+        return out
+    except requests.RequestException:
+        return []
 def within_window(commence_iso: str) -> bool:
     if not commence_iso: return False
     start = datetime.fromisoformat(commence_iso.replace("Z","+00:00"))
@@ -254,6 +269,10 @@ def run():
     # Fetch with diagnostics across configured sport keys
     diag = []
     events_all = []
+    # --- BEGIN EXTRA DIAGNOSTICS ---
+    total_before_window = 0
+    # --- END EXTRA DIAGNOSTICS ---
+
     for key in SPORT_KEYS:
         data, status, hdrs, body = fetch_odds_with_diag(key)
         events_all += data
@@ -265,10 +284,29 @@ def run():
         if status != 200 and body:
             diag.append("  error body: " + body)
 
+
+    # Fallback: if no events were collected, auto-discover active tennis keys and try again
+    if not events_all:
+        auto_keys = list_tennis_keys(API_KEY)
+        if auto_keys:
+            diag.append(f"- Auto-discovered keys: {', '.join(auto_keys)}")
+            for key in auto_keys:
+                data, status, hdrs, body = fetch_odds_with_diag(key)
+                events_all += data
+                line = f"- `{key}` status: **{status}**, events: **{len(data)}**"
+                rem = hdrs.get("x-requests-remaining"); used = hdrs.get("x-requests-used")
+                if rem or used:
+                    line += f"  | quota remaining={rem or '?'} used={used or '?'}"
+                diag.append(line)
+                if status != 200 and body:
+                    diag.append("  error body: " + body)
+        else:
+            diag.append("- Auto-discovery found no active ATP/WTA keys from provider.")
     # Build candidates with realism weights — H2H only
     cands = []
 
     for ev in events_all:
+        total_before_window += 1
         ct = ev.get("commence_time")
         if not ct or not within_window(ct):
             continue
@@ -347,6 +385,9 @@ def run():
             add_row(cands, tour=(model_tour or tour_hint), market="H2H", selection=n2, opponent=n1,
                     odds=b["price"], p_model_val=None, p_fair=pfB, start_utc=start_utc_str,
                     conf=conf_mkt)
+
+    # Add diagnostics summary
+    diag.append(f"- Events fetched (all keys): {len(events_all)} | Before window filter: {total_before_window} | After window filter: {len(cands)//2 if cands else 0} matches (H2H pairs)")
 
     # Sort realism-weighted and cap rows
     cands.sort(key=lambda r: r["score"], reverse=True)
