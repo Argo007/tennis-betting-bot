@@ -55,7 +55,7 @@ jobs:
           OUT_DIR: "outputs"
           SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
-          python tennis_value_engine.py
+          python scripts/tennis_value_engine.py  
 
       - name: Upload shortlist artifact
         uses: actions/upload-artifact@v4
