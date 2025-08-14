@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Tennis Value Engine — H2H only, realism-weighted
-------------------------------------------------
-- Only evaluates Head-to-Head (H2H) markets. Totals/Spreads are removed.
+Tennis Value Engine — H2H only (Realism-weighted)  ✅
+- Only evaluates Head-to-Head (H2H) markets. Totals/Spreads removed.
 - Uses Elo (ATP/WTA, 2023–2025) + per-player match counts to weight confidence.
-- Confidence weighting:
-    * Elo-backed H2H rows: conf = min(1.0, min(matchesA, matchesB)/30)
-    * Market-only H2H rows: 0.6 if sharp-book price used else 0.3
-- Ranking score: score = EV * Kelly * Confidence
-- Bet rule: YES if Kelly >= KELLY_MIN, EV >= EV_MIN, Confidence >= MIN_CONF
-- Sharp book whitelist via SHARP_BOOKS env (comma separated). If any sharp lines exist, we keep only sharp-best quotes.
-- OUTPUT columns are trimmed: no "books" and no "source".
-- Outputs a Markdown table every run and appends API diagnostics.
+- Confidence:
+    * Elo-backed H2H rows: conf = min(1.0, min(matchesA, matchesB) / 30)
+    * Market-only H2H rows: 0.6 if any sharp book used, else 0.3
+- Rank score: score = EV * Kelly * Confidence
+- YES bet if: Kelly >= KELLY_MIN and EV >= EV_MIN and Confidence >= MIN_CONF
+- Auto-discovers active tennis tournament keys if generic keys return no events.
+- Output: Markdown table (no "books" or "source" columns) + diagnostics.
 """
 
 import os, io, unicodedata, requests, pandas as pd
@@ -26,17 +24,16 @@ API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 if not API_KEY:
     raise SystemExit("ODDS_API_KEY not set")
 
-LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "24"))
+LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "48"))
 REGIONS         = os.getenv("REGIONS", "eu,uk,us,au").replace(" ", "")
 MARKETS         = os.getenv("MARKETS", "h2h").replace(" ", "")  # force default to H2H
 SPORT_KEYS      = [s.strip() for s in os.getenv("SPORT_KEYS", "tennis,tennis_atp,tennis_wta").split(",") if s.strip()]
 
 KELLY_MIN = float(os.getenv("KELLY_MIN", "0.05"))
 EV_MIN    = float(os.getenv("EV_MIN", "0.00"))
-MIN_CONF  = float(os.getenv("MIN_CONF", "0.40"))  # minimum confidence for YES
+MIN_CONF  = float(os.getenv("MIN_CONF", "0.40"))
 TOP_ROWS  = int(os.getenv("TOP_ROWS", "25"))
 
-# Sharp book whitelist (case-insensitive contains match)
 DEFAULT_SHARP = "Pinnacle, Pinnacle Sports, bet365, Bet365, Unibet, Marathonbet, William Hill, Betfair Sportsbook, 888sport, 10Bet"
 SHARP_BOOKS = [b.strip().lower() for b in os.getenv("SHARP_BOOKS", DEFAULT_SHARP).split(",") if b.strip()]
 
@@ -125,7 +122,6 @@ def p_model(player_a: str, player_b: str, idx_elo: dict):
 def conf_from_matches(pa: str, pb: str, idx_cnt: dict):
     a = idx_cnt.get(norm_name(pa), 0.0)
     b = idx_cnt.get(norm_name(pb), 0.0)
-    # cap by the weaker sample size; normalize to 30 matches
     return min(1.0, min(a,b)/30.0)
 
 # ------------- Odds API + diagnostics -------------
@@ -134,7 +130,7 @@ def fetch_odds_with_diag(sport_key: str):
     params = dict(
         apiKey=API_KEY,
         regions=REGIONS,
-        markets=MARKETS,           # should be "h2h"
+        markets=MARKETS,           # "h2h"
         oddsFormat="decimal",
         dateFormat="iso",
     )
@@ -157,11 +153,9 @@ def fetch_odds_with_diag(sport_key: str):
         body_snippet = str(e)
     return data, status, headers, body_snippet
 
-
-# --- helper: list active tennis keys (ATP/WTA) from Odds API ---
 def list_tennis_keys(api_key: str):
     try:
-        r = requests.get("https://api.the-odds-api.com/v4/sports", params={"apiKey": API_KEY}, timeout=30)
+        r = requests.get("https://api.the-odds-api.com/v4/sports", params={"apiKey": api_key}, timeout=30)
         if r.status_code != 200:
             return []
         out = []
@@ -172,6 +166,7 @@ def list_tennis_keys(api_key: str):
         return out
     except requests.RequestException:
         return []
+
 def within_window(commence_iso: str) -> bool:
     if not commence_iso: return False
     start = datetime.fromisoformat(commence_iso.replace("Z","+00:00"))
@@ -199,15 +194,13 @@ def add_row(rows, *, tour, market, selection, opponent, odds, p_model_val, p_fai
     kf  = ""
     bet = "NO"
     score = -1e9
-    # EV/Kelly from whichever prob is meaningful for this row:
     p_used = p_model_val if (p_model_val is not None) else p_fair
     if p_used is not None:
         evu = p_used * odds - 1.0
         kf  = kelly(p_used, odds)
-        # Bet YES only if all three clear:
         if yes_rule and (kf >= KELLY_MIN and evu >= EV_MIN and conf >= MIN_CONF):
             bet = "YES"
-        score = evu * max(kf, 0.0) * conf  # realism-weighted score
+        score = evu * max(kf, 0.0) * conf
     rows.append({
         "tour": tour, "market": market, "selection": selection, "opponent": opponent or "",
         "odds": float(odds), "p_model": ("" if p_model_val is None else float(p_model_val)),
@@ -217,24 +210,18 @@ def add_row(rows, *, tour, market, selection, opponent, odds, p_model_val, p_fai
     })
 
 def rowline(r):
-    return "| {tour} | {market} | {sel} | {opp} | {odds:.2f} | {pm} | {pf} | {ev} | {kel} | {conf:.2f} | {bet} | {start} |".format(
-        tour=r["tour"],
-        market=r["market"],
-        sel=r["selection"],
-        opp=(r["opponent"] or "—"),
-        odds=r["odds"],
-        pm=(f\"{r['p_model']:.3f}\" if isinstance(r[\"p_model\"], float) else (r[\"p_model\"] or \"\")),
-        pf=(f\"{r['p_fair']:.3f}\" if isinstance(r[\"p_fair\"], float) else (r[\"p_fair\"] or \"\")),
-        ev=(f\"{r['evu']:.3f}\" if r[\"evu\"] != \"\" else \"\"),
-        kel=(f\"{r['kelly']:.3f}\" if r[\"kelly\"] != \"\" else \"\"),
-        conf=r[\"conf\"],
-        bet=r[\"bet\"],
-        start=r[\"start_utc\"],
+    pm  = f"{r['p_model']:.3f}" if isinstance(r["p_model"], float) else (r["p_model"] or "")
+    pf  = f"{r['p_fair']:.3f}"  if isinstance(r["p_fair"],  float) else (r["p_fair"]  or "")
+    ev  = f"{r['evu']:.3f}"     if r["evu"]   != "" else ""
+    kel = f"{r['kelly']:.3f}"   if r["kelly"] != "" else ""
+    return (
+        f"| {r['tour']} | {r['market']} | {r['selection']} | {r.get('opponent') or '—'} | "
+        f"{r['odds']:.2f} | {pm} | {pf} | {ev} | {kel} | {r['conf']:.2f} | {r['bet']} | {r['start_utc']} |"
     )
 
 def write_output(table_rows, diag_lines):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    now_loc = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime(f\"%Y-%m-%d %H:%M {LOCAL_TZ.key.split('/')[-1]}\")
+    now_loc = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime(f"%Y-%m-%d %H:%M {LOCAL_TZ.key.split('/')[-1]}")
     head = [
         "# Tennis Value Engine (H2H only, Realism-weighted)",
         "",
@@ -269,10 +256,6 @@ def run():
     # Fetch with diagnostics across configured sport keys
     diag = []
     events_all = []
-    # --- BEGIN EXTRA DIAGNOSTICS ---
-    total_before_window = 0
-    # --- END EXTRA DIAGNOSTICS ---
-
     for key in SPORT_KEYS:
         data, status, hdrs, body = fetch_odds_with_diag(key)
         events_all += data
@@ -284,8 +267,7 @@ def run():
         if status != 200 and body:
             diag.append("  error body: " + body)
 
-
-    # Fallback: if no events were collected, auto-discover active tennis keys and try again
+    # Fallback: if nothing from static keys, auto-discover active tennis_* keys
     if not events_all:
         auto_keys = list_tennis_keys(API_KEY)
         if auto_keys:
@@ -302,6 +284,10 @@ def run():
                     diag.append("  error body: " + body)
         else:
             diag.append("- Auto-discovery found no active ATP/WTA keys from provider.")
+
+    total_before_window = 0
+    h2h_pairs_after_window = 0
+
     # Build candidates with realism weights — H2H only
     cands = []
 
@@ -316,9 +302,8 @@ def run():
         stitle = (ev.get("sport_title") or "").upper()
         tour_hint = "ATP" if "ATP" in stitle else ("WTA" if "WTA" in stitle else "GEN")
 
-        # ---- Aggregate best H2H prices with sharp filter preference ----
+        # Aggregate best H2H prices with sharp filter pref
         def best_prices_h2h():
-            # returns dict keyed by name -> {\"price\":, \"sharp\":bool}
             grid = {}
             sharp_any = False
             for bm in ev.get("bookmakers", []):
@@ -332,21 +317,21 @@ def run():
                         if nm is None or pr is None: continue
                         cell = grid.get(nm)
                         if cell is None or pr > cell["price"] or (bsharp and pr == cell["price"] and not cell["sharp"]):
-                            grid[nm] = {\"price\": float(pr), \"sharp\": bsharp}
+                            grid[nm] = {"price": float(pr), "sharp": bsharp}
                             if bsharp: sharp_any = True
                         elif abs(pr - cell["price"]) < 1e-9:
                             cell["sharp"] = cell["sharp"] or bsharp
                             if bsharp: sharp_any = True
             if sharp_any:
-                # keep only prices that are sharp-best
                 grid = {k:v for k,v in grid.items() if v["sharp"]}
             return grid
 
         h2h = best_prices_h2h()
         if len(h2h) == 2:
             (n1, a), (n2, b) = list(h2h.items())[0], list(h2h.items())[1]
+            h2h_pairs_after_window += 1
 
-            # choose model tour
+            # Guess model tour
             pmA = pmB = None; confE = 0.0; model_tour = None
             def try_tour(code):
                 if code=="ATP":
@@ -365,11 +350,11 @@ def run():
                 pmA, pmB, confE, model_tour = try_tour(code)
                 if model_tour: break
 
-            # market no-vig
+            # Market no-vig
             _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
             conf_mkt = 0.6 if (a["sharp"] or b["sharp"]) else 0.3
 
-            # Elo-backed rows (if found)
+            # Elo-backed rows
             if model_tour:
                 add_row(cands, tour=model_tour, market="H2H", selection=n1, opponent=n2,
                         odds=a["price"], p_model_val=pmA, p_fair=pfA, start_utc=start_utc_str,
@@ -378,7 +363,7 @@ def run():
                         odds=b["price"], p_model_val=pmB, p_fair=pfB, start_utc=start_utc_str,
                         conf=confE)
 
-            # Market-only rows (always)
+            # Market-only rows
             add_row(cands, tour=(model_tour or tour_hint), market="H2H", selection=n1, opponent=n2,
                     odds=a["price"], p_model_val=None, p_fair=pfA, start_utc=start_utc_str,
                     conf=conf_mkt)
@@ -386,14 +371,12 @@ def run():
                     odds=b["price"], p_model_val=None, p_fair=pfB, start_utc=start_utc_str,
                     conf=conf_mkt)
 
-    # Add diagnostics summary
-    diag.append(f"- Events fetched (all keys): {len(events_all)} | Before window filter: {total_before_window} | After window filter: {len(cands)//2 if cands else 0} matches (H2H pairs)")
+    # Diagnostics summary
+    diag.append(f"- Events fetched (all keys): {len(events_all)} | Before window filter: {total_before_window} | H2H pairs after window: {h2h_pairs_after_window}")
 
-    # Sort realism-weighted and cap rows
+    # Sort & limit
     cands.sort(key=lambda r: r["score"], reverse=True)
     top = cands[:TOP_ROWS]
-
-    # Render table
     rows = [rowline(r) for r in top]
 
     write_output(rows, diag)
