@@ -46,7 +46,7 @@ jobs:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           LOOKAHEAD_HOURS: "48"
           REGIONS: "eu,uk,us,au"
-          MARKETS: "h2h"  # ensure only H2H is requested
+          MARKETS: "h2h"
           SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
           KELLY_MIN: "0.05"
           EV_MIN: "0.00"
@@ -55,17 +55,22 @@ jobs:
           OUT_DIR: "outputs"
           SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
-          python scripts/tennis_value_engine.py  
+          python scripts/tennis_value_engine.py
 
       - name: Upload shortlist artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tennis-value-engine-shortlist
           path: outputs/value_engine_shortlist.md
 
-      - name: Summarize
+      - name: Summarize (safe)
         if: always()
         run: |
           echo "## Rendered file" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          sed -n '1,200p' outputs/value_engine_shortlist.md >> $GITHUB_STEP_SUMMARY
+          if [ -f outputs/value_engine_shortlist.md ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            sed -n '1,200p' outputs/value_engine_shortlist.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No shortlist file produced._" >> $GITHUB_STEP_SUMMARY
+          fi
