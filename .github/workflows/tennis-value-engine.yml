@@ -1,9 +1,9 @@
-name: Tennis Value Engine (Clean H2H)
+name: Tennis Value Engine (H2H only)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "5 6 * * *"   # UTC; adjust if needed
+    - cron: "0 8 * * *"   # 08:00 UTC daily
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -25,143 +25,47 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Prepare dependencies
+        run: |
+          printf "pandas\nrequests\npytz\n" > requirements.txt
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests pytz
+          pip install -r requirements.txt
 
-      - name: List workspace (before run)
-        run: |
-          echo "==== FILES (top 3 levels) ===="
-          find . -maxdepth 3 -type f | sed 's|^\./||' | sort
-          echo "==============================="
-
-      # Run producer BUT BLOCK any summary it tries to write
-      - name: Run model (produce shortlist)
+      - name: Run value engine (H2H only)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           LOOKAHEAD_HOURS: "24"
           REGIONS: "eu,uk,us,au"
-          MARKETS: "h2h,spreads,totals"
+          MARKETS: "h2h"  # ensure only H2H is requested
           SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
-          KELLY_MIN: "0.00"
+          KELLY_MIN: "0.05"
           EV_MIN: "0.00"
-          MIN_CONF: "0.00"
+          MIN_CONF: "0.40"
+          TOP_ROWS: "25"
           OUT_DIR: "outputs"
           SHORTLIST_FILE: "value_engine_shortlist.md"
-          GITHUB_STEP_SUMMARY: "/dev/null"   # <- producer cannot pollute the summary
         run: |
-          set -euo pipefail
-          CAND=$(ls -1 **/*.py | grep -Ei '(tennis.*value.*engine|value.*engine).*\.py$' | head -n 1 || true)
-          if [ -z "${CAND:-}" ]; then
-            echo "ERROR: Could not find a producer script matching *tennis*value*engine*.py"
-            find . -maxdepth 3 -type f -name '*.py' | sed 's|^\./||' | sort
-            exit 1
-          fi
-          echo "Producer script: $CAND"
-          python "$CAND"
+          python tennis_value_engine.py
 
-      # Build CLEAN table and publish summary (single step: parse MD -> filter/dedupe -> CSV -> summary)
-      - name: Build clean H2H table; export CSV; overwrite summary
-        run: |
-          python - <<'PY'
-          import pandas as pd, os, sys, glob, re
-
-          # ---- find shortlist markdown with the known header ----
-          HEADER = "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) | Books | Source |"
-          md_files = glob.glob("**/*.md", recursive=True)
-          if not md_files:
-              sys.exit("ERROR: No markdown files found (producer didn't write a shortlist).")
-
-          src_md = None
-          for f in sorted(md_files):
-              try:
-                  txt = open(f, encoding="utf-8").read()
-                  if HEADER in txt:
-                      src_md = f; break
-              except Exception:
-                  pass
-          if src_md is None:
-              sys.exit("ERROR: Could not find shortlist table header in any .md")
-
-          lines = [l.rstrip("\n") for l in open(src_md, encoding="utf-8")]
-          start = next((i for i,l in enumerate(lines) if l.strip().startswith(HEADER)), None)
-          if start is None:
-              sys.exit("ERROR: header not found after opening shortlist")
-
-          header = [c.strip() for c in lines[start].strip().strip("|").split("|")]
-          data, i = [], start + 2  # skip separator row
-          while i < len(lines):
-              l = lines[i].strip()
-              if not l or not l.startswith("|"): break
-              if l.startswith("|---"): i += 1; continue
-              parts = [c.strip() for c in l.strip().strip("|").split("|")]
-              if len(parts) != len(header): break
-              data.append(dict(zip(header, parts)))
-              i += 1
-
-          df = pd.DataFrame(data)
-
-          # ---- numeric coercion ----
-          for col in ["Odds","p_model","p_fair","EV/u","Kelly","Conf"]:
-              if col in df.columns:
-                  df[col] = pd.to_numeric(df[col].replace({"": None}), errors="coerce")
-
-          # ---- CLEAN: H2H only; Kelly >= 0.05; EV/u > 0 ----
-          df = df[df["Market"].astype(str).str.strip().str.upper().eq("H2H")].copy()
-          df = df[(df["Kelly"] >= 0.05) & (df["EV/u"] > 0)].copy()
-
-          # ---- DEDUPE per unordered matchup; keep highest Kelly then EV/u then Odds ----
-          def pair(a,b):
-              a,b = str(a).strip(), str(b).strip()
-              return " | ".join(sorted([a,b]))
-          df["__pair__"] = [pair(a,b) for a,b in zip(df["Selection"], df["Opponent"])]
-          sort_cols, asc = ["Kelly","EV/u"], [False, False]
-          if "Odds" in df.columns: sort_cols.append("Odds"); asc.append(False)
-          df.sort_values(sort_cols, ascending=asc, inplace=True)
-          df = df.drop_duplicates(["__pair__"], keep="first").copy()
-          df.drop(columns="__pair__", inplace=True)
-
-          # ---- DROP noise columns ----
-          for name in list(df.columns):
-              if name.lower() in ("books","source"):
-                  df.drop(columns=name, inplace=True)
-
-          df["Bet"] = "YES"
-
-          # ---- tidy order (no Books/Source) ----
-          preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)']
-          cols_out = [c for c in preferred if c in df.columns] or df.columns.tolist()
-          df = df[cols_out]
-
-          # ---- write CSV ----
-          out_csv = "value_filtered_h2h.csv"
-          df.to_csv(out_csv, index=False)
-
-          # ---- overwrite Actions summary with ONLY the clean table ----
-          def gfm(t):
-              if t.empty: return "_No H2H picks passed filters._"
-              lines = ["| " + " | ".join(t.columns) + " |",
-                       "| " + " | ".join(["---"]*len(t.columns)) + " |"]
-              for _, r in t.iterrows():
-                  lines.append("| " + " | ".join(str(r[c]) for c in t.columns) + " |")
-              return "\n".join(lines)
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/tmp/gh_summary.md")
-          with open(summary_path, "w") as fh:   # 'w' = truncate/overwrite anything earlier
-              fh.write("# Clean H2H Picks\n\n" + gfm(df) + "\n")
-
-          print(f"Built clean table: {out_csv} (rows kept: {len(df)})")
-          PY
-
-      - name: Upload filtered picks
+      - name: Upload shortlist artifact
         uses: actions/upload-artifact@v4
         with:
-          name: value_filtered_h2h
-          path: value_filtered_h2h.csv
-          if-no-files-found: error
+          name: tennis-value-engine-shortlist
+          path: outputs/value_engine_shortlist.md
+
+      - name: Summarize
+        if: always()
+        run: |
+          echo "## Rendered file" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          sed -n '1,200p' outputs/value_engine_shortlist.md >> $GITHUB_STEP_SUMMARY

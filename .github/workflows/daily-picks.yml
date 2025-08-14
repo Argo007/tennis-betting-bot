@@ -1,4 +1,4 @@
-name: Tennis Picks (ATP/WTA)
+name: Daily Picks (H2H only)
 
 on:
   schedule:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tennis-picks
+  group: daily-picks
   cancel-in-progress: true
 
 env:
@@ -25,7 +25,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # minimal deps so setup-python cache is happy
       - name: Prepare dependencies
         run: |
           printf "pandas\nrequests\npytz\n" > requirements.txt
@@ -42,126 +41,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- build Elo (last 2–3 seasons) ---
-      - name: Download ATP/WTA results
-        run: |
-          set -euo pipefail
-          mkdir -p matches
-          curl -sSLo matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -sSLo matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -sSLo matches/atp_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv || true
-          curl -sSLo matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -sSLo matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
-          curl -sSLo matches/wta_matches_2025.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2025.csv || true
-
-      - name: Generate Elo
-        run: |
-          python - <<'PY'
-          import pandas as pd, glob, os
-          START, K = 1500, 32
-          def exp(a,b): return 1/(1+10**((b-a)/400))
-          def upd(a,b,s): return a + K*(s-exp(a,b))
-          def calc(pattern):
-              files = sorted(glob.glob(pattern))
-              if not files: raise SystemExit(f"No files for {pattern}")
-              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
-              E={}
-              for _,r in df.iterrows():
-                  w,l = r.get('winner_name'), r.get('loser_name')
-                  if pd.isna(w) or pd.isna(l): continue
-                  ew, el = E.get(w,START), E.get(l,START)
-                  E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
-              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()]).sort_values('elo',ascending=False)
-          os.makedirs("data", exist_ok=True)
-          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
-          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
-          print("Elo ready.")
-          PY
-
-      # --- run your model with a strict 24h window ---
-      - name: Run model (24h)
+      - name: Run (H2H-only) value engine
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          LOOKAHEAD_HOURS: "24"
+          REGIONS: "eu,uk,us,au"
+          MARKETS: "h2h"
+          SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
+          KELLY_MIN: "0.05"
+          EV_MIN: "0.00"
+          MIN_CONF: "0.40"
+          TOP_ROWS: "25"
+          OUT_DIR: "outputs"
+          SHORTLIST_FILE: "daily_picks.md"
         run: |
-          set -euo pipefail
-          python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out value_picks_pro.csv
+          python tennis_value_engine.py
 
-      # --- print shortlist: stake removed, Bet: YES/NO instead ---
-      - name: Print shortlist (3 Dogs, 2 Favs per tour)
+      - name: Upload daily picks
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-picks-h2h
+          path: outputs/daily_picks.md
+
+      - name: Summarize
+        if: always()
         run: |
-          python - <<'PY'
-          import pandas as pd, os, sys
-          from datetime import datetime, timedelta, timezone
-
-          ODDS_DOG_MIN, ODDS_DOG_MAX = 2.20, 4.50
-          ODDS_FAV_MIN, ODDS_FAV_MAX = 1.30, 1.80
-          MIN_CONF = 50
-          TOP_DOGS, TOP_FAVS = 3, 2
-
-          # Odds "goodness" threshold -> YES if EV>0 and Kelly>=this
-          BET_KELLY_MIN = 0.05
-
-          if not os.path.exists("value_picks_pro.csv"):
-              print("No value_picks_pro.csv produced — skipping shortlist.")
-              sys.exit(0)
-
-          df = pd.read_csv("value_picks_pro.csv")
-
-          for c in ["blended_prob","best_odds","ev_per_unit","kelly_fraction","confidence"]:
-              if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-
-          need = {"tour","player","opponent","best_odds","ev_per_unit","blended_prob","kelly_fraction","confidence","commence_time_utc"}
-          miss = [c for c in need if c not in df.columns]
-          if miss:
-              print("Missing columns:", ", ".join(miss)); sys.exit(0)
-
-          # Hard 24h filter (UTC)
-          now = datetime.now(timezone.utc); in24 = now + timedelta(hours=24)
-          df["commence_time_utc"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
-          df = df[(df["commence_time_utc"] >= now) & (df["commence_time_utc"] <= in24)]
-
-          df = df.dropna(subset=["best_odds","ev_per_unit","blended_prob","kelly_fraction","commence_time_utc"])
-
-          def dedup(d):
-              d = d.copy()
-              d.insert(0,"match_id", d.apply(lambda r: " :: ".join(sorted([str(r["player"]), str(r["opponent"])])), axis=1))
-              return d.sort_values("ev_per_unit", ascending=False).groupby("match_id", as_index=False).first()
-
-          def picks(data, lo, hi, n):
-              filt = data[
-                  (data["ev_per_unit"] > 0) &
-                  (data["best_odds"].between(lo, hi, inclusive="both")) &
-                  (data["confidence"] >= MIN_CONF)
-              ]
-              return dedup(filt).sort_values(["ev_per_unit","confidence"], ascending=[False, False]).head(n)
-
-          def bet_yes_no(row):
-              return "YES" if (row["ev_per_unit"] > 0) and (row["kelly_fraction"] >= BET_KELLY_MIN) else "NO"
-
-          def bullets(x):
-              if x.empty: return "_None_"
-              lines=[]
-              for _,r in x.iterrows():
-                  lines.append(
-                      f"- {r['player']} vs {r['opponent']} — {r['best_odds']:.2f} "
-                      f"(p={r['blended_prob']:.2f}, Kelly={r['kelly_fraction']:.3f}, Bet: {bet_yes_no(r)})\n"
-                      f"  🗓 {r['commence_time_utc'].strftime('%Y-%m-%d %H:%M UTC')}"
-                  )
-              return "\n".join(lines)
-
-          out=[]
-          for tour in ["ATP","WTA"]:
-              sub = df[df["tour"].str.upper()==tour]
-              dogs = picks(sub, ODDS_DOG_MIN, ODDS_DOG_MAX, TOP_DOGS)
-              favs = picks(sub, ODDS_FAV_MIN, ODDS_FAV_MAX, TOP_FAVS)
-              out += [
-                  f"## 🏆 {tour} Underdogs (Top {TOP_DOGS})",
-                  bullets(dogs), "",
-                  f"## 🛡 {tour} Favorites (Top {TOP_FAVS})",
-                  bullets(favs), ""
-              ]
-
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("\n".join(out))
-          print("Shortlist written to job summary.")
-          PY
+          echo "## Daily Picks (H2H only)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          sed -n '1,200p' outputs/daily_picks.md >> $GITHUB_STEP_SUMMARY
