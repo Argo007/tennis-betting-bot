@@ -44,7 +44,7 @@ jobs:
       - name: Run (H2H-only) value engine
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          LOOKAHEAD_HOURS: "24"
+          LOOKAHEAD_HOURS: "48"
           REGIONS: "eu,uk,us,au"
           MARKETS: "h2h"
           SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
