@@ -55,8 +55,8 @@ jobs:
           OUT_DIR: "outputs"
           SHORTLIST_FILE: "daily_picks.md"
         run: |
-          python tennis_value_engine.py
-
+          python scripts/tennis_value_engine.py
+          
       - name: Upload daily picks
         uses: actions/upload-artifact@v4
         with:
