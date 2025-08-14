@@ -56,16 +56,21 @@ jobs:
           SHORTLIST_FILE: "daily_picks.md"
         run: |
           python scripts/tennis_value_engine.py
-          
+
       - name: Upload daily picks
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-picks-h2h
           path: outputs/daily_picks.md
 
-      - name: Summarize
+      - name: Summarize (safe)
         if: always()
         run: |
           echo "## Daily Picks (H2H only)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          sed -n '1,200p' outputs/daily_picks.md >> $GITHUB_STEP_SUMMARY
+          if [ -f outputs/daily_picks.md ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            sed -n '1,200p' outputs/daily_picks.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No daily picks file produced._" >> $GITHUB_STEP_SUMMARY
+          fi
