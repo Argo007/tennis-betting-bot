@@ -2,19 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Tennis Value Engine — realism weighted
---------------------------------------
-- Works with generic "tennis" sport key (set SPORT_KEYS in env).
-- Builds Elo (ATP/WTA, 2023–2025) and now also tracks MATCH COUNTS per player.
+Tennis Value Engine — H2H only, realism-weighted
+------------------------------------------------
+- Only evaluates Head-to-Head (H2H) markets. Totals/Spreads are removed.
+- Uses Elo (ATP/WTA, 2023–2025) + per-player match counts to weight confidence.
 - Confidence weighting:
-    * Elo-backed rows: conf = min(1.0, min(matchesA, matchesB)/30)
-    * Market H2H: 0.6 if sharp-book price used else 0.3
-    * Totals/Spreads: 0.4 if sharp-book price used else 0.2
-- Score used for ranking: score = EV * Kelly * Confidence
-- Bet: YES only if Kelly >= KELLY_MIN, EV >= EV_MIN, Confidence >= MIN_CONF
-- Sharp book whitelist via SHARP_BOOKS env (comma separated). Fallback to all books if none matched.
-
-Outputs a Markdown table every run. Appends API diagnostics.
+    * Elo-backed H2H rows: conf = min(1.0, min(matchesA, matchesB)/30)
+    * Market-only H2H rows: 0.6 if sharp-book price used else 0.3
+- Ranking score: score = EV * Kelly * Confidence
+- Bet rule: YES if Kelly >= KELLY_MIN, EV >= EV_MIN, Confidence >= MIN_CONF
+- Sharp book whitelist via SHARP_BOOKS env (comma separated). If any sharp lines exist, we keep only sharp-best quotes.
+- OUTPUT columns are trimmed: no "books" and no "source".
+- Outputs a Markdown table every run and appends API diagnostics.
 """
 
 import os, io, unicodedata, requests, pandas as pd
@@ -29,13 +28,12 @@ if not API_KEY:
 
 LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "24"))
 REGIONS         = os.getenv("REGIONS", "eu,uk,us,au").replace(" ", "")
-MARKETS         = os.getenv("MARKETS", "h2h,spreads,totals").replace(" ", "")
+MARKETS         = os.getenv("MARKETS", "h2h").replace(" ", "")  # force default to H2H
 SPORT_KEYS      = [s.strip() for s in os.getenv("SPORT_KEYS", "tennis,tennis_atp,tennis_wta").split(",") if s.strip()]
 
 KELLY_MIN = float(os.getenv("KELLY_MIN", "0.05"))
 EV_MIN    = float(os.getenv("EV_MIN", "0.00"))
-MIN_CONF  = float(os.getenv("MIN_CONF", "0.40"))  # new: minimum confidence for YES
-
+MIN_CONF  = float(os.getenv("MIN_CONF", "0.40"))  # minimum confidence for YES
 TOP_ROWS  = int(os.getenv("TOP_ROWS", "25"))
 
 # Sharp book whitelist (case-insensitive contains match)
@@ -136,7 +134,7 @@ def fetch_odds_with_diag(sport_key: str):
     params = dict(
         apiKey=API_KEY,
         regions=REGIONS,
-        markets=MARKETS,
+        markets=MARKETS,           # should be "h2h"
         oddsFormat="decimal",
         dateFormat="iso",
     )
@@ -181,7 +179,7 @@ def is_sharp_book(name: str) -> bool:
     return any(tag in n for tag in SHARP_BOOKS)
 
 def add_row(rows, *, tour, market, selection, opponent, odds, p_model_val, p_fair, start_utc,
-            books, source, conf, yes_rule=True):
+            conf, yes_rule=True):
     evu = ""
     kf  = ""
     bet = "NO"
@@ -200,41 +198,38 @@ def add_row(rows, *, tour, market, selection, opponent, odds, p_model_val, p_fai
         "odds": float(odds), "p_model": ("" if p_model_val is None else float(p_model_val)),
         "p_fair": float(p_fair) if p_fair is not None else "",
         "evu": ("" if evu=="" else float(evu)), "kelly": ("" if kf=="" else float(kf)),
-        "bet": bet, "start_utc": start_utc, "books": books, "source": source,
-        "score": score, "conf": conf
+        "bet": bet, "start_utc": start_utc, "score": score, "conf": conf
     })
 
 def rowline(r):
-    return "| {tour} | {market} | {sel} | {opp} | {odds:.2f} | {pm} | {pf} | {ev} | {kel} | {conf:.2f} | {bet} | {start} | {books} | {src} |".format(
+    return "| {tour} | {market} | {sel} | {opp} | {odds:.2f} | {pm} | {pf} | {ev} | {kel} | {conf:.2f} | {bet} | {start} |".format(
         tour=r["tour"],
         market=r["market"],
         sel=r["selection"],
         opp=(r["opponent"] or "—"),
         odds=r["odds"],
-        pm=(f"{r['p_model']:.3f}" if isinstance(r["p_model"], float) else (r["p_model"] or "")),
-        pf=(f"{r['p_fair']:.3f}" if isinstance(r["p_fair"], float) else (r["p_fair"] or "")),
-        ev=(f"{r['evu']:.3f}" if r["evu"] != "" else ""),
-        kel=(f"{r['kelly']:.3f}" if r["kelly"] != "" else ""),
-        conf=r["conf"],
-        bet=r["bet"],
-        start=r["start_utc"],
-        books=r.get("books",""),
-        src=r["source"],
+        pm=(f\"{r['p_model']:.3f}\" if isinstance(r[\"p_model\"], float) else (r[\"p_model\"] or \"\")),
+        pf=(f\"{r['p_fair']:.3f}\" if isinstance(r[\"p_fair\"], float) else (r[\"p_fair\"] or \"\")),
+        ev=(f\"{r['evu']:.3f}\" if r[\"evu\"] != \"\" else \"\"),
+        kel=(f\"{r['kelly']:.3f}\" if r[\"kelly\"] != \"\" else \"\"),
+        conf=r[\"conf\"],
+        bet=r[\"bet\"],
+        start=r[\"start_utc\"],
     )
 
 def write_output(table_rows, diag_lines):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    now_loc = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime(f"%Y-%m-%d %H:%M {LOCAL_TZ.key.split('/')[-1]}")
+    now_loc = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime(f\"%Y-%m-%d %H:%M {LOCAL_TZ.key.split('/')[-1]}\")
     head = [
-        "# Tennis Value Engine (Realism-weighted)",
+        "# Tennis Value Engine (H2H only, Realism-weighted)",
         "",
         f"Updated: {now_loc} ({now_utc})",
         "",
-        "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) | Books | Source |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|:---:|---|---|---|",
+        "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|:---:|---|",
     ]
     rows = head + (table_rows if table_rows else [
-        "| – | – | – | – | – | – | – | – | – | – | – | – | – | – |",
+        "| – | – | – | – | – | – | – | – | – | – | – | – |",
         "",
         "_No markets returned by the API in your window/regions. See diagnostics below._",
     ])
@@ -270,12 +265,12 @@ def run():
         if status != 200 and body:
             diag.append("  error body: " + body)
 
-    # Build candidates with realism weights
+    # Build candidates with realism weights — H2H only
     cands = []
 
     for ev in events_all:
         ct = ev.get("commence_time")
-        if not ct or not within_window(ct): 
+        if not ct or not within_window(ct):
             continue
         start_utc = datetime.fromisoformat(ct.replace("Z","+00:00"))
         start_utc_str = start_utc.strftime("%Y-%m-%d %H:%M UTC")
@@ -283,41 +278,37 @@ def run():
         stitle = (ev.get("sport_title") or "").upper()
         tour_hint = "ATP" if "ATP" in stitle else ("WTA" if "WTA" in stitle else "GEN")
 
-        # ---- Aggregate best prices with sharp filter preference ----
-        def best_prices(market_key):
-            # returns dict keyed by (name,point) -> {"price":, "books":set(), "sharp":bool, "name":, "point":}
+        # ---- Aggregate best H2H prices with sharp filter preference ----
+        def best_prices_h2h():
+            # returns dict keyed by name -> {\"price\":, \"sharp\":bool}
             grid = {}
             sharp_any = False
             for bm in ev.get("bookmakers", []):
                 bname = bm.get("title","?")
                 bsharp = is_sharp_book(bname)
                 for mk in bm.get("markets", []):
-                    if mk.get("key") != market_key: continue
+                    if mk.get("key") != "h2h": continue
                     for out in mk.get("outcomes", []):
                         nm = out.get("name")
-                        pt = out.get("point", 0.0) or 0.0
                         pr = out.get("price")
                         if nm is None or pr is None: continue
-                        k = (nm, float(pt))
-                        cell = grid.get(k)
+                        cell = grid.get(nm)
                         if cell is None or pr > cell["price"] or (bsharp and pr == cell["price"] and not cell["sharp"]):
-                            grid[k] = {"price": float(pr), "books": {bname}, "sharp": bsharp, "name": nm, "point": float(pt)}
+                            grid[nm] = {\"price\": float(pr), \"sharp\": bsharp}
                             if bsharp: sharp_any = True
                         elif abs(pr - cell["price"]) < 1e-9:
-                            cell["books"].add(bname)
                             cell["sharp"] = cell["sharp"] or bsharp
                             if bsharp: sharp_any = True
-            # if any sharp prices existed, keep only lines where best is sharp; else keep all
             if sharp_any:
+                # keep only prices that are sharp-best
                 grid = {k:v for k,v in grid.items() if v["sharp"]}
             return grid
 
-        # H2H (pair any two outcomes)
-        h2h = best_prices("h2h")
+        h2h = best_prices_h2h()
         if len(h2h) == 2:
-            (n1,_), a = list(h2h.items())[0]
-            (n2,_), b = list(h2h.items())[1]
-            # model tour guess: try hint, then ATP, then WTA
+            (n1, a), (n2, b) = list(h2h.items())[0], list(h2h.items())[1]
+
+            # choose model tour
             pmA = pmB = None; confE = 0.0; model_tour = None
             def try_tour(code):
                 if code=="ATP":
@@ -331,6 +322,7 @@ def run():
                         c = conf_from_matches(n1, n2, cnt_wta)
                         return p1, p2, c, "WTA"
                 return None, None, 0.0, None
+
             for code in ([tour_hint] if tour_hint in ("ATP","WTA") else []) + ["ATP","WTA"]:
                 pmA, pmB, confE, model_tour = try_tour(code)
                 if model_tour: break
@@ -343,52 +335,18 @@ def run():
             if model_tour:
                 add_row(cands, tour=model_tour, market="H2H", selection=n1, opponent=n2,
                         odds=a["price"], p_model_val=pmA, p_fair=pfA, start_utc=start_utc_str,
-                        books=", ".join(sorted(a["books"])), source="Elo", conf=confE)
+                        conf=confE)
                 add_row(cands, tour=model_tour, market="H2H", selection=n2, opponent=n1,
                         odds=b["price"], p_model_val=pmB, p_fair=pfB, start_utc=start_utc_str,
-                        books=", ".join(sorted(b["books"])), source="Elo", conf=confE)
+                        conf=confE)
 
             # Market-only rows (always)
             add_row(cands, tour=(model_tour or tour_hint), market="H2H", selection=n1, opponent=n2,
                     odds=a["price"], p_model_val=None, p_fair=pfA, start_utc=start_utc_str,
-                    books=", ".join(sorted(a["books"])), source="Kelly H2H", conf=conf_mkt)
+                    conf=conf_mkt)
             add_row(cands, tour=(model_tour or tour_hint), market="H2H", selection=n2, opponent=n1,
                     odds=b["price"], p_model_val=None, p_fair=pfB, start_utc=start_utc_str,
-                    books=", ".join(sorted(b["books"])), source="Kelly H2H", conf=conf_mkt)
-
-        # Totals (pair Over/Under at same line)
-        totals = best_prices("totals")
-        by_pts = {}
-        for (nm,pt), cell in totals.items():
-            by_pts.setdefault(pt, {})[nm] = cell
-        for pt, sides in by_pts.items():
-            if "Over" in sides and "Under" in sides:
-                po, pu = sides["Over"]["price"], sides["Under"]["price"]
-                _,_,pfO,pfU = fair_two_way(po, pu)
-                conf_tot = 0.4 if (sides["Over"]["sharp"] or sides["Under"]["sharp"]) else 0.2
-                add_row(cands, tour=tour_hint, market="Totals", selection=f"Over {pt}", opponent="",
-                        odds=po, p_model_val=None, p_fair=pfO, start_utc=start_utc_str,
-                        books=", ".join(sorted(sides["Over"]["books"])), source="Kelly Totals", conf=conf_tot)
-                add_row(cands, tour=tour_hint, market="Totals", selection=f"Under {pt}", opponent="",
-                        odds=pu, p_model_val=None, p_fair=pfU, start_utc=start_utc_str,
-                        books=", ".join(sorted(sides["Under"]["books"])), source="Kelly Totals", conf=conf_tot)
-
-        # Spreads (any two outcomes at same line)
-        spreads = best_prices("spreads")
-        sp_by_pts = {}
-        for (nm,pt), cell in spreads.items():
-            sp_by_pts.setdefault(pt, []).append((nm, cell))
-        for pt, arr in sp_by_pts.items():
-            if len(arr)==2:
-                (_, A), (_, B) = arr[0], arr[1]
-                _,_,pfA,pfB = fair_two_way(A["price"], B["price"])
-                conf_sp = 0.4 if (A["sharp"] or B["sharp"]) else 0.2
-                add_row(cands, tour=tour_hint, market="Spread", selection=f"{pt:+.1f} (A)", opponent="",
-                        odds=A["price"], p_model_val=None, p_fair=pfA, start_utc=start_utc_str,
-                        books=", ".join(sorted(A["books"])), source="Kelly Spread", conf=conf_sp)
-                add_row(cands, tour=tour_hint, market="Spread", selection=f"{pt:+.1f} (B)", opponent="",
-                        odds=B["price"], p_model_val=None, p_fair=pfB, start_utc=start_utc_str,
-                        books=", ".join(sorted(B["books"])), source="Kelly Spread", conf=conf_sp)
+                    conf=conf_mkt)
 
     # Sort realism-weighted and cap rows
     cands.sort(key=lambda r: r["score"], reverse=True)
@@ -396,15 +354,6 @@ def run():
 
     # Render table
     rows = [rowline(r) for r in top]
-
-    # If nothing, still show diagnostics
-    diag_lines = []
-    if not events_all:
-        diag_lines.append("- No events found from provider for the configured SPORT_KEYS/regions.")
-    else:
-        # Add the API per-key status summary collected earlier
-        # (already appended during fetch)
-        pass  # handled in write_output via diag passed in
 
     write_output(rows, diag)
 
