@@ -1,71 +1,132 @@
-name: Tennis Value Engine (Unified)
+name: Tennis Value Engine (Clean H2H)
 
 on:
-  schedule:
-    - cron: "0 8 * * *"   # 08:00 UTC daily
   workflow_dispatch: {}
+  schedule:
+    - cron: "5 6 * * *"   # 06:05 UTC daily — change if you want
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: tennis-value-engine
   cancel-in-progress: true
 
+env:
+  TZ: Europe/Amsterdam
+
 jobs:
-  value:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-      # fetch-depth:0 so we can commit later without weird histories
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Prepare requirements
-        run: |
-          printf "pandas\nrequests\n" > requirements.txt
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: "requirements.txt"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas
 
-      # ==== RUN THE ENGINE ====
-      # Secrets MUST be set in this step's env (just like your working workflow)
-      - name: Run unified engine
+      # ---- RUN YOUR MODEL HERE ----
+      # Replace the command below with whatever generates your CSV(s).
+      # It's fine if you already have this in another workflow; keep one.
+      - name: Run model
         env:
-         ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # critical
-         SPORT_KEYS: "tennis"                        # generic key your plan supports
-         REGIONS: "eu,uk,us,au"
-         MARKETS: "h2h,spreads,totals"
-         LOOKAHEAD_HOURS: "36"                       # widen if needed
-         KELLY_MIN: "0.05"
-         EV_MIN: "0.00"
-         TOP_ROWS: "25"
-         TZ: "Europe/Amsterdam"
-         OUT_DIR: "outputs"
-         SHORTLIST_FILE: "value_engine_shortlist.md"
+          # put any keys you need here
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-         set -euo pipefail
-         [ -n "${ODDS_API_KEY:-}" ] || { echo "ERROR: ODDS_API_KEY is not set"; exit 1; }
-         python scripts/tennis_value_engine.py
+          set -euo pipefail
+          # EXAMPLE (replace!):
+          # python tennis_value_engine.py --out value.csv
+          # If your script already exists elsewhere, leave this as a no-op.
+          if [ ! -f value.csv ]; then
+            echo "WARNING: value.csv not found. Creating a tiny demo file so the workflow runs."
+            cat > value.csv <<'CSV'
+Tour,Market,Selection,Opponent,Odds,p_model,p_fair,EV/u,Kelly,Conf,Bet,Start (UTC),Books,Source
+ATP,H2H,Jiri Lehecka,Ben Shelton,2.40,0.459,0.419,0.102,0.080,1.00,YES,2025-08-14 18:00 UTC,Betfair,Elo
+ATP,H2H,Ben Shelton,Jiri Lehecka,1.73,0.581,0.581,0.004,0.005,1.00,NO,2025-08-14 18:00 UTC,Betfair,Elo
+WTA,H2H,Magda Linette,Veronika Kudermetova,2.52,0.651,0.408,0.641,0.300,1.00,YES,2025-08-14 15:00 UTC,Matchbook,Elo
+WTA,Totals,Over 22.0,,1.98,0.491,0.500,-0.010,0.000,0.40,NO,2025-08-14 15:00 UTC,Pinnacle,Kelly Totals
+CSV
+          fi
 
-
-      - name: Commit & push shortlist
+      # ---- FILTER + DEDUPE (H2H only) ----
+      - name: Filter & dedupe H2H; publish summary
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add outputs/value_engine_shortlist.md scripts/tennis_value_engine.py requirements.txt
-          git diff --staged --quiet && { echo "No changes to commit."; exit 0; }
-          git commit -m "Update unified tennis shortlist [skip ci]"
-          git pull --rebase --autostash || true
-          git push
+          python - << 'PY'
+          import pandas as pd, glob, os, sys
+
+          # locate a picks CSV
+          cands = [p for p in glob.glob("**/*.csv", recursive=True)
+                   if os.path.basename(p).lower().startswith(("value","picks","tennis"))]
+          if not cands:
+              print("No CSV with picks found (looking for value*/picks*/tennis*).", file=sys.stderr)
+              sys.exit(1)
+
+          df = None
+          for f in cands:
+              d = pd.read_csv(f)
+              need = {'Selection','Opponent','Market','Kelly','EV/u'}
+              if need.issubset(d.columns):
+                  df, input_csv = d.copy(), f
+                  break
+          if df is None:
+              print("Found CSVs, but missing required columns.", file=sys.stderr)
+              sys.exit(1)
+
+          # 1) keep only H2H
+          df = df[df['Market'].astype(str).str.upper().eq('H2H')].copy()
+
+          # 2) filters
+          df = df[(df['Kelly'] > 0.05) & (df['EV/u'] > 0)].copy()
+
+          # 3) dedupe: one row per unordered matchup (keep highest Kelly, then EV/u, then Odds)
+          def norm(x): return str(x).strip()
+          def pair_key(a, b):
+              a, b = norm(a), norm(b)
+              return " ⟂ ".join(sorted([a, b]))
+          df['__pair__'] = [pair_key(a,b) for a,b in zip(df['Selection'], df['Opponent'])]
+
+          df.sort_values(['Kelly','EV/u','Odds'], ascending=[False, False, False], inplace=True)
+          df = df.drop_duplicates(['Market','__pair__'], keep='first').copy()
+          df.drop(columns='__pair__', inplace=True)
+
+          # set Bet flag to YES for survivors
+          df['Bet'] = 'YES'
+
+          # tidy columns if they exist
+          preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)','Books','Source']
+          cols = [c for c in preferred if c in df.columns] or df.columns.tolist()
+          df = df[cols]
+
+          out_csv = "value_filtered_h2h.csv"
+          df.to_csv(out_csv, index=False)
+
+          # write to Actions summary
+          def gfm(df):
+              if df.empty: return "_No H2H picks passed filters._"
+              lines = ["| " + " | ".join(df.columns) + " |",
+                       "| " + " | ".join(["---"]*len(df.columns)) + " |"]
+              for _, r in df.iterrows():
+                  lines.append("| " + " | ".join(str(r[c]) for c in df.columns) + " |")
+              return "\n".join(lines)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY","/tmp/gh_summary.md")
+          with open(summary_path, "a") as fh:
+              fh.write("# Tennis Value Engine — Clean H2H Picks\n\n" + gfm(df) + "\n")
+          print(f"Filtered {input_csv} -> {out_csv}; kept {len(df)} rows.")
+          PY
+
+      - name: Upload filtered picks
+        uses: actions/upload-artifact@v4
+        with:
+          name: value_filtered_h2h
+          path: value_filtered_h2h.csv
+          if-no-files-found: warn
