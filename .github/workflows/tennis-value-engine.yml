@@ -3,7 +3,7 @@ name: Tennis Value Engine (Clean H2H)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "5 6 * * *"   # 06:05 UTC daily
+    - cron: "5 6 * * *"
 
 permissions:
   contents: read
@@ -35,40 +35,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas
 
-      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      # REPLACE THIS with your real command that produces a CSV.
-      # It must output at least these columns (case/spacing tolerant):
-      # Selection, Opponent, Market, Kelly, EV/u, (optional Odds, p_model, p_fair, etc.)
-      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      # >>> Replace the command below with YOUR script that creates a CSV (e.g., value.csv)
       - name: Run model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           set -euo pipefail
-          # Example placeholder. Replace with your real command.
+          # EXAMPLE (replace with your real command):
           # python tennis_value_engine.py --out value.csv
-          if [ ! -f value.csv ]; then
-            echo "WARNING: value.csv not found — creating a small demo file."
-            cat > value.csv <<'CSV'
-Tour,Market,Selection,Opponent,Odds,p_model,p_fair,EV/u,Kelly,Conf,Bet,Start (UTC),Books,Source
-ATP,H2H,Jiri Lehecka,Ben Shelton,2.40,0.459,0.419,0.102,0.080,1.00,YES,2025-08-14 18:00 UTC,Betfair,Elo
-ATP,H2H,Ben Shelton,Jiri Lehecka,1.73,0.581,0.581,0.004,0.005,1.00,NO,2025-08-14 18:00 UTC,Betfair,Elo
-WTA,H2H,Magda Linette,Veronika Kudermetova,2.52,0.651,0.408,0.641,0.300,1.00,YES,2025-08-14 15:00 UTC,Matchbook,Elo
-WTA,Totals,Over 22.0,,1.98,0.491,0.500,-0.010,0.000,0.40,NO,2025-08-14 15:00 UTC,Pinnacle,Kelly Totals
-CSV
-          fi
+          test -f value.csv || { echo "ERROR: value.csv not found. Your model step must create it."; exit 1; }
 
       - name: Filter & dedupe H2H; publish summary
         run: |
           python - <<'PY'
           import pandas as pd, glob, os, sys, re
 
-          # ---------- Helpers ----------
           def normalize_col(s: str) -> str:
-              # lower, remove spaces and punctuation
               return re.sub(r'[^a-z0-9]', '', str(s).lower())
 
-          # Map messy column names to canonical ones
           def remap_columns(df):
               want = {
                   'selection': ['selection','player','pick'],
@@ -87,104 +71,86 @@ CSV
                       if a in norm_map:
                           out[canon] = norm_map[a]
                           break
-              # minimal required
               required = ['selection','opponent','market','kelly','ev/u']
               missing = [r for r in required if r not in out]
               if missing:
-                  raise SystemExit(f"Missing required columns after remap: {missing} (got: {list(df.columns)})")
+                  raise SystemExit(f"Missing required columns: {missing}")
               return out
 
-          def to_num(df, col):
-              df[col] = pd.to_numeric(df[col], errors='coerce')
-
-          # ---------- Locate CSV ----------
+          # find a CSV produced by your model
           cands = [p for p in glob.glob("**/*.csv", recursive=True)
                    if os.path.basename(p).lower().startswith(("value","picks","tennis"))]
           if not cands:
-              print("No CSV with picks found (looking for value*/picks*/tennis*).", file=sys.stderr)
-              sys.exit(1)
+              print("No CSV found (looking for value*/picks*/tennis*).", file=sys.stderr); sys.exit(1)
 
           df = None
           for f in cands:
               try:
                   d = pd.read_csv(f)
-              except Exception:
-                  continue
-              try:
                   cols = remap_columns(d)
                   df, input_csv = d.copy(), f
                   break
-              except SystemExit:
+              except Exception:
                   continue
-
           if df is None:
-              print("Found CSVs, but none had the required columns.", file=sys.stderr)
-              sys.exit(1)
+              print("CSV found but missing required columns.", file=sys.stderr); sys.exit(1)
 
-          cols = remap_columns(df)
-
-          # ---------- Clean types ----------
+          # coerce numeric
           for c in [cols['kelly'], cols['ev/u']]:
-              to_num(df, c)
+              df[c] = pd.to_numeric(df[c], errors='coerce')
           if 'odds' in cols:
-              to_num(df, cols['odds'])
+              df[cols['odds']] = pd.to_numeric(df[cols['odds']], errors='coerce')
 
-          # ---------- 1) Keep H2H only ----------
+          # 1) H2H only
           df = df[df[cols['market']].astype(str).str.upper().eq('H2H')].copy()
-
-          # ---------- 2) Filters ----------
+          # 2) filters
           df = df[(df[cols['kelly']] > 0.05) & (df[cols['ev/u']] > 0)].copy()
 
-          # ---------- 3) Dedupe by unordered matchup (keep highest Kelly, then EV/u, then Odds) ----------
-          def norm_name(x): return str(x).strip()
-          def pair_key(a, b):
-              a, b = norm_name(a), norm_name(b)
-              return " ⟂ ".join(sorted([a, b]))
+          # 3) dedupe by unordered pair (keep highest Kelly, then EV/u, then Odds)
+          def pair_key(a,b):
+              a, b = str(a).strip(), str(b).strip()
+              return " | ".join(sorted([a,b]))
           df['__pair__'] = [pair_key(a,b) for a,b in zip(df[cols['selection']], df[cols['opponent']])]
 
           sort_keys = [cols['kelly'], cols['ev/u']]
-          ascending = [False, False]
-          if 'odds' in cols:
-              sort_keys.append(cols['odds'])
-              ascending.append(False)
-          df.sort_values(sort_keys, ascending=ascending, inplace=True)
+          asc = [False, False]
+          if 'odds' in cols: sort_keys.append(cols['odds']); asc.append(False)
+          df.sort_values(sort_keys, ascending=asc, inplace=True)
           df = df.drop_duplicates(['__pair__'], keep='first').copy()
           df.drop(columns='__pair__', inplace=True)
 
-          # ---------- Final formatting ----------
           df['Bet'] = 'YES'
-          preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)','Books','Source']
-          # Ensure canonical names exist for pretty ordering
-          rename_back = {cols.get('market','Market'): 'Market',
-                         cols.get('selection','Selection'): 'Selection',
-                         cols.get('opponent','Opponent'): 'Opponent',
-                         cols.get('kelly','Kelly'): 'Kelly',
-                         cols.get('ev/u','EV/u'): 'EV/u'}
-          if 'odds' in cols:   rename_back[cols['odds']] = 'Odds'
-          if 'p_model' in cols: rename_back[cols['p_model']] = 'p_model'
-          if 'p_fair' in cols:  rename_back[cols['p_fair']]  = 'p_fair'
-          df = df.rename(columns=rename_back)
 
+          rename = {
+            cols['market']: 'Market',
+            cols['selection']: 'Selection',
+            cols['opponent']: 'Opponent',
+            cols['kelly']: 'Kelly',
+            cols['ev/u']: 'EV/u'
+          }
+          if 'odds' in cols:    rename[cols['odds']] = 'Odds'
+          if 'p_model' in cols: rename[cols['p_model']] = 'p_model'
+          if 'p_fair' in cols:  rename[cols['p_fair']]  = 'p_fair'
+          df = df.rename(columns=rename)
+
+          preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)','Books','Source']
           cols_out = [c for c in preferred if c in df.columns] or df.columns.tolist()
           df = df[cols_out]
 
           out_csv = "value_filtered_h2h.csv"
           df.to_csv(out_csv, index=False)
 
-          # ---------- Summary table ----------
-          def gfm(df):
-              if df.empty: return "_No H2H picks passed filters._"
-              lines = ["| " + " | ".join(df.columns) + " |",
-                       "| " + " | ".join(["---"]*len(df.columns)) + " |"]
-              for _, r in df.iterrows():
-                  lines.append("| " + " | ".join(str(r[c]) for c in df.columns) + " |")
+          def gfm(t):
+              if t.empty: return "_No H2H picks passed filters._"
+              lines = ["| " + " | ".join(t.columns) + " |",
+                       "| " + " | ".join(["---"]*len(t.columns)) + " |"]
+              for _, r in t.iterrows():
+                  lines.append("| " + " | ".join(str(r[c]) for c in t.columns) + " |")
               return "\n".join(lines)
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY","/tmp/gh_summary.md")
-          with open(summary_path, "a") as fh:
+          with open(os.environ.get("GITHUB_STEP_SUMMARY","/tmp/gh_summary.md"), "a") as fh:
               fh.write("# Tennis Value Engine — Clean H2H Picks\n\n" + gfm(df) + "\n")
 
-          print(f"Filtered {input_csv} -> {out_csv}; kept {len(df)} rows.")
+          print(f"Kept {len(df)} rows -> value_filtered_h2h.csv")
           PY
 
       - name: Upload filtered picks
