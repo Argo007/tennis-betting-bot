@@ -3,7 +3,7 @@ name: Tennis Value Engine (Clean H2H)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "5 6 * * *"   # change to taste
+    - cron: "5 6 * * *"   # adjust to taste
 
 permissions:
   contents: read
@@ -35,40 +35,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests pytz
 
-      # --------- RUN YOUR MODEL (must create a CSV) ----------
-      # This tries a few common entrypoints. If you use a different one,
-      # replace this block with your real command that WRITES a CSV.
-      - name: Run model (produce CSV)
+      # 1) Run YOUR model — it writes outputs/value_engine_shortlist.md (Markdown), not a CSV.
+      - name: Run model (produces Markdown shortlist)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          LOOKAHEAD_HOURS: "24"
+          REGIONS: "eu,uk,us,au"
+          MARKETS: "h2h,spreads,totals"
+          SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
+          KELLY_MIN: "0.05"
+          EV_MIN: "0.00"
+          MIN_CONF: "0.40"
+          OUT_DIR: "outputs"
+          SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
           set -euo pipefail
-
-          # Choose an output filename we will all agree on
-          OUT="Tennis Value Engine Unified.csv"
-
-          # Try common producer scripts; replace with YOUR real command if needed
-          if [ -f tennis_value_engine_unified.py ]; then
-            python tennis_value_engine_unified.py --out "$OUT"
-          elif [ -f tennis_value_engine.py ]; then
-            python tennis_value_engine.py --out "$OUT"
-          elif [ -f tennis_value_picks_pro.py ]; then
-            # fallback: different script you used earlier
-            python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out "$OUT"
-          else
-            echo "No known producer script found. If your repo uses a different entrypoint,"
-            echo "replace this step with your actual command that writes a CSV."
-          fi
-
-          # Sanity: if nothing wrote our OUT file but some CSVs exist, keep going; else hard fail
-          if [ ! -f "$OUT" ]; then
-            if ls -1 **/*.csv 1>/dev/null 2>&1; then
-              echo "WARNING: '$OUT' not found, but other CSV(s) exist. The filter step will search for them."
-            else
-              echo "ERROR: No CSVs found. Your model step must write at least one CSV."
-              exit 1
-            fi
-          fi
+          python tennis_value_engine.py
+          test -f outputs/value_engine_shortlist.md || { echo "Shortlist MD not found."; exit 1; }
 
       - name: List workspace (debug)
         run: |
@@ -76,7 +59,47 @@ jobs:
           find . -maxdepth 3 -type f | sed 's|^\./||' | sort
           echo "==============================="
 
-      # --------- FILTER + DEDUPE ----------
+      # 2) Convert the Markdown table -> CSV (Tennis Value Engine Unified.csv)
+      - name: Convert shortlist MD to CSV
+        run: |
+          python - <<'PY'
+          import pandas as pd, re, os, sys
+          md_path = "outputs/value_engine_shortlist.md"
+          if not os.path.exists(md_path):
+              print("ERROR: Markdown shortlist not found:", md_path, file=sys.stderr); sys.exit(1)
+          lines = [l.rstrip("\n") for l in open(md_path, encoding="utf-8")]
+          # find header row
+          start = None
+          for i,l in enumerate(lines):
+              if l.strip().startswith("| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) | Books | Source |"):
+                  start = i; break
+          if start is None:
+              print("ERROR: Could not find table header in shortlist.", file=sys.stderr); sys.exit(1)
+          header = [c.strip() for c in lines[start].strip().strip("|").split("|")]
+          data = []
+          i = start + 2  # skip the separator row like |---|---|...
+          while i < len(lines):
+              l = lines[i].strip()
+              if not l or not l.startswith("|"): break
+              if l.startswith("|---"):  # safety
+                  i += 1; continue
+              parts = [c.strip() for c in l.strip().strip("|").split("|")]
+              if len(parts) != len(header): break
+              data.append(dict(zip(header, parts)))
+              i += 1
+          if not data:
+              print("WARNING: No rows parsed from shortlist table.")
+          df = pd.DataFrame(data)
+          # coerce numerics where sensible
+          for col in ["Odds","p_model","p_fair","EV/u","Kelly","Conf"]:
+              if col in df.columns:
+                  df[col] = pd.to_numeric(df[col].replace({"": None}), errors="coerce")
+          out_csv = "Tennis Value Engine Unified.csv"
+          df.to_csv(out_csv, index=False)
+          print("Wrote", out_csv, "rows:", len(df))
+          PY
+
+      # 3) Filter H2H + Kelly/EV, dedupe per matchup, publish summary
       - name: Filter & dedupe H2H; publish summary
         run: |
           python - <<'PY'
@@ -84,101 +107,61 @@ jobs:
 
           def norm(s): return re.sub(r'[^a-z0-9]', '', str(s).lower())
 
-          # Find CSVs
+          # find CSVs (prefer our unified CSV)
           csvs = glob.glob("**/*.csv", recursive=True)
           if not csvs:
-            print("ERROR: No CSV files found after model run.", file=sys.stderr)
-            sys.exit(1)
-
-          # Prefer a file named like "Tennis Value Engine Unified*.csv"
-          def score(path):
-            base = norm(os.path.basename(path))
-            prefer = all(k in base for k in ["tennis","value","engine","unified"])
-            # prefer our unified name, then larger file (likely the main table)
-            return (prefer, os.path.getsize(path))
-
+            print("ERROR: No CSV files found.", file=sys.stderr); sys.exit(1)
+          def score(p):
+            b = norm(os.path.basename(p))
+            prefer = all(k in b for k in ["tennis","value","engine","unified"])
+            return (prefer, os.path.getsize(p))
           csvs.sort(key=score, reverse=True)
+          src = csvs[0]
+          df = pd.read_csv(src)
 
-          # Column remapper
-          def remap_columns(df):
-            want = {
-              'selection': ['selection','player','pick'],
-              'opponent':  ['opponent','opp'],
-              'market':    ['market','mkt'],
-              'kelly':     ['kelly','kellyfraction','k'],
-              'ev/u':      ['ev/u','evu','evperu','ev','edge'],
-              'odds':      ['odds','price','decimalodds'],
-              'p_model':   ['p_model','pmodel','prob','prob_model'],
-              'p_fair':    ['pfair','p_fair','prob_fair','fairprob'],
-            }
-            nm = {norm(c): c for c in df.columns}
-            out = {}
-            for canon, aliases in want.items():
-              for a in aliases:
-                if a in nm:
-                  out[canon] = nm[a]; break
-            for r in ['selection','opponent','market','kelly','ev/u']:
-              if r not in out:
-                raise KeyError(f"Missing required column: {r}")
-            return out
+          # tolerant map
+          def col(df, *names):
+            for n in names:
+              if n in df.columns: return n
+            # case-insensitive
+            lower = {c.lower(): c for c in df.columns}
+            for n in names:
+              if n.lower() in lower: return lower[n.lower()]
+            raise KeyError(f"Missing column: {names}")
+          c_market   = col(df, "Market","market")
+          c_sel      = col(df, "Selection","selection")
+          c_opp      = col(df, "Opponent","opponent")
+          c_kelly    = col(df, "Kelly","kelly")
+          c_evu      = col(df, "EV/u","evu","EVU","EV")
+          c_odds     = df.columns[df.columns.str.lower().eq("odds")][0] if any(df.columns.str.lower().eq("odds")) else None
 
-          df, src, cols = None, None, None
-          for f in csvs:
-            try:
-              d = pd.read_csv(f)
-            except Exception:
-              continue
-            try:
-              cols = remap_columns(d)
-              df, src = d.copy(), f
-              break
-            except Exception:
-              continue
-
-          if df is None:
-            print("ERROR: CSVs found, but none had required columns.", file=sys.stderr)
-            sys.exit(1)
-
-          # Coerce numerics
-          for c in [cols['kelly'], cols['ev/u']]:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-          if 'odds' in cols:
-            df[cols['odds']] = pd.to_numeric(df[cols['odds']], errors='coerce')
+          # numeric coercion
+          df[c_kelly] = pd.to_numeric(df[c_kelly], errors="coerce")
+          df[c_evu]   = pd.to_numeric(df[c_evu], errors="coerce")
+          if c_odds: df[c_odds] = pd.to_numeric(df[c_odds], errors="coerce")
 
           # 1) H2H only
-          df = df[df[cols['market']].astype(str).str.upper().eq('H2H')].copy()
-          # 2) Filters
-          df = df[(df[cols['kelly']] > 0.05) & (df[cols['ev/u']] > 0)].copy()
+          df = df[df[c_market].astype(str).str.upper().eq("H2H")].copy()
+          # 2) filters
+          df = df[(df[c_kelly] > 0.05) & (df[c_evu] > 0)].copy()
 
-          # 3) Dedupe by unordered matchup (keep highest Kelly, then EV/u, then Odds)
+          # 3) dedupe by unordered matchup
           def pair_key(a,b):
             a,b = str(a).strip(), str(b).strip()
             return " | ".join(sorted([a,b]))
-          df['__pair__'] = [pair_key(a,b) for a,b in zip(df[cols['selection']], df[cols['opponent']])]
+          df["__pair__"] = [pair_key(a,b) for a,b in zip(df[c_sel], df[c_opp])]
 
-          sort_cols, asc = [cols['kelly'], cols['ev/u']], [False, False]
-          if 'odds' in cols: sort_cols.append(cols['odds']); asc.append(False)
+          sort_cols, asc = [c_kelly, c_evu], [False, False]
+          if c_odds: sort_cols.append(c_odds); asc.append(False)
           df.sort_values(sort_cols, ascending=asc, inplace=True)
-          df = df.drop_duplicates(['__pair__'], keep='first').copy()
-          df.drop(columns='__pair__', inplace=True)
+          df = df.drop_duplicates(["__pair__"], keep="first").copy()
+          df.drop(columns="__pair__", inplace=True)
 
-          # Finalize & output
-          df['Bet'] = 'YES'
-          rename = {
-            cols['market']:'Market',
-            cols['selection']:'Selection',
-            cols['opponent']:'Opponent',
-            cols['kelly']:'Kelly',
-            cols['ev/u']:'EV/u'
-          }
-          if 'odds' in cols:    rename[cols['odds']] = 'Odds'
-          if 'p_model' in cols: rename[cols['p_model']] = 'p_model'
-          if 'p_fair' in cols:  rename[cols['p_fair']]  = 'p_fair'
-          df = df.rename(columns=rename)
-
+          # finalize columns & flag
+          df["Bet"] = "YES"
           preferred = ['Tour','Market','Selection','Opponent','Odds','p_model','p_fair','EV/u','Kelly','Conf','Bet','Start (UTC)','Books','Source']
-          order = [c for c in preferred if c in df.columns] or df.columns.tolist()
-          df = df[order]
+          cols_out = [c for c in preferred if c in df.columns] or df.columns.tolist()
+          df = df[cols_out]
 
           out_csv = "value_filtered_h2h.csv"
           df.to_csv(out_csv, index=False)
@@ -193,8 +176,7 @@ jobs:
 
           with open(os.environ.get("GITHUB_STEP_SUMMARY","/tmp/gh_summary.md"), "a") as fh:
             fh.write(f"# Clean H2H Picks (source: {src})\n\n" + gfm(df) + "\n")
-
-          print(f"Source: {src}  ->  value_filtered_h2h.csv  (rows kept: {len(df)})")
+          print(f"Source: {src} -> value_filtered_h2h.csv (rows kept: {len(df)})")
           PY
 
       - name: Upload filtered picks
