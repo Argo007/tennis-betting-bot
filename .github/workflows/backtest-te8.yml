@@ -95,11 +95,17 @@ jobs:
           print("Elo files ready at data/atp_elo.csv and data/wta_elo.csv")
           PY
 
-      # --- tennis-data: CSV or XLSX, multiple naming patterns ---
-      - name: Download historical closing odds (tennis-data.co.uk)
+      # --- Robust tennis-data fetch; skip if your CSV already exists ---
+      - name: Download historical closing odds (tennis-data.co.uk) — or skip if CSV provided
         run: |
           set -e
+          if [ -f data/historical_matches.csv ]; then
+            echo "Found data/historical_matches.csv in repo -> skipping download & build."
+            exit 0
+          fi
+
           mkdir -p tennisdata
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
           for Y in ${{ inputs.years_csv }}; do
             for URL in \
               "https://www.tennis-data.co.uk/${Y}/ATP_${Y}.csv" \
@@ -111,93 +117,105 @@ jobs:
             do
               FN="tennisdata/$(basename "$URL")"
               echo "Trying $URL"
-              if curl -sS -L -f "$URL" -o "$FN"; then
-                echo "Saved -> $FN"
-              fi
+              curl -A "$UA" -sS -L --retry 3 --retry-delay 5 -f "$URL" -o "$FN" && echo "Saved -> $FN" || true
             done
           done
           echo "Downloaded files:"
           ls -l tennisdata || true
 
-      # --- Build the unified historical_matches.csv for the backtester ---
-      - name: Build historical_matches.csv
+          COUNT=$(ls tennisdata 2>/dev/null | wc -l || echo 0)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error ::Could not download tennis-data files. Either the site blocked the runner or filenames changed."
+            echo "Options:"
+            echo "  1) Commit your own CSV as data/historical_matches.csv and re-run."
+            echo "  2) Adjust years in the workflow input."
+            exit 1
+          fi
+
+      - name: Build historical_matches.csv (from tennis-data) — or skip if CSV provided
         run: |
+          set -e
+          if [ -f data/historical_matches.csv ]; then
+            echo "Found data/historical_matches.csv -> skipping build."
+            exit 0
+          fi
+
           python - <<'PY'
           import os, glob, pandas as pd, numpy as np
           os.makedirs("data", exist_ok=True)
 
           def load_any(path):
-            try:
-              if path.lower().endswith(('.xlsx','.xls')):
-                return pd.read_excel(path)
-              return pd.read_csv(path)
-            except Exception:
               try:
-                return pd.read_csv(path, encoding="latin1")
+                  if path.lower().endswith(('.xlsx','.xls')):
+                      return pd.read_excel(path)
+                  return pd.read_csv(path)
               except Exception:
-                return None
+                  try:
+                      return pd.read_csv(path, encoding="latin1")
+                  except Exception:
+                      return None
 
           frames=[]
           for path in glob.glob("tennisdata/*.*"):
-            if not path.lower().endswith(('.csv','.xlsx','.xls')): 
-              continue
-            df = load_any(path)
-            if df is None or df.empty:
-              continue
+              if not path.lower().endswith(('.csv','.xlsx','.xls')): 
+                  continue
+              df = load_any(path)
+              if df is None or df.empty:
+                  continue
 
-            cols = {c.lower(): c for c in df.columns}
-            if "date" not in cols or ("winner" not in cols and "w" not in cols):
-              continue
+              cols = {c.lower(): c for c in df.columns}
+              if "date" not in cols or ("winner" not in cols and "w" not in cols):
+                  continue
 
-            cDate = cols.get("date")
-            cWin  = cols.get("winner", cols.get("w"))
-            cLos  = cols.get("loser",  cols.get("l"))
-            cPSW  = cols.get("psw")
-            cPSL  = cols.get("psl")
-            cAvgW = cols.get("avgw")
-            cAvgL = cols.get("avgl")
-            cSurf = cols.get("surface") if "surface" in cols else None
+              cDate = cols.get("date")
+              cWin  = cols.get("winner", cols.get("w"))
+              cLos  = cols.get("loser",  cols.get("l"))
+              cPSW  = cols.get("psw")
+              cPSL  = cols.get("psl")
+              cAvgW = cols.get("avgw")
+              cAvgL = cols.get("avgl")
+              cSurf = cols.get("surface") if "surface" in cols else None
 
-            d = pd.DataFrame({
-                "date": pd.to_datetime(df[cDate], errors="coerce"),
-                "winner": df[cWin].astype(str),
-                "loser":  df[cLos].astype(str),
-                "odds_w": pd.to_numeric(df[cPSW] if cPSW in df else df.get(cAvgW, np.nan), errors="coerce"),
-                "odds_l": pd.to_numeric(df[cPSL] if cPSL in df else df.get(cAvgL, np.nan), errors="coerce"),
-                "surface": df[cSurf].astype(str) if cSurf else ""
-            }).dropna(subset=["date"])
+              d = pd.DataFrame({
+                  "date": pd.to_datetime(df[cDate], errors="coerce"),
+                  "winner": df[cWin].astype(str),
+                  "loser":  df[cLos].astype(str),
+                  "odds_w": pd.to_numeric(df[cPSW] if cPSW in df else df.get(cAvgW, np.nan), errors="coerce"),
+                  "odds_l": pd.to_numeric(df[cPSL] if cPSL in df else df.get(cAvgL, np.nan), errors="coerce"),
+                  "surface": df[cSurf].astype(str) if cSurf else ""
+              }).dropna(subset=["date"])
 
-            # fallback to averages if needed
-            if d["odds_w"].isna().all() and cAvgW in df: d["odds_w"]=pd.to_numeric(df[cAvgW], errors="coerce")
-            if d["odds_l"].isna().all() and cAvgL in df: d["odds_l"]=pd.to_numeric(df[cAvgL], errors="coerce")
-            d = d.dropna(subset=["odds_w","odds_l"])
+              # fallback to averages if Pinnacle missing
+              if d["odds_w"].isna().all() and cAvgW in df: d["odds_w"]=pd.to_numeric(df[cAvgW], errors="coerce")
+              if d["odds_l"].isna().all() and cAvgL in df: d["odds_l"]=pd.to_numeric(df[cAvgL], errors="coerce")
+              d = d.dropna(subset=["odds_w","odds_l"])
 
-            tour = "ATP" if "ATP" in os.path.basename(path).upper() else ("WTA" if "WTA" in os.path.basename(path).upper() else "")
-            if not tour: tour = "ATP"  # harmless default
+              base = os.path.basename(path).upper()
+              tour = "ATP" if "ATP" in base else ("WTA" if "WTA" in base else "ATP")
 
-            a = pd.DataFrame({
-                "date": d["date"].dt.strftime("%Y-%m-%d"),
-                "tour": tour,
-                "player": d["winner"],
-                "opponent": d["loser"],
-                "best_odds": d["odds_w"],
-                "result": 1,
-                "surface": d["surface"]
-            })
-            b = pd.DataFrame({
-                "date": d["date"].dt.strftime("%Y-%m-%d"),
-                "tour": tour,
-                "player": d["loser"],
-                "opponent": d["winner"],
-                "best_odds": d["odds_l"],
-                "result": 0,
-                "surface": d["surface"]
-            })
-            frames += [a,b]
+              a = pd.DataFrame({
+                  "date": d["date"].dt.strftime("%Y-%m-%d"),
+                  "tour": tour,
+                  "player": d["winner"],
+                  "opponent": d["loser"],
+                  "best_odds": d["odds_w"],
+                  "result": 1,
+                  "surface": d["surface"]
+              })
+              b = pd.DataFrame({
+                  "date": d["date"].dt.strftime("%Y-%m-%d"),
+                  "tour": tour,
+                  "player": d["loser"],
+                  "opponent": d["winner"],
+                  "best_odds": d["odds_l"],
+                  "result": 0,
+                  "surface": d["surface"]
+              })
+              frames += [a,b]
 
           if not frames:
-            print("No tennis-data files parsed.")
-            raise SystemExit(1)
+              print("No tennis-data files parsed.")
+              raise SystemExit(1)
 
           out = pd.concat(frames, ignore_index=True)
           out = out.dropna(subset=["best_odds"])
@@ -217,7 +235,7 @@ jobs:
                 "start_date": "2023-05-15",
                 "end_date": "2023-06-02",
                 "impact": 0.70,
-                "note": "Example stub — adjust/remove as needed"
+                "note": "Example stub — adjust as needed"
               }
             ]
             JSON
@@ -234,7 +252,7 @@ jobs:
           DOG_BAND=$(echo "$BANDS" | sed -n 's/.*dog=\([^;]*\).*/\1/p'); [ -z "$DOG_BAND" ] && DOG_BAND="2.20,4.50"
           FAV_BAND=$(echo "$BANDS" | sed -n 's/.*fav=\([^;]*\).*/\1/p'); [ -z "$FAV_BAND" ] && FAV_BAND="1.15,2.00"
 
-          # Parse tuners: surface_boost=...;recent_form_weight=...;injury_penalty=...
+          # Parse tuners
           TUNE="${{ inputs.tuners }}"
           SURF_BOOST=$(echo "$TUNE" | sed -n 's/.*surface_boost=\([^;]*\).*/\1/p'); [ -z "$SURF_BOOST" ] && SURF_BOOST="0.05"
           FORM_W=$(echo "$TUNE" | sed -n 's/.*recent_form_weight=\([^;]*\).*/\1/p'); [ -z "$FORM_W" ] && FORM_W="0.30"
