@@ -2,391 +2,289 @@
 # -*- coding: utf-8 -*-
 
 """
-Tennis Value Engine — H2H only (concise, deduped)
-- Only H2H markets; Totals/Spreads removed.
-- Uses Elo (ATP/WTA, 2023–2025) + per-player match counts to weight confidence.
-- Confidence: Elo rows conf = min(1, min(matchesA, matchesB)/30); market-only rows: 0.6 if sharp price else 0.3
-- Score = EV * Kelly * Confidence
-- YES if Kelly >= KELLY_MIN and EV >= EV_MIN and Confidence >= MIN_CONF
-- Auto-discovers active tennis_* keys if generic keys return nothing
-- Output: ONE Markdown table (no books/source), + diagnostics text
-- No writing to GITHUB_STEP_SUMMARY (workflow will render the file)
+TrueEdge8 + Kelly Pro Engine
+- Adjustable lookahead (hours) via CLI: --lookahead-h 24
+- Uses your Elo CSVs: data/atp_elo.csv, data/wta_elo.csv
+- Reads matches from: value_picks_pro.csv
+- Excludes live/in-progress; shows only upcoming within window
+- Kelly stake sizing with micro-cap for underdogs (<= 0.25 × Kelly)
+- TrueEdge8 scoring (7 practical factors; no CLV fetch for speed)
+- Clean, color-coded summary to GitHub Step Summary (or summary.md locally)
+- Optional diagnostics: --diagnostics
 """
 
-import os, io, unicodedata, requests, pandas as pd
-from pathlib import Path
+import os
+import json
+import math
+import argparse
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+import pandas as pd
 
-# ---------------- ENV ----------------
-API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-if not API_KEY:
-    raise SystemExit("ODDS_API_KEY not set")
+# --------------------------- CLI ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="TrueEdge8 + Kelly Pro Engine")
+    p.add_argument("--lookahead-h", type=int, default=24, help="Hours ahead to include (default 24)")
+    p.add_argument("--min-conf", type=int, default=50, help="Minimum confidence filter (default 50)")
+    p.add_argument("--bankroll", type=float, default=0.0, help="Optional bankroll € to display stake size (0 = hide)")
+    p.add_argument("--diagnostics", action="store_true", help="Show diagnostics section")
+    return p.parse_args()
 
-LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "48"))
-REGIONS         = os.getenv("REGIONS", "eu,uk,us,au").replace(" ", "")
-MARKETS         = os.getenv("MARKETS", "h2h").replace(" ", "")  # force H2H
-SPORT_KEYS      = [s.strip() for s in os.getenv("SPORT_KEYS", "tennis,tennis_atp,tennis_wta").split(",") if s.strip()]
+# ----------------------- Config Defaults -------------------
+ODDS_DOG_MIN, ODDS_DOG_MAX = 1.90, 6.00
+ODDS_FAV_MIN, ODDS_FAV_MAX = 1.15, 2.00
+TE8_THRESHOLD_DOG, TE8_THRESHOLD_FAV = 0.60, 0.50
+UNDERDOG_KELLY_CAP = 0.25  # stake = min(Kelly, 0.25*Kelly) -> effectively 0.25×K
+BUF_MINUTES = 5            # ignore <5m (treat as live-ish)
 
-KELLY_MIN = float(os.getenv("KELLY_MIN", "0.05"))
-EV_MIN    = float(os.getenv("EV_MIN", "0.00"))
-MIN_CONF  = float(os.getenv("MIN_CONF", "0.40"))
-TOP_ROWS  = int(os.getenv("TOP_ROWS", "25"))
+# ---------------------- Data Loading -----------------------
+def load_csv_safely(path, required_cols=None):
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if required_cols:
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise RuntimeError(f"{path} missing required columns: {missing}")
+    return df
 
-DEFAULT_SHARP = "Pinnacle, Pinnacle Sports, bet365, Bet365, Unibet, Marathonbet, William Hill, Betfair Sportsbook, 888sport, 10Bet"
-SHARP_BOOKS   = [b.strip().lower() for b in os.getenv("SHARP_BOOKS", DEFAULT_SHARP).split(",") if b.strip()]
-
-OUT_DIR        = Path(os.getenv("OUT_DIR", "outputs"))
-SHORTLIST_FILE = os.getenv("SHORTLIST_FILE", "value_engine_shortlist.md")
-LOCAL_TZ       = ZoneInfo(os.getenv("TZ", "Europe/Amsterdam"))
-
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ---------------- Elo ----------------
-START_ELO, K = 1500, 32
-def _exp(a,b): return 1/(1+10**((b-a)/400))
-def _upd(a,b,s): return a + K*(s-_exp(a,b))
-
-SACK_ATP = [
- "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv",
- "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv",
- "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv",
-]
-SACK_WTA = [
- "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv",
- "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv",
- "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2025.csv",
-]
-
-def dl_csv(url):
+def get_injuries():
     try:
-        r = requests.get(url, timeout=30)
-        if r.status_code==200 and r.text.strip():
-            return pd.read_csv(io.StringIO(r.text))
-    except requests.RequestException:
-        pass
-    return None
+        with open("injuries.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
 
-def build_elo_and_counts(urls):
-    frames=[]
-    for u in urls:
-        df = dl_csv(u)
-        if df is not None: frames.append(df)
-    if not frames:
-        return pd.DataFrame(columns=["player","elo"]), pd.DataFrame(columns=["player","matches"])
-    df = pd.concat(frames, ignore_index=True)
-    E={}; C={}
-    for _,r in df.iterrows():
-        w,l = r.get("winner_name"), r.get("loser_name")
-        if pd.isna(w) or pd.isna(l): continue
-        ew, el = E.get(w,START_ELO), E.get(l,START_ELO)
-        E[w] = _upd(ew,el,1); E[l] = _upd(el,ew,0)
-        C[w] = C.get(w,0)+1; C[l] = C.get(l,0)+1
-    elo_df = pd.DataFrame([{"player":k,"elo":v} for k,v in E.items()])
-    cnt_df = pd.DataFrame([{"player":k,"matches":v} for k,v in C.items()])
-    return elo_df, cnt_df
+# ---------------------- Elo Probability --------------------
+def get_elo_rating(elo_df: pd.DataFrame, player: str) -> float:
+    if elo_df.empty:
+        return 1500.0
+    row = elo_df.loc[elo_df["player"] == str(player)]
+    return float(row["elo"].iloc[0]) if not row.empty else 1500.0
 
-def ensure_elo():
-    Path("data").mkdir(exist_ok=True)
-    if not Path("data/atp_elo.csv").exists() or not Path("data/atp_matches.csv").exists():
-        elo, cnt = build_elo_and_counts(SACK_ATP)
-        if not elo.empty:
-            elo.sort_values("elo", ascending=False).to_csv("data/atp_elo.csv", index=False)
-            cnt.to_csv("data/atp_matches.csv", index=False)
-    if not Path("data/wta_elo.csv").exists() or not Path("data/wta_matches.csv").exists():
-        elo, cnt = build_elo_and_counts(SACK_WTA)
-        if not elo.empty:
-            elo.sort_values("elo", ascending=False).to_csv("data/wta_elo.csv", index=False)
-            cnt.to_csv("data/wta_matches.csv", index=False)
+def elo_win_prob(elo_df: pd.DataFrame, p1: str, p2: str) -> float:
+    e1 = get_elo_rating(elo_df, p1)
+    e2 = get_elo_rating(elo_df, p2)
+    # p = 1 / (1 + 10^((e2-e1)/400))
+    return 1.0 / (1.0 + 10.0 ** ((e2 - e1) / 400.0))
 
-def norm_name(s: str) -> str:
-    if not s: return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    keep = set("abcdefghijklmnopqrstuvwxyz -.'")
-    s = "".join(ch for ch in s.lower() if ch in keep)
-    return " ".join(s.split())
+# ----------------------- Kelly Fraction --------------------
+def kelly_fraction(prob: float, odds: float) -> float:
+    # Kelly (decimal odds): K = ((o-1)*p - (1-p)) / (o-1) = (o*p - 1) / (o-1)
+    if not (0.0 <= prob <= 1.0) or odds <= 1.0:
+        return 0.0
+    b = odds - 1.0
+    k = (odds * prob - 1.0) / b
+    return float(max(0.0, min(1.0, k)))
 
-def load_index(path_csv, val_col):
-    df = pd.read_csv(path_csv) if Path(path_csv).exists() else pd.DataFrame(columns=["player",val_col])
-    return {norm_name(r["player"]): float(r[val_col]) for _,r in df.iterrows()}
+# -------------------- TrueEdge8 (7 factors here) -----------
+def trueedge8(row: pd.Series, injuries_map: dict) -> float:
+    """
+    7 pragmatic factors (0..1), averaged:
+      1) Form      -> proxy from confidence column (scaled)
+      2) Surface   -> placeholder (use 0.6/0.7 if surface aligns; we use mild 0.6 default)
+      3) H2H       -> placeholder 0.55 (neutral/slight edge)
+      4) Rest      -> assume decent rest unless very short ETA
+      5) Injury    -> multiplier from injuries.json (1.0 = healthy; <1 reduces)
+      6) Stage     -> mild bump (0.55) — can be tuned by round if provided
+      7) Mental    -> mild bump for home_adv flag
+    We keep conservative ranges so TE8 isn't overly optimistic.
+    """
+    conf = float(row.get("confidence", 0.0))
+    eta_min = float(row.get("eta_min", 180.0))
 
-def p_model(player_a: str, player_b: str, idx_elo: dict):
-    e1 = idx_elo.get(norm_name(player_a))
-    e2 = idx_elo.get(norm_name(player_b))
-    if e1 is None or e2 is None: return None
-    return _exp(e1, e2)
+    # 1) Form via confidence (MIN_CONF..100 -> 0.50..0.80 roughly)
+    form = 0.50 + 0.30 * max(0.0, min(1.0, conf / 100.0))  # 0.50..0.80
 
-def conf_from_matches(pa: str, pb: str, idx_cnt: dict):
-    a = idx_cnt.get(norm_name(pa), 0.0)
-    b = idx_cnt.get(norm_name(pb), 0.0)
-    return min(1.0, min(a,b)/30.0)
+    # 2) Surface (placeholder)
+    surface = 0.60
 
-# ------------- Odds API + diagnostics -------------
-def fetch_odds_with_diag(sport_key: str):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = dict(
-        apiKey=API_KEY, regions=REGIONS, markets=MARKETS,
-        oddsFormat="decimal", dateFormat="iso",
-    )
-    status = None; headers = {}; body_snippet = ""; data = []
+    # 3) H2H (placeholder)
+    h2h = 0.55
+
+    # 4) Rest (if starting very soon, slightly reduce)
+    if eta_min < 90:
+        rest = 0.55
+    elif eta_min < 240:
+        rest = 0.60
+    else:
+        rest = 0.65
+
+    # 5) Injury/news multiplier
+    inj_mult = float(injuries_map.get(str(row.get("player", "")), 1.0))
+    # convert multiplier (0..1) to a factor ~ [0.40..0.75..0.90]
+    injury = 0.40 + 0.50 * inj_mult  # if 1.0 -> 0.90; if 0.0 -> 0.40
+
+    # 6) Tournament stage (unknown -> neutral)
+    stage = 0.55
+
+    # 7) Mental (home advantage flag)
+    mental = 0.60 + (0.10 if bool(row.get("home_adv", False)) else 0.0)
+
+    factors = [form, surface, h2h, rest, injury, stage, mental]
+    return round(sum(factors) / len(factors), 2)
+
+# ---------------------- Formatting Helpers -----------------
+def eta_fmt(minutes: float) -> str:
     try:
-        r = requests.get(url, params=params, timeout=25)
-        status = r.status_code
-        headers = {k.lower(): v for k,v in r.headers.items()}
-        if status == 200:
-            j = r.json()
-            data = j if isinstance(j, list) else []
-        else:
-            txt = r.text or ""
-            body_snippet = (txt[:400] + "...") if len(txt) > 400 else txt
-    except requests.RequestException as e:
-        status = 0; body_snippet = str(e)
-    return data, status, headers, body_snippet
+        m = int(round(minutes))
+        h, mm = divmod(m, 60)
+        return f"{h}h {mm:02d}m" if h else f"{mm}m"
+    except Exception:
+        return "—"
 
-def list_tennis_keys(api_key: str):
+def ts_fmt(ts: pd.Timestamp) -> str:
     try:
-        r = requests.get("https://api.the-odds-api.com/v4/sports", params={"apiKey": api_key}, timeout=30)
-        if r.status_code != 200: return []
-        out = []
-        for s in r.json():
-            key = str(s.get("key",""))
-            if key.startswith("tennis_") and (("atp" in key) or ("wta" in key)) and s.get("active", True):
-                out.append(key)
-        return out
-    except requests.RequestException:
-        return []
+        return ts.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(ts)
 
-def within_window(commence_iso: str) -> bool:
-    if not commence_iso: return False
-    start = datetime.fromisoformat(commence_iso.replace("Z","+00:00"))
+# -------------------------- Main ---------------------------
+def main():
+    args = parse_args()
+    injuries_map = get_injuries()
+
+    # Load Elo
+    atp_elo = load_csv_safely("data/atp_elo.csv", ["player", "elo"])
+    wta_elo = load_csv_safely("data/wta_elo.csv", ["player", "elo"])
+
+    # Load matches from your model output
+    df = load_csv_safely("value_picks_pro.csv")
+    if df.empty:
+        out("_No matches file (value_picks_pro.csv) found._")
+        return
+
+    # Normalize columns
+    for c in ["blended_prob", "best_odds", "confidence"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "confidence" not in df.columns:
+        df["confidence"] = 0
+
+    # Parse commence time (prefer UTC column)
+    if "commence_time_utc" in df.columns:
+        df["commence_dt"] = pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
+    elif "commence_time" in df.columns:
+        df["commence_dt"] = pd.to_datetime(df["commence_time"], utc=True, errors="coerce")
+    else:
+        df["commence_dt"] = pd.NaT
+
     now = datetime.now(timezone.utc)
-    return timedelta(0) <= (start - now) <= timedelta(hours=LOOKAHEAD_HOURS)
+    cut = now + timedelta(minutes=BUF_MINUTES)
+    horizon = now + timedelta(hours=args.lookahead_h)
 
-def fair_two_way(odds_a: float, odds_b: float):
-    ia, ib = 1/odds_a, 1/odds_b
-    s = ia+ib
-    if s <= 0: return 0.5,0.5,0.5,0.5
-    return ia, ib, ia/s, ib/s
+    # Exclude live/in-progress if flags/strings exist
+    if "is_live" in df.columns:
+        df = df[~df["is_live"].fillna(False).astype(bool)]
+    if "status" in df.columns:
+        df = df[~df["status"].astype(str).str.contains("live|in ?play|started|progress", case=False, na=False)]
 
-def kelly(p: float, o: float):
-    b = o-1.0
-    return max(0.0, (b*p - (1-p))/b) if b>0 else 0.0
+    # 24h/12h/48h filter (adjustable)
+    df = df[df["commence_dt"].notna() & (df["commence_dt"] >= cut) & (df["commence_dt"] <= horizon)]
 
-# ---------------- helpers ----------------
-def is_sharp_book(name: str) -> bool:
-    n = (name or "").lower()
-    return any(tag in n for tag in SHARP_BOOKS)
+    # Confidence filter
+    df = df[df["confidence"].fillna(0) >= args.min_conf]
 
-def add_row(rows, *, tour, market, selection, opponent, odds, p_model_val, p_fair, start_utc,
-            conf, yes_rule=True):
-    evu = ""; kf = ""; bet = "NO"; score = -1e9
-    p_used = p_model_val if (p_model_val is not None) else p_fair
-    if p_used is not None:
-        evu = p_used * odds - 1.0
-        kf  = kelly(p_used, odds)
-        if yes_rule and (kf >= KELLY_MIN and evu >= EV_MIN and conf >= MIN_CONF):
-            bet = "YES"
-        score = evu * max(kf, 0.0) * conf
-    rows.append({
-        "tour": tour, "market": market, "selection": selection, "opponent": opponent or "",
-        "odds": float(odds), "p_model": ("" if p_model_val is None else float(p_model_val)),
-        "p_fair": float(p_fair) if p_fair is not None else "",
-        "evu": ("" if evu=="" else float(evu)), "kelly": ("" if kf=="" else float(kf)),
-        "bet": bet, "start_utc": start_utc, "score": score, "conf": conf,
-        "_is_model": (p_model_val is not None),
-    })
+    if df.empty:
+        out(f"_No eligible matches in ≤{args.lookahead_h}h window (min_conf={args.min_conf})._")
+        return
 
-def rowline(r):
-    pm  = f"{r['p_model']:.3f}" if isinstance(r["p_model"], float) else (r["p_model"] or "")
-    pf  = f"{r['p_fair']:.3f}"  if isinstance(r["p_fair"],  float) else (r["p_fair"]  or "")
-    ev  = f"{r['evu']:.3f}"     if r["evu"]   != "" else ""
-    kel = f"{r['kelly']:.3f}"   if r["kelly"] != "" else ""
-    return (
-        f"| {r['tour']} | {r['market']} | {r['selection']} | {r.get('opponent') or '—'} | "
-        f"{r['odds']:.2f} | {pm} | {pf} | {ev} | {kel} | {r['conf']:.2f} | {r['bet']} | {r['start_utc']} |"
-    )
+    # Precompute ETA and pick tour ELO df
+    df["eta_min"] = (df["commence_dt"] - now).dt.total_seconds() / 60.0
 
-def write_output(table_rows, diag_lines):
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    now_loc = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime(f"%Y-%m-%d %H:%M {LOCAL_TZ.key.split('/')[-1]}")
-    head = [
-        "# Tennis Value Engine (H2H only, Realism-weighted)",
-        "",
-        f"Updated: {now_loc} ({now_utc})",
-        "",
-        "| Tour | Market | Selection | Opponent | Odds | p_model | p_fair | EV/u | Kelly | Conf | Bet | Start (UTC) |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|:---:|---|",
-    ]
-    rows = head + (table_rows if table_rows else [
-        "| – | – | – | – | – | – | – | – | – | – | – | – |",
-        "",
-        "_No markets returned by the API in your window/regions. See diagnostics below._",
-    ])
-    if diag_lines:
-        rows += ["", "## API Diagnostics", *diag_lines]
-    out_path = OUT_DIR / SHORTLIST_FILE
-    out_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
-    print(f"Wrote {out_path}")
+    # Compute probabilities (Elo-based), Kelly, TE8
+    rows = []
+    for _, r in df.iterrows():
+        tour = str(r.get("tour", "")).upper()
+        elo_df = atp_elo if tour == "ATP" else wta_elo
 
-# ---------------- main ----------------
-def run():
-    # Build/load Elo + match counts
-    ensure_elo()
-    elo_atp = load_index("data/atp_elo.csv", "elo")
-    elo_wta = load_index("data/wta_elo.csv", "elo")
-    cnt_atp = load_index("data/atp_matches.csv", "matches")
-    cnt_wta = load_index("data/wta_matches.csv", "matches")
+        p_player = str(r.get("player", ""))
+        p_oppo   = str(r.get("opponent", ""))
 
-    # Fetch with diagnostics across configured sport keys
-    diag = []
-    events_all = []
-    for key in SPORT_KEYS:
-        data, status, hdrs, body = fetch_odds_with_diag(key)
-        events_all += data
-        line = f"- `{key}` status: **{status}**, events: **{len(data)}**"
-        rem = hdrs.get("x-requests-remaining"); used = hdrs.get("x-requests-used")
-        if rem or used:
-            line += f"  | quota remaining={rem or '?'} used={used or '?'}"
-        diag.append(line)
-        if status != 200 and body:
-            diag.append("  error body: " + body)
-
-    # Fallback: if nothing from static keys, auto-discover active tennis_* keys
-    if not events_all:
-        auto_keys = list_tennis_keys(API_KEY)
-        if auto_keys:
-            diag.append(f"- Auto-discovered keys: {', '.join(auto_keys)}")
-            for key in auto_keys:
-                data, status, hdrs, body = fetch_odds_with_diag(key)
-                events_all += data
-                line = f"- `{key}` status: **{status}**, events: **{len(data)}**"
-                rem = hdrs.get("x-requests-remaining"); used = hdrs.get("x-requests-used")
-                if rem or used:
-                    line += f"  | quota remaining={rem or '?'} used={used or '?'}"
-                diag.append(line)
-                if status != 200 and body:
-                    diag.append("  error body: " + body)
-        else:
-            diag.append("- Auto-discovery found no active ATP/WTA keys from provider.")
-
-    total_before_window = 0
-    h2h_pairs_after_window = 0
-
-    # Build candidates with realism weights — H2H only
-    cands = []
-
-    for ev in events_all:
-        total_before_window += 1
-        ct = ev.get("commence_time")
-        if not ct or not within_window(ct):
+        odds = float(r.get("best_odds", float("nan")))
+        if not (odds > 1.0):
             continue
-        start_utc = datetime.fromisoformat(ct.replace("Z","+00:00"))
-        start_utc_str = start_utc.strftime("%Y-%m-%d %H:%M UTC")
 
-        stitle = (ev.get("sport_title") or "").upper()
-        tour_hint = "ATP" if "ATP" in stitle else ("WTA" if "WTA" in stitle else "GEN")
+        prob = elo_win_prob(elo_df, p_player, p_oppo)  # Elo probability
+        kelly = kelly_fraction(prob, odds)
 
-        # Aggregate best H2H prices with sharp filter pref
-        def best_prices_h2h():
-            grid = {}
-            sharp_any = False
-            for bm in ev.get("bookmakers", []):
-                bname = bm.get("title","?")
-                bsharp = is_sharp_book(bname)
-                for mk in bm.get("markets", []):
-                    if mk.get("key") != "h2h": continue
-                    for out in mk.get("outcomes", []):
-                        nm = out.get("name"); pr = out.get("price")
-                        if nm is None or pr is None: continue
-                        cell = grid.get(nm)
-                        if cell is None or pr > cell["price"] or (bsharp and pr == cell["price"] and not cell["sharp"]):
-                            grid[nm] = {"price": float(pr), "sharp": bsharp}
-                            if bsharp: sharp_any = True
-                        elif abs(pr - cell["price"]) < 1e-9:
-                            cell["sharp"] = cell["sharp"] or bsharp
-                            if bsharp: sharp_any = True
-            if sharp_any:
-                grid = {k:v for k,v in grid.items() if v["sharp"]}
-            return grid
+        # Enforce micro-stake cap for dogs
+        is_dog = (ODDS_DOG_MIN <= odds <= ODDS_DOG_MAX)
+        if is_dog and kelly > 0:
+            kelly = 0.25 * kelly  # enforce 0.25×K
 
-        h2h = best_prices_h2h()
-        if len(h2h) == 2:
-            (n1, a), (n2, b) = list(h2h.items())[0], list(h2h.items())[1]
-            h2h_pairs_after_window += 1
+        te8 = trueedge8(r, injuries_map)
 
-            # Guess model tour
-            pmA = pmB = None; confE = 0.0; model_tour = None
-            def try_tour(code):
-                if code=="ATP":
-                    p1 = p_model(n1, n2, elo_atp); p2 = p_model(n2, n1, elo_atp)
-                    if p1 is not None and p2 is not None:
-                        c = conf_from_matches(n1, n2, cnt_atp)
-                        return p1, p2, c, "ATP"
-                if code=="WTA":
-                    p1 = p_model(n1, n2, elo_wta); p2 = p_model(n2, n1, elo_wta)
-                    if p1 is not None and p2 is not None:
-                        c = conf_from_matches(n1, n2, cnt_wta)
-                        return p1, p2, c, "WTA"
-                return None, None, 0.0, None
+        # Decision
+        te_thresh = TE8_THRESHOLD_DOG if is_dog else TE8_THRESHOLD_FAV if (ODDS_FAV_MIN <= odds <= ODDS_FAV_MAX) else TE8_THRESHOLD_FAV
+        bet_ok = (kelly > 0) and (te8 >= te_thresh)
 
-            for code in ([tour_hint] if tour_hint in ("ATP","WTA") else []) + ["ATP","WTA"]:
-                pmA, pmB, confE, model_tour = try_tour(code)
-                if model_tour: break
+        rows.append({
+            "tour": tour,
+            "player": p_player,
+            "opponent": p_oppo,
+            "odds": odds,
+            "prob": round(prob, 3),
+            "kelly": round(kelly, 3),
+            "te8": round(te8, 2),
+            "bet": bet_ok,
+            "start": r["commence_dt"],
+            "eta_min": float(r["eta_min"])
+        })
 
-            # Market no‑vig
-            _,_,pfA,pfB = fair_two_way(a["price"], b["price"])
-            conf_mkt = 0.6 if (a["sharp"] or b["sharp"]) else 0.3
+    if not rows:
+        out(f"_No qualified picks after TE8/Kelly filters in ≤{args.lookahead_h}h window._")
+        return
 
-            # Elo-backed rows
-            if model_tour:
-                add_row(cands, tour=model_tour, market="H2H", selection=n1, opponent=n2,
-                        odds=a["price"], p_model_val=pmA, p_fair=pfA, start_utc=start_utc_str, conf=confE)
-                add_row(cands, tour=model_tour, market="H2H", selection=n2, opponent=n1,
-                        odds=b["price"], p_model_val=pmB, p_fair=pfB, start_utc=start_utc_str, conf=confE)
+    X = pd.DataFrame(rows)
 
-            # Market-only rows
-            add_row(cands, tour=(model_tour or tour_hint), market="H2H", selection=n1, opponent=n2,
-                    odds=a["price"], p_model_val=None, p_fair=pfA, start_utc=start_utc_str, conf=conf_mkt)
-            add_row(cands, tour=(model_tour or tour_hint), market="H2H", selection=n2, opponent=n1,
-                    odds=b["price"], p_model_val=None, p_fair=pfB, start_utc=start_utc_str, conf=conf_mkt)
+    # Sort by: sooner first, then higher Kelly
+    X = X.sort_values(["start", "kelly"], ascending=[True, False])
 
-    # --- Deduplicate to max ONE row per match (per start time) ---
-    # Key = (start_utc, sorted names)
-    def match_key(r):
-        a = norm_name(r["selection"]); b = norm_name(r["opponent"])
-        names = tuple(sorted([a, b]))
-        return (r["start_utc"], names)
+    # Build summary
+    header = f"_Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} · upcoming-only (≤{args.lookahead_h}h, buffer {BUF_MINUTES}m) · min_conf={args.min_conf}._"
+    lines = [header, ""]
 
-    grouped = {}
-    for r in cands:
-        if not r["opponent"]:
+    def badge(b):  # color-coded via emoji
+        return "🟢 **BET**" if b else "🔴 **PASS**"
+
+    def stake_note(k):
+        if args.bankroll > 0 and k > 0:
+            return f" • Stake≈€{args.bankroll * k:.2f}"
+        return ""
+
+    for tour in ["ATP", "WTA"]:
+        sub = X[X["tour"] == tour]
+        if sub.empty:
             continue
-        k = match_key(r)
-        prev = grouped.get(k)
-        if prev is None:
-            grouped[k] = r
-        else:
-            # Choose better row: YES first, then model > market, then score, then EV
-            def score_tuple(x):
-                return (1 if x["bet"] == "YES" else 0,
-                        1 if x["_is_model"] else 0,
-                        x["score"],
-                        (x["evu"] if x["evu"] != "" else -1e9))
-            if score_tuple(r) > score_tuple(prev):
-                grouped[k] = r
+        lines.append(f"## {tour} Picks")
+        for _, r in sub.iterrows():
+            lines.append(
+                f"{badge(r['bet'])} — {r['player']} vs {r['opponent']} — {r['odds']:.2f}  \n"
+                f"p={r['prob']:.2f} • Kelly={r['kelly']:.3f} • TE8={r['te8']:.2f}{stake_note(r['kelly'])}  \n"
+                f"🗓 {ts_fmt(r['start'])} • ETA: {eta_fmt(r['eta_min'])}"
+            )
+        lines.append("")
 
-    deduped = list(grouped.values())
+    # Diagnostics (optional)
+    if args.diagnostics:
+        lines += [
+            "---",
+            "### Diagnostics",
+            f"- Matches considered: {len(df)}",
+            f"- Picks after filters: {len(X)}",
+            f"- Dog odds band: [{ODDS_DOG_MIN}, {ODDS_DOG_MAX}] | Fav band: [{ODDS_FAV_MIN}, {ODDS_FAV_MAX}]",
+            f"- TE8 thresholds: fav {TE8_THRESHOLD_FAV}, dog {TE8_THRESHOLD_DOG}",
+            f"- Underdog micro-cap: {UNDERDOG_KELLY_CAP}×Kelly",
+        ]
 
-    # Diagnostics summary
-    diag.append(f"- Events fetched (all keys): {len(events_all)} | Before window filter: {total_before_window} | H2H pairs after window: {h2h_pairs_after_window} | After dedupe: {len(deduped)}")
+    # Write to GitHub Step Summary (or local file if not in Actions)
+    out("\n".join(lines))
 
-    # Sort & limit
-    deduped.sort(key=lambda r: r["score"], reverse=True)
-    top = deduped[:TOP_ROWS]
-    rows = [rowline(r) for r in top]
-
-    write_output(rows, diag)
+def out(text: str):
+    path = os.environ.get("GITHUB_STEP_SUMMARY", "summary.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print("Summary written to:", path)
 
 if __name__ == "__main__":
-    run()
+    main()
