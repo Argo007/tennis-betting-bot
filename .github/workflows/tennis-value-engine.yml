@@ -1,19 +1,9 @@
-name: Tennis Value Engine (H2H only)
+name: Tennis Picks (ATP/WTA)
 
 on:
   schedule:
     - cron: "0 8 * * *"   # 08:00 UTC daily
   workflow_dispatch: {}
-
-permissions:
-  contents: read
-
-concurrency:
-  group: tennis-value-engine
-  cancel-in-progress: true
-
-env:
-  TZ: Europe/Amsterdam
 
 jobs:
   picks:
@@ -22,55 +12,60 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Prepare dependencies
-        run: |
-          printf "pandas\nrequests\npytz\n" > requirements.txt
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: "requirements.txt"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas requests
 
-      - name: Run value engine (H2H only)
+      # --- Build Elo from last two seasons (simple, consistent) ---
+      - name: Download ATP/WTA results
+        run: |
+          mkdir -p matches
+          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
+          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+
+      - name: Generate Elo
+        run: |
+          python - <<'PY'
+          import pandas as pd, glob, os
+          START, K = 1500, 32
+          def exp(a,b): return 1/(1+10**((b-a)/400))
+          def upd(a,b,s): return a + K*(s-exp(a,b))
+          def calc(pattern):
+              files = glob.glob(pattern)
+              if not files:
+                  raise SystemExit("No match files for Elo.")
+              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+              E = {}
+              for _,r in df.iterrows():
+                  w,l = r['winner_name'], r['loser_name']
+                  ew, el = E.get(w,START), E.get(l,START)
+                  E[w] = upd(ew,el,1); E[l] = upd(el,ew,0)
+              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()])
+          os.makedirs("data", exist_ok=True)
+          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
+          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
+          print("Elo ready.")
+          PY
+
+      # --- Run your pricing/model step that produces value_picks_pro.csv ---
+      - name: Run model (fetch odds & price value)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          LOOKAHEAD_HOURS: "48"
-          REGIONS: "eu,uk,us,au"
-          MARKETS: "h2h"
-          SPORT_KEYS: "tennis,tennis_atp,tennis_wta"
-          KELLY_MIN: "0.05"
-          EV_MIN: "0.00"
-          MIN_CONF: "0.40"
-          TOP_ROWS: "25"
-          OUT_DIR: "outputs"
-          SHORTLIST_FILE: "value_engine_shortlist.md"
         run: |
-          python scripts/tennis_value_engine.py
+          # Adjust lookahead if you want (e.g., 12, 24, 48)
+          python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out value_picks_pro.csv
 
-      - name: Upload shortlist artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tennis-value-engine-shortlist
-          path: outputs/value_engine_shortlist.md
-
-      - name: Summarize (safe)
-        if: always()
+      # --- Render clean shortlist with TrueEdge8 + Kelly (no tables) ---
+      - name: Publish picks (clean, color-coded)
         run: |
-          echo "## Rendered file" >> $GITHUB_STEP_SUMMARY
-          if [ -f outputs/value_engine_shortlist.md ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            sed -n '1,200p' outputs/value_engine_shortlist.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "_No shortlist file produced._" >> $GITHUB_STEP_SUMMARY
-          fi
+          # --bankroll prints stake hints in € (set 0 to hide); --diagnostics optional
+          python tennis_value_engine.py --lookahead-h 24 --min-conf 50 --bankroll 200 --diagnostics
