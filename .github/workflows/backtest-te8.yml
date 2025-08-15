@@ -1,0 +1,220 @@
+name: Backtest TrueEdge8 + Kelly
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: true
+        default: "2023-01-01"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: true
+        default: "2024-12-31"
+      te8_dog:
+        description: "TE8 threshold for dogs"
+        required: true
+        default: "0.60"
+      te8_fav:
+        description: "TE8 threshold for favorites"
+        required: true
+        default: "0.50"
+      dog_band:
+        description: "Dog odds band [min,max]"
+        required: true
+        default: "1.90,6.00"
+      fav_band:
+        description: "Fav odds band [min,max]"
+        required: true
+        default: "1.15,2.00"
+      dog_cap:
+        description: "Dog micro-cap × Kelly"
+        required: true
+        default: "0.25"
+      stake_unit:
+        description: "Flat unit stake (€)"
+        required: true
+        default: "100"
+      bankroll:
+        description: "Starting bankroll for Kelly sim (€)"
+        required: true
+        default: "1000"
+      years_csv:
+        description: "Years to download (space separated)"
+        required: true
+        default: "2023 2024"
+      surface_boost:
+        description: "Add to TE8 if strong on surface"
+        required: true
+        default: "0.05"
+      recent_form_weight:
+        description: "Amplitude for recent form factor"
+        required: true
+        default: "0.30"
+      injury_penalty:
+        description: "Multiply TE8 by (1 - penalty) when injured"
+        required: true
+        default: "0.15"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Download ATP/WTA results (Jeff Sackmann)
+        run: |
+          mkdir -p sackmann
+          for Y in ${{ inputs.years_csv }}; do
+            curl -sSL -o sackmann/atp_matches_${Y}.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_${Y}.csv
+            curl -sSL -o sackmann/wta_matches_${Y}.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_${Y}.csv
+          done
+
+      - name: Generate Elo (for backtest)
+        run: |
+          python - <<'PY'
+          import pandas as pd, glob, os
+          START, K = 1500.0, 32.0
+          def exp(a,b): return 1/(1+10**((b-a)/400))
+          def upd(a,b,s): return a + K*(s-exp(a,b))
+          def calc(pattern):
+              files = glob.glob(pattern)
+              if not files: raise SystemExit("No match files for Elo.")
+              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+              E={}
+              for _,r in df.iterrows():
+                  w,l = r.get('winner_name'), r.get('loser_name')
+                  if not isinstance(w,str) or not isinstance(l,str): continue
+                  ew,el = E.get(w,START), E.get(l,START)
+                  E[w]=upd(ew,el,1.0); E[l]=upd(el,ew,0.0)
+              return pd.DataFrame([{"player":k,"elo":v} for k,v in E.items()])
+          os.makedirs("data", exist_ok=True)
+          calc("sackmann/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
+          calc("sackmann/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
+          print("Elo files ready.")
+          PY
+
+      - name: Download historical closing odds (tennis-data.co.uk)
+        run: |
+          mkdir -p tennisdata
+          for Y in ${{ inputs.years_csv }}; do
+            curl -sSL -o tennisdata/ATP_${Y}.csv https://www.tennis-data.co.uk/${Y}/ATP_${Y}.csv || true
+            curl -sSL -o tennisdata/WTA_${Y}.csv https://www.tennis-data.co.uk/${Y}/WTA_${Y}.csv || true
+          done
+
+      - name: Build historical_matches.csv
+        run: |
+          python - <<'PY'
+          import os, glob, pandas as pd, numpy as np
+          os.makedirs("data", exist_ok=True)
+          frames=[]
+          for path in glob.glob("tennisdata/*.csv"):
+              try:
+                  df = pd.read_csv(path)
+              except Exception:
+                  try: df = pd.read_csv(path, encoding="latin1")
+                  except Exception: continue
+              cols = {c.lower(): c for c in df.columns}
+              if "date" not in cols or ("winner" not in cols and "w" not in cols): continue
+              cDate = cols.get("date")
+              cWin  = cols.get("winner", cols.get("w"))
+              cLos  = cols.get("loser",  cols.get("l"))
+              cPSW  = cols.get("psw"); cPSL  = cols.get("psl")
+              cAvgW = cols.get("avgw"); cAvgL = cols.get("avgl")
+              cSurf = cols.get("surface") if "surface" in cols else None
+              d = pd.DataFrame({
+                  "date": pd.to_datetime(df[cDate], errors="coerce"),
+                  "winner": df[cWin].astype(str),
+                  "loser":  df[cLos].astype(str),
+                  "odds_w": pd.to_numeric(df[cPSW] if cPSW in df else df.get(cAvgW, np.nan), errors="coerce"),
+                  "odds_l": pd.to_numeric(df[cPSL] if cPSL in df else df.get(cAvgL, np.nan), errors="coerce"),
+                  "surface": df[cSurf].astype(str) if cSurf else ""
+              }).dropna(subset=["date"])
+              if d["odds_w"].isna().all() and cAvgW in df: d["odds_w"]=pd.to_numeric(df[cAvgW], errors="coerce")
+              if d["odds_l"].isna().all() and cAvgL in df: d["odds_l"]=pd.to_numeric(df[cAvgL], errors="coerce")
+              d = d.dropna(subset=["odds_w","odds_l"])
+              tour = "ATP" if "ATP" in os.path.basename(path) else "WTA"
+              a = pd.DataFrame({"date": d["date"].dt.strftime("%Y-%m-%d"),"tour": tour,
+                                "player": d["winner"],"opponent": d["loser"],
+                                "best_odds": d["odds_w"],"result": 1,"surface": d["surface"]})
+              b = pd.DataFrame({"date": d["date"].dt.strftime("%Y-%m-%d"),"tour": tour,
+                                "player": d["loser"],"opponent": d["winner"],
+                                "best_odds": d["odds_l"],"result": 0,"surface": d["surface"]})
+              frames += [a,b]
+          if not frames: raise SystemExit("No tennis-data files parsed.")
+          out = pd.concat(frames, ignore_index=True)
+          out = out.dropna(subset=["best_odds"])
+          out["best_odds"] = pd.to_numeric(out["best_odds"], errors="coerce")
+          out = out.dropna(subset=["best_odds"])
+          out.to_csv("data/historical_matches.csv", index=False)
+          print("Built data/historical_matches.csv with", len(out), "rows.")
+          PY
+
+      - name: Ensure injuries.json exists
+        run: |
+          if [ ! -f injuries.json ]; then
+            cat > injuries.json <<'JSON'
+            [
+              {
+                "player": "Holger Rune",
+                "start_date": "2023-05-15",
+                "end_date": "2023-06-02",
+                "impact": 0.70,
+                "note": "Example stub — adjust/remove as needed"
+              }
+            ]
+            JSON
+            echo "Created injuries.json stub."
+          else
+            echo "injuries.json present."
+          fi
+
+      - name: Run backtest
+        run: |
+          test -f backtest_te8.py || { echo "::error ::backtest_te8.py missing in repo root"; exit 1; }
+          python backtest_te8.py \
+            --input data/historical_matches.csv \
+            --elo-atp data/atp_elo.csv \
+            --elo-wta data/wta_elo.csv \
+            --injuries injuries.json \
+            --start "${{ inputs.start_date }}" \
+            --end   "${{ inputs.end_date }}" \
+            --te8-dog "${{ inputs.te8_dog }}" \
+            --te8-fav "${{ inputs.te8_fav }}" \
+            --dog-band "${{ inputs.dog_band }}" \
+            --fav-band "${{ inputs.fav_band }}" \
+            --dog-cap "${{ inputs.dog_cap }}" \
+            --stake-unit "${{ inputs.stake_unit }}" \
+            --bankroll "${{ inputs.bankroll }}" \
+            --surface-boost "${{ inputs.surface_boost }}" \
+            --recent-form-weight "${{ inputs.recent_form_weight }}" \
+            --injury-penalty "${{ inputs.injury_penalty }}" \
+            --out-csv backtest_results.csv \
+            --summary backtest_summary.md
+
+      - name: Publish summary
+        run: |
+          if [ -f backtest_summary.md ]; then
+            cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No backtest summary produced._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload artifacts (CSV + MD)
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-output
+          path: |
+            backtest_results.csv
+            backtest_summary.md
