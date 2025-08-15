@@ -11,6 +11,10 @@ on:
         description: "End date (YYYY-MM-DD)"
         required: true
         default: "2024-12-31"
+      years_csv:
+        description: "Years to download (space separated)"
+        required: true
+        default: "2023 2024"
       te8_dog:
         description: "TE8 threshold for dogs"
         required: true
@@ -19,14 +23,10 @@ on:
         description: "TE8 threshold for favorites"
         required: true
         default: "0.50"
-      dog_band:
-        description: "Dog odds band [min,max]"
+      bands:
+        description: "Odds bands: dog=min,max;fav=min,max"
         required: true
-        default: "1.90,6.00"
-      fav_band:
-        description: "Fav odds band [min,max]"
-        required: true
-        default: "1.15,2.00"
+        default: "dog=2.20,4.50;fav=1.15,2.00"
       dog_cap:
         description: "Dog micro-cap × Kelly"
         required: true
@@ -39,22 +39,10 @@ on:
         description: "Starting bankroll for Kelly sim (€)"
         required: true
         default: "1000"
-      years_csv:
-        description: "Years to download (space separated)"
+      tuners:
+        description: "TE8 tuners: surface_boost=0.05;recent_form_weight=0.30;injury_penalty=0.15"
         required: true
-        default: "2023 2024"
-      surface_boost:
-        description: "Add to TE8 if strong on surface"
-        required: true
-        default: "0.05"
-      recent_form_weight:
-        description: "Amplitude for recent form factor"
-        required: true
-        default: "0.30"
-      injury_penalty:
-        description: "Multiply TE8 by (1 - penalty) when injured"
-        required: true
-        default: "0.15"
+        default: "surface_boost=0.05;recent_form_weight=0.30;injury_penalty=0.15"
 
 jobs:
   backtest:
@@ -130,8 +118,8 @@ jobs:
               cDate = cols.get("date")
               cWin  = cols.get("winner", cols.get("w"))
               cLos  = cols.get("loser",  cols.get("l"))
-              cPSW  = cols.get("psw"); cPSL  = cols.get("psl")
-              cAvgW = cols.get("avgw"); cAvgL = cols.get("avgl")
+              cPSW  = cols.get("psw"); cPSL = cols.get("psl")
+              cAvgW = cols.get("avgw"); cAvgL= cols.get("avgl")
               cSurf = cols.get("surface") if "surface" in cols else None
               d = pd.DataFrame({
                   "date": pd.to_datetime(df[cDate], errors="coerce"),
@@ -180,9 +168,22 @@ jobs:
             echo "injuries.json present."
           fi
 
-      - name: Run backtest
+      - name: Parse bands & tuners; run backtest
+        shell: bash
         run: |
+          # Parse bands: dog=min,max;fav=min,max
+          BANDS="${{ inputs.bands }}"
+          DOG_BAND=$(echo "$BANDS" | sed -n 's/.*dog=\([^;]*\).*/\1/p'); [ -z "$DOG_BAND" ] && DOG_BAND="2.20,4.50"
+          FAV_BAND=$(echo "$BANDS" | sed -n 's/.*fav=\([^;]*\).*/\1/p'); [ -z "$FAV_BAND" ] && FAV_BAND="1.15,2.00"
+
+          # Parse tuners: surface_boost=...;recent_form_weight=...;injury_penalty=...
+          TUNE="${{ inputs.tuners }}"
+          SURF_BOOST=$(echo "$TUNE" | sed -n 's/.*surface_boost=\([^;]*\).*/\1/p'); [ -z "$SURF_BOOST" ] && SURF_BOOST="0.05"
+          FORM_W=$(echo "$TUNE" | sed -n 's/.*recent_form_weight=\([^;]*\).*/\1/p'); [ -z "$FORM_W" ] && FORM_W="0.30"
+          INJ_PEN=$(echo "$TUNE" | sed -n 's/.*injury_penalty=\([^;]*\).*/\1/p'); [ -z "$INJ_PEN" ] && INJ_PEN="0.15"
+
           test -f backtest_te8.py || { echo "::error ::backtest_te8.py missing in repo root"; exit 1; }
+
           python backtest_te8.py \
             --input data/historical_matches.csv \
             --elo-atp data/atp_elo.csv \
@@ -192,14 +193,14 @@ jobs:
             --end   "${{ inputs.end_date }}" \
             --te8-dog "${{ inputs.te8_dog }}" \
             --te8-fav "${{ inputs.te8_fav }}" \
-            --dog-band "${{ inputs.dog_band }}" \
-            --fav-band "${{ inputs.fav_band }}" \
+            --dog-band "$DOG_BAND" \
+            --fav-band "$FAV_BAND" \
             --dog-cap "${{ inputs.dog_cap }}" \
             --stake-unit "${{ inputs.stake_unit }}" \
             --bankroll "${{ inputs.bankroll }}" \
-            --surface-boost "${{ inputs.surface_boost }}" \
-            --recent-form-weight "${{ inputs.recent_form_weight }}" \
-            --injury-penalty "${{ inputs.injury_penalty }}" \
+            --surface-boost "$SURF_BOOST" \
+            --recent-form-weight "$FORM_W" \
+            --injury-penalty "$INJ_PEN" \
             --out-csv backtest_results.csv \
             --summary backtest_summary.md
 
