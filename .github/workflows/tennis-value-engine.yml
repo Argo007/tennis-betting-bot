@@ -1,17 +1,52 @@
-name: Tennis Picks (ATP/WTA)
+name: Tennis Value Engine (Daily Picks)
 
 on:
   schedule:
-    - cron: "0 8 * * *"     # 08:00 UTC daily
-  workflow_dispatch: {}
+    - cron: "0 7 * * *"         # every day 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      lookahead_h:
+        description: "Odds freshness window (hours)"
+        required: false
+        default: "6"
+      min_conf:
+        description: "Minimum model confidence (0–1)"
+        required: false
+        default: "0.58"
+      bankroll:
+        description: "Starting bankroll for Kelly"
+        required: false
+        default: "1000"
+      max_picks:
+        description: "Max picks to publish"
+        required: false
+        default: "20"
+      publish_md:
+        description: "Publish markdown summary to job log?"
+        required: true
+        type: choice
+        default: "yes"
+        options: ["yes","no"]
+
+permissions:
+  contents: read
+
+env:
+  TZ: Europe/Amsterdam
+  LOOKAHEAD_H: ${{ github.event.inputs.lookahead_h || '6' }}
+  MIN_CONF:    ${{ github.event.inputs.min_conf    || '0.58' }}
+  BANKROLL:    ${{ github.event.inputs.bankroll    || '1000' }}
+  MAX_PICKS:   ${{ github.event.inputs.max_picks   || '20' }}
+  PUBLISH_MD:  ${{ github.event.inputs.publish_md  || 'yes' }}
 
 jobs:
-  picks:
+  value-engine:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -21,170 +56,102 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install \
+            pandas numpy requests pyyaml tabulate openpyxl \
+            matplotlib unidecode rapidfuzz
 
-      # --- Build Elo from last two seasons ---
-      - name: Download ATP/WTA results
+      # --- Optional: quick sanity ping so we fail fast if scripts moved ---
+      - name: Verify scripts present
         run: |
-          mkdir -p matches
-          curl -sSL -o matches/atp_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
-          curl -sSL -o matches/atp_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
-          curl -sSL -o matches/wta_matches_2023.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2023.csv
-          curl -sSL -o matches/wta_matches_2024.csv https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_matches_2024.csv
+          test -f tennis_value_engine.py || echo "::warning ::tennis_value_engine.py not found (skipping this stage)"
+          test -f tennis_value_picks_pro.py || { echo "::error ::tennis_value_picks_pro.py not found at repo root"; exit 1; }
 
-      - name: Generate Elo
+      # --- Run your odds scan / model pipeline (make this whatever your repo expects) ---
+      - name: Run value engine (predict + shortlist)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOG=outputs/engine_run.log
+          mkdir -p outputs data
+
+          # If you have a pre-engine step, keep it; otherwise this is a no-op.
+          if [ -f tennis_value_engine.py ]; then
+            echo "Running tennis_value_engine.py ..." | tee -a "$LOG"
+            python tennis_value_engine.py \
+              --lookahead "${LOOKAHEAD_H}" \
+              --min-conf "${MIN_CONF}" \
+              --out outputs/value_candidates.csv 2>&1 | tee -a "$LOG"
+          else
+            echo "No tennis_value_engine.py detected; assuming candidates come from picks_pro." | tee -a "$LOG"
+          fi
+
+          echo "Running tennis_value_picks_pro.py ..." | tee -a "$LOG"
+          # This script is assumed to write value_picks_pro.csv
+          python tennis_value_picks_pro.py \
+            --lookahead "${LOOKAHEAD_H}" \
+            --min-conf "${MIN_CONF}" \
+            --bankroll "${BANKROLL}" \
+            --max-picks "${MAX_PICKS}" 2>&1 | tee -a "$LOG"
+
+          # If script didn't write the file, make an empty but valid CSV so the job doesn't blow up
+          test -f value_picks_pro.csv || {
+            echo "date,tour,tournament,round,player,opponent,odds,edge,kelly,stake,model_conf" > value_picks_pro.csv
+            echo "::warning ::No picks produced; created empty value_picks_pro.csv" | tee -a "$LOG"
+          }
+
+      # --- Build a clean markdown summary (never crash on empty/missing) ---
+      - name: Build & publish summary
         run: |
           python - <<'PY'
-          import pandas as pd, glob, os
-          START, K = 1500, 32
-          def exp(a,b): return 1/(1+10**((b-a)/400))
-          def upd(a,b,s): return a + K*(s-exp(a,b))
-          def calc(pattern):
-              files = glob.glob(pattern)
-              if not files: raise SystemExit("No match files for Elo.")
-              df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
-              E={}
-              for _,r in df.iterrows():
-                  w,l = r['winner_name'], r['loser_name']
-                  ew,el = E.get(w,START), E.get(l,START)
-                  E[w]=upd(ew,el,1); E[l]=upd(el,ew,0)
-              return pd.DataFrame([{'player':k,'elo':v} for k,v in E.items()])
-          os.makedirs("data", exist_ok=True)
-          calc("matches/atp_matches_*.csv").to_csv("data/atp_elo.csv", index=False)
-          calc("matches/wta_matches_*.csv").to_csv("data/wta_elo.csv", index=False)
-          print("Elo ready.")
-          PY
-
-      # --- Your pricing/model step (produces value_picks_pro.csv) ---
-      - name: Run model (fetch odds & price value)
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: |
-          python tennis_value_picks_pro.py --region eu --lookahead-h 24 --out value_picks_pro.csv
-
-      # --- Clean, color-coded summary (INLINE ENGINE: no missing file) ---
-      - name: Publish picks (clean, color-coded)
-        env:
-          LOOKAHEAD_H: "24"     # adjust: 12 / 24 / 48
-          MIN_CONF:    "50"     # confidence threshold
-          BANKROLL:    "200"    # € to show stake hints (set "0" to hide)
-        run: |
-          python - <<'PY'
-          import os, pandas as pd
-          from datetime import datetime, timezone, timedelta
-
-          # ---- settings from env ----
-          LOOKAHEAD_H = int(os.getenv("LOOKAHEAD_H","24"))
-          MIN_CONF    = int(os.getenv("MIN_CONF","50"))
-          BANKROLL    = float(os.getenv("BANKROLL","0"))
-          BUF_MIN     = 5
-          DOG_MIN, DOG_MAX = 1.90, 6.00
-          FAV_MIN, FAV_MAX = 1.15, 2.00
-          TE8_FAV, TE8_DOG = 0.50, 0.60
-
-          # ---- helpers ----
-          def elo_rating(df, name):
-              r = df[df["player"] == str(name)]
-              return float(r["elo"].iloc[0]) if not r.empty else 1500.0
-          def elo_prob(df, p1, p2):
-              e1 = elo_rating(df,p1); e2 = elo_rating(df,p2)
-              return 1.0/(1.0+10.0**((e2-e1)/400.0))
-          def kelly(p, odds):
-              if not (0<=p<=1) or odds<=1: return 0.0
-              b = odds-1.0
-              return max((odds*p-1.0)/b, 0.0)
-          def te8(row):
-              conf = float(row.get("confidence",0))
-              form = 0.50 + 0.30*max(0,min(1,conf/100.0))
-              eta  = float(row.get("eta_min",240))
-              rest = 0.55 if eta<90 else (0.60 if eta<240 else 0.65)
-              surface, h2h, stage, mental, injury = 0.60, 0.55, 0.55, 0.60, 0.90
-              return round((form+surface+h2h+rest+injury+stage+mental)/7.0,2)
-          def eta_fmt(m):
-              m=int(round(m)); h,mm=divmod(m,60); return f"{h}h {mm:02d}m" if h else f"{mm}m"
-          def ts_fmt(ts): return pd.to_datetime(ts, utc=True).strftime("%Y-%m-%d %H:%M UTC")
-          def badge(ok): return "🟢 **BET**" if ok else "🔴 **PASS**"
-
-          # ---- load data ----
-          atp = pd.read_csv("data/atp_elo.csv")
-          wta = pd.read_csv("data/wta_elo.csv")
-          df  = pd.read_csv("value_picks_pro.csv")
-
-          for c in ["blended_prob","best_odds","confidence"]:
-              if c in df.columns: df[c]=pd.to_numeric(df[c], errors="coerce")
-          if "confidence" not in df.columns: df["confidence"]=0
-
-          # time filters
-          if "commence_time_utc" in df.columns:
-              df["start_dt"]=pd.to_datetime(df["commence_time_utc"], utc=True, errors="coerce")
-          elif "commence_time" in df.columns:
-              df["start_dt"]=pd.to_datetime(df["commence_time"], utc=True, errors="coerce")
+          import os, pandas as pd, json
+          picks_path="value_picks_pro.csv"
+          md=["# Tennis Value Engine — Daily Picks"]
+          if os.path.exists(picks_path):
+            try:
+              df=pd.read_csv(picks_path)
+            except Exception as e:
+              md.append(f"\n_Unable to read picks CSV: {e}_")
+              df=pd.DataFrame()
           else:
-              df["start_dt"]=pd.NaT
+            df=pd.DataFrame()
+          n=len(df)
+          md.append(f"\n- Lookahead: **{os.getenv('LOOKAHEAD_H')}h**")
+          md.append(f"- Min confidence: **{os.getenv('MIN_CONF')}**")
+          md.append(f"- Bankroll: **€{float(os.getenv('BANKROLL','1000')):,.2f}**")
+          md.append(f"- Max picks: **{os.getenv('MAX_PICKS')}**")
+          md.append(f"- Rows in picks: **{n}**")
 
-          now = datetime.now(timezone.utc)
-          cut = now + timedelta(minutes=BUF_MIN)
-          horizon = now + timedelta(hours=LOOKAHEAD_H)
+          if n>0:
+            cols=[c for c in ["date","tour","tournament","round","player","opponent","odds","edge","kelly","stake","model_conf"] if c in df.columns]
+            df= df[cols].copy()
+            df.sort_values(["date","tour","tournament","round","player"], inplace=True)
+            # Show top 25 in summary to keep it readable
+            head=df.head(25)
+            try:
+              table=head.to_markdown(index=False)
+            except Exception:
+              table=head.to_csv(index=False)
+            md.append("\n## Top picks (first 25)\n\n"+table)
+          else:
+            md.append("\n_No picks met the filters today._")
 
-          if "is_live" in df.columns:
-              df = df[~df["is_live"].fillna(False).astype(bool)]
-          if "status" in df.columns:
-              df = df[~df["status"].astype(str).str.contains("live|in ?play|started|progress", case=False, na=False)]
-
-          df = df[df["start_dt"].notna() & (df["start_dt"]>=cut) & (df["start_dt"]<=horizon)]
-          df = df[df["confidence"].fillna(0) >= MIN_CONF]
-          if df.empty:
-              with open(os.environ.get("GITHUB_STEP_SUMMARY","summary.md"),"w") as f:
-                  f.write(f"_No eligible matches in ≤{LOOKAHEAD_H}h window (min_conf={MIN_CONF})._")
-              raise SystemExit(0)
-
-          df["eta_min"] = (df["start_dt"] - now).dt.total_seconds()/60.0
-
-          # compute picks
-          rows=[]
-          for _,r in df.iterrows():
-              tour = str(r.get("tour","")).upper()
-              elo_df = atp if tour=="ATP" else wta
-              odds = float(r.get("best_odds", float("nan")))
-              if not (odds>1): continue
-              p = elo_prob(elo_df, str(r["player"]), str(r["opponent"]))
-              k = kelly(p, odds)
-              is_dog = (DOG_MIN <= odds <= DOG_MAX)
-              if is_dog and k>0: k = 0.25*k     # micro-cap
-              score = te8(r)
-              thresh = TE8_DOG if is_dog else TE8_FAV
-              bet = (k>0) and (score>=thresh)
-              rows.append({
-                  "tour": tour, "player": r["player"], "opponent": r["opponent"],
-                  "odds": round(odds,2), "prob": round(p,3), "kelly": round(k,3),
-                  "te8": score, "bet": bet, "start": r["start_dt"], "eta": float(r["eta_min"])
-              })
-
-          X = pd.DataFrame(rows)
-          if X.empty:
-              with open(os.environ.get("GITHUB_STEP_SUMMARY","summary.md"),"w") as f:
-                  f.write(f"_No qualified picks after TE8/Kelly filters in ≤{LOOKAHEAD_H}h window._")
-              raise SystemExit(0)
-
-          X = X.sort_values(["start","kelly"], ascending=[True,False])
-
-          header = f"_Filtered at {now.strftime('%Y-%m-%d %H:%M UTC')} · upcoming-only (≤{LOOKAHEAD_H}h, buffer {BUF_MIN}m) · min_conf={MIN_CONF}._"
-          lines=[header,""]
-
-          for tour in ["ATP","WTA"]:
-              sub = X[X["tour"]==tour]
-              if sub.empty: continue
-              lines.append(f"## {tour} Picks")
-              for _,r in sub.iterrows():
-                  stake = f" • Stake≈€{BANKROLL*r['kelly']:.2f}" if BANKROLL>0 and r["kelly"]>0 else ""
-                  lines.append(
-                      f"{badge(r['bet'])} — {r['player']} vs {r['opponent']} — {r['odds']:.2f}  \n"
-                      f"p={r['prob']:.2f} • Kelly={r['kelly']:.3f} • TE8={r['te8']:.2f}{stake}  \n"
-                      f"🗓 {ts_fmt(r['start'])} • ETA: {eta_fmt(r['eta'])}"
-                  )
-              lines.append("")
-
-          with open(os.environ.get("GITHUB_STEP_SUMMARY","summary.md"),"w",encoding="utf-8") as f:
-              f.write("\n".join(lines))
-          print("Summary written.")
+          out="\n".join(md)
+          open("outputs/picks_summary.md","w").write(out)
           PY
+
+          if [ "${PUBLISH_MD}" = "yes" ] && [ -f outputs/picks_summary.md ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            cat outputs/picks_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # --- Upload artifacts for download ---
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: value-engine-output
+          path: |
+            value_picks_pro.csv
+            outputs/*.md
+            outputs/*.log
+          if-no-files-found: warn
