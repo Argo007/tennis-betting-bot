@@ -23,6 +23,10 @@ on:
         description: "Grid (min_edge=...;kelly_cap=...;te8_dog=...;te8_fav=...)"
         required: false
         default: "min_edge=0.02,0.03,0.04;kelly_cap=0.10,0.15,0.20;te8_dog=0.58,0.60;te8_fav=0.48,0.50"
+      date_window_days:
+        description: "± days to match odds date to Sackmann (use 21 for Slams)"
+        required: false
+        default: "21"
       use_synth:
         description: "Seed example odds if none found"
         required: true
@@ -57,7 +61,7 @@ jobs:
         run: |
           mkdir -p data/raw/odds data/raw/odds_normalized data
 
-      # Write the seed CSV via Python (no heredoc risk)
+      # write seed CSV via Python (no YAML heredoc issues)
       - name: Seed sample odds if none
         if: ${{ github.event.inputs.use_synth == 'yes' }}
         run: |
@@ -88,6 +92,7 @@ jobs:
       - name: Build dataset (link odds to Sackmann + quick Elo) — always writes headers
         env:
           YEARS_CSV: ${{ github.event.inputs.years_csv }}
+          DATE_WIN: ${{ github.event.inputs.date_window_days }}
         run: |
           python - << 'PY'
           import os, io, time, glob, re, pandas as pd, requests
@@ -95,6 +100,10 @@ jobs:
 
           years = os.getenv("YEARS_CSV") or "2021 2022 2023 2024 2025"
           YEARS = [int(y) for y in years.split()]
+          try:
+              DATE_WIN = int(os.getenv("DATE_WIN") or "21")
+          except:
+              DATE_WIN = 21
 
           def fetch(repo, tour, y):
               url=f"https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{tour}_matches_{y}.csv"
@@ -151,10 +160,10 @@ jobs:
               odds=odds.dropna(subset=["date","player_a","player_b","odds_a","odds_b"])
 
               def link_row(r):
-                  pair=" vs ".join(sorted([norm(r["player_a"]), norm(r["player_b"])]))
-                  cand = results[(results["pair"]==pair) &
-                                 (results["date"].between(r["date"]-pd.Timedelta(days=10),
-                                                          r["date"]+pd.Timedelta(days=10)))]
+                  pair=" vs ".join(sorted([norm(r['player_a']), norm(r['player_b'])]))
+                  start = r["date"] - pd.Timedelta(days=DATE_WIN)
+                  end   = r["date"] + pd.Timedelta(days=DATE_WIN)
+                  cand = results[(results["pair"]==pair) & (results["date"].between(start,end))]
                   if cand.empty: return None
                   m = cand.iloc[(cand["date"]-r["date"]).abs().argsort().iloc[0]]
                   w,l = m["w_norm"], m["l_norm"]
@@ -174,7 +183,7 @@ jobs:
               out = pd.DataFrame(rows, columns=cols)
 
           out.to_csv("data/historical_matches.csv", index=False)  # ALWAYS headers
-          print(f"Linked rows: {len(out)}")
+          print(f"Linked rows: {len(out)} (±{DATE_WIN} days)")
           PY
 
       - name: Backtest (skip gracefully on 0 rows)
@@ -184,7 +193,9 @@ jobs:
             echo "" >> backtest_summary.md
             echo "_Dataset missing or empty._" >> backtest_summary.md
           else
-            N=$(python -c "import pandas as pd; print(len(pd.read_csv('data/historical_matches.csv')))") || N=0
+            N=$(python -c "import pandas as pd; import sys; 
+df=pd.read_csv('data/historical_matches.csv'); 
+print(len(df))" 2>/dev/null || echo 0)
             if [ "$N" = "0" ]; then
               echo "# TE8 Backtest Summary" > backtest_summary.md
               echo "" >> backtest_summary.md
