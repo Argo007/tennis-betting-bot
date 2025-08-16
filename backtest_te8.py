@@ -1,384 +1,352 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Backtest TrueEdge8 + Kelly (live-parity core, with tunable boosts)
-- Reads historical matches with odds & results
-- Uses Elo CSVs: data/atp_elo.csv, data/wta_elo.csv (simple, static Elo)
-- Applies TrueEdge8 (same 7-factor skeleton as live); adds:
-    * recent_form_weight (replaces the 0.30 amplitude in form mapping)
-    * surface_boost (+TE8 if strong surface record last 365d)
-    * injury_penalty (extra global reduction when in injury window)
-- Kelly staking with micro-cap for dogs (0.25 × Kelly)
-- Outputs accuracy %, ROI %, bankroll change, per-surface metrics, and a detailed CSV
-
-INPUT CSV (default: data/historical_matches.csv) must have columns:
-  date (YYYY-MM-DD), tour (ATP/WTA), player, opponent, best_odds, result (1/0)
-Optional: surface (Hard/Clay/Grass/Indoor), home_adv (True/False)
-
-NOTE: Uses static Elo files; for purist backtests, switch to rolling pre-match Elo.
+TrueEdge8 backtest (Sackmann + local odds)
+- Deterministic, CI-safe, no external I/O beyond provided files
+- Chronological processing (no look-ahead)
 """
 
-import os, json, argparse, math
-from datetime import datetime, timedelta
+import argparse, json, math, sys
+from pathlib import Path
+from datetime import datetime
 import pandas as pd
 import numpy as np
 
-# ---------------- CLI ----------------
+
 def parse_args():
-    p = argparse.ArgumentParser("Backtest TrueEdge8 + Kelly (tunable)")
-    p.add_argument("--input", type=str, default="data/historical_matches.csv")
-    p.add_argument("--elo-atp", type=str, default="data/atp_elo.csv")
-    p.add_argument("--elo-wta", type=str, default="data/wta_elo.csv")
-    p.add_argument("--injuries", type=str, default="injuries.json")
-    p.add_argument("--start", type=str, default="2023-01-01")
-    p.add_argument("--end", type=str, default="2025-12-31")
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", required=True, help="data/historical_matches.csv")
+    p.add_argument("--elo-atp", default=None, help="optional Elo snapshot for ATP")
+    p.add_argument("--elo-wta", default=None, help="optional Elo snapshot for WTA")
+    p.add_argument("--injuries", default=None, help="injuries.json (optional)")
 
-    # Gates / bands
-    p.add_argument("--te8-dog", type=float, default=0.60)
-    p.add_argument("--te8-fav", type=float, default=0.50)
-    p.add_argument("--dog-band", type=str, default="1.90,6.00")
-    p.add_argument("--fav-band", type=str, default="1.15,2.00")
-    p.add_argument("--dog-cap", type=float, default=0.25)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
 
-    # Tuners
-    p.add_argument("--recent-form-weight", type=float, default=0.30, help="Amplitude for form factor (0.30 = live parity)")
-    p.add_argument("--surface-boost", type=float, default=0.05, help="Add to TE8 if strong surface (win%>=0.60, >=10 matches last 365d)")
-    p.add_argument("--injury-penalty", type=float, default=0.15, help="Multiply TE8 by (1 - penalty) if player in injury window")
+    p.add_argument("--te8-dog", type=float, required=True)
+    p.add_argument("--te8-fav", type=float, required=True)
 
-    # Bankroll / outputs
+    p.add_argument("--dog-band", default="2.20,4.50")
+    p.add_argument("--fav-band", default="1.15,2.00")
+
+    p.add_argument("--dog-cap", type=float, default=0.25, help="Multiplies Kelly for dogs")
     p.add_argument("--stake-unit", type=float, default=100.0)
     p.add_argument("--bankroll", type=float, default=1000.0)
-    p.add_argument("--out-csv", type=str, default="backtest_results.csv")
-    p.add_argument("--summary", type=str, default="backtest_summary.md")
+
+    p.add_argument("--surface-boost", type=float, default=0.05)
+    p.add_argument("--recent-form-weight", type=float, default=0.30)
+    p.add_argument("--injury-penalty", type=float, default=0.15)
+
+    p.add_argument("--out-csv", default="backtest_results.csv")
+    p.add_argument("--summary", default="backtest_summary.md")
     return p.parse_args()
 
-# ------------- IO Helpers -------------
-def load_csv(path, req=None):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing file: {path}")
-    df = pd.read_csv(path)
-    if req:
-        miss = [c for c in req if c not in df.columns]
-        if miss:
-            raise RuntimeError(f"{path} missing required columns: {miss}")
-    return df
+
+def odds_to_prob(o):
+    if pd.isna(o) or o <= 1.0:
+        return np.nan
+    return 1.0 / o
+
+
+def kelly_fraction(p, b):
+    """
+    Kelly = (bp - q)/b  where b = odds-1, q = 1-p
+    """
+    if not (0 < p < 1) or b <= 0:
+        return 0.0
+    k = (b * p - (1 - p)) / b
+    return max(0.0, float(k))
+
+
+def parse_band(s):
+    try:
+        lo, hi = s.split(",")
+        return float(lo), float(hi)
+    except Exception:
+        return (0.0, 99.0)
+
 
 def load_injuries(path):
-    if not os.path.exists(path):
+    if not path:
         return []
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-# ------------- Elo --------------------
-def elo_rating(df, player):
-    if df.empty: return 1500.0
-    row = df[df["player"] == str(player)]
-    return float(row["elo"].iloc[0]) if not row.empty else 1500.0
-
-def elo_prob(df, p1, p2):
-    e1 = elo_rating(df, p1); e2 = elo_rating(df, p2)
-    return 1.0 / (1.0 + 10.0 ** ((e2 - e1) / 400.0))
-
-# --------- Kelly Fraction -------------
-def kelly_fraction(p, odds):
-    if not (0 <= p <= 1) or odds <= 1: return 0.0
-    b = odds - 1.0
-    return max((odds * p - 1.0) / b, 0.0)
-
-# -------- Injuries Lookup -------------
-def injury_factor_for(player, cur_date, injuries):
-    """
-    injuries: list of dicts with keys: player, start_date, end_date, impact (0..1)
-    Returns a TrueEdge factor mapping: 0.40 + 0.50 * impact
-    """
+    p = Path(path)
+    if not p.exists():
+        return []
     try:
-        p = str(player).lower()
-        for rec in injuries:
-            if str(rec.get("player","")).lower() == p:
-                start = pd.to_datetime(rec.get("start_date"))
-                end   = pd.to_datetime(rec.get("end_date"))
-                if pd.isna(start) or pd.isna(end): 
-                    continue
-                if start <= cur_date <= end:
-                    impact = float(rec.get("impact", 0.90))
-                    impact = min(max(impact, 0.0), 1.0)
-                    return round(0.40 + 0.50 * impact, 2), True
+        with p.open() as f:
+            data = json.load(f)
+        # Normalize
+        out = []
+        for r in data:
+            try:
+                out.append({
+                    "player": str(r["player"]).strip().lower(),
+                    "start": pd.to_datetime(r["start_date"]).normalize(),
+                    "end": pd.to_datetime(r["end_date"]).normalize(),
+                    "impact": float(r.get("impact", 0.15))
+                })
+            except Exception:
+                continue
+        return out
     except Exception:
-        pass
-    return 0.90, False  # neutral+ if no injury
+        return []
 
-# -------- Helpers on history ----------
-def last_matches(hist, player, cur_date, n=10):
-    d = hist[(hist["player"]==player) & (hist["date"]<cur_date)].sort_values("date", ascending=False).head(n)
-    return d
 
-def surface_stats(hist, player, cur_date, surface, window_days=365, min_matches=10):
-    if not isinstance(surface, str) or not surface: 
-        return None
-    start = cur_date - pd.Timedelta(days=window_days)
-    d = hist[(hist["player"]==player) & (hist["date"]<cur_date) &
-             (hist["date"]>=start) & (hist["surface"].astype(str).str.lower()==surface.lower())]
-    if d.empty: return {"n":0,"wr":None}
-    return {"n": len(d), "wr": float(d["result"].mean())}
+def player_injured(inj_list, player_name, date):
+    name = str(player_name).strip().lower()
+    for r in inj_list:
+        if r["player"] == name and r["start"] <= date <= r["end"]:
+            return True, r["impact"]
+    return False, 0.0
 
-# -------- TrueEdge8 (live skeleton + tuners) -----
-def trueedge8_for_match(row, hist_all, cur_date, injuries_list, recent_form_weight=0.30,
-                        surface_boost=0.05, injury_penalty=0.15):
+
+def surface_hint(surf: str):
+    s = (surf or "").strip().lower()
+    if s in ("clay", "cl"):
+        return "clay"
+    if s in ("grass", "gr"):
+        return "grass"
+    if s in ("hard", "hardcourt", "hc", "carpet"):
+        return "hard"
+    return "unknown"
+
+
+def recent_form_boost(form_winrate, weight):
+    # Map [0,1] -> [-weight, +weight], centered at 0.5
+    if np.isnan(form_winrate):
+        return 0.0
+    return weight * (form_winrate - 0.5) * 2.0
+
+
+def surface_boost_factor(surf, weight):
+    # Light, symmetric nudge for surfaces we "like" (placeholder logic)
+    s = surface_hint(surf)
+    if s == "clay":
+        return +weight * 0.5
+    if s == "grass":
+        return +weight * 0.3
+    if s == "hard":
+        return +weight * 0.4
+    return 0.0
+
+
+def te8_score(base_price_edge, elo_edge_bp, surf_boost, form_boost, injury_pen):
     """
-    Base (live parity):
-      form = 0.50 + 0.30*winrate_last10
-      surface = 0.60
-      h2h = 0.55
-      rest = 0.55 (≤1d) / 0.60 (≤4d) / 0.65 (>4d)
-      injury = 0.90 (no injury) or mapped factor if injured
-      stage = 0.55
-      mental = 0.70 if home else 0.60
-
-    Tuners:
-      - recent_form_weight replaces the 0.30 amplitude above
-      - if surface wr ≥ 0.60 and n ≥ 10 in last 365d → add surface_boost to final TE8 (cap at 1.0)
-      - if injured → multiply final TE8 by (1 - injury_penalty)
+    TE8 is a bounded confidence score in [0,1] combining:
+    - price edge (fair vs market)
+    - Elo edge (transformed to ~win prob delta)
+    - surface boost
+    - recent form
+    - injury penalty (applied as negative)
+    All components are squashed and combined then re-bounded to [0,1].
     """
+    # Each term in [-1, +1]-ish
+    x = (
+        0.45 * base_price_edge +
+        0.35 * elo_edge_bp +
+        0.10 * surf_boost +
+        0.10 * form_boost -
+        injury_pen
+    )
+    # squash to (0,1) sigmoid-ish; keep monotonic
+    return float(1.0 / (1.0 + math.exp(-3.5 * x)))
 
-    player = row["player"]
-    surface = row.get("surface", None)
-    home_adv = str(row.get("home_adv","")).lower() in ("1","true","yes")
 
-    # 1) Form via last 10 matches
-    d = last_matches(hist_all, player, cur_date, n=10)
-    if d.empty:
-        form = 0.55
-        last_date = pd.NaT
-    else:
-        wr = float(d["result"].mean())
-        form = 0.50 + recent_form_weight * max(0.0, min(1.0, wr))  # amplitude tunable
-        last_date = d["date"].max()
-
-    # 2) Surface base factor (stays conservative)
-    surface_factor = 0.60
-
-    # 3) H2H (no lookup here) — neutral+
-    h2h = 0.55
-
-    # 4) Rest via days since last match
-    if pd.isna(last_date):
-        rest = 0.60
-    else:
-        days = (cur_date - last_date).days
-        rest = 0.55 if days<=1 else (0.60 if days<=4 else 0.65)
-
-    # 5) Injury factor + flag
-    injury_factor, injured_now = injury_factor_for(player, cur_date, injuries_list)
-
-    # 6) Stage (unknown in most CSVs)
-    stage = 0.55
-
-    # 7) Mental/home
-    mental = 0.70 if home_adv else 0.60
-
-    base_te8 = (form + surface_factor + h2h + rest + injury_factor + stage + mental) / 7.0
-
-    # Apply tuners:
-    # Surface boost if strong on this surface in last 365d
-    if isinstance(surface, str) and surface:
-        ss = surface_stats(hist_all, player, cur_date, surface, window_days=365, min_matches=10)
-        if ss and ss["n"] >= 10 and ss["wr"] is not None and ss["wr"] >= 0.60 and surface_boost > 0:
-            base_te8 = min(1.0, base_te8 + surface_boost)
-
-    # Extra injury penalty (global) if injured
-    if injured_now and injury_penalty > 0:
-        base_te8 = max(0.0, base_te8 * (1.0 - injury_penalty))
-
-    # Factor details for analysis
-    detail = {
-        "te_form": round(form,2),
-        "te_surface": round(surface_factor,2),
-        "te_h2h": round(h2h,2),
-        "te_rest": round(rest,2),
-        "te_injury": round(injury_factor,2),
-        "te_stage": round(stage,2),
-        "te_mental": round(mental,2),
-        "te_surface_boost_applied": 1 if (isinstance(surface,str) and surface and ss and ss["n"]>=10 and ss["wr"]>=0.60 and surface_boost>0) else 0,
-        "te_injury_penalty_applied": 1 if injured_now and injury_penalty>0 else 0
-    }
-    return round(base_te8,2), detail
-
-# --------------- Main -----------------
 def main():
     args = parse_args()
 
-    # Parse bands & thresholds
-    dog_min, dog_max = map(float, args.dog_band.split(","))
-    fav_min, fav_max = map(float, args.fav_band.split(","))
+    # Load dataset
+    df = pd.read_csv(args.input)
+    # Expected input columns from the build workflow:
+    # date,tour,tournament,round,player,opponent,odds,opp_odds,result,elo_player,elo_opponent,source
+    for c in ["date","tour","player","opponent","odds","result"]:
+        if c not in df.columns:
+            print(f"::error ::Missing column '{c}' in {args.input}", file=sys.stderr)
+            sys.exit(1)
 
-    # Load data
-    hist = load_csv(args.input, ["date","tour","player","opponent","best_odds","result"])
-    atp = load_csv(args.elo_atp, ["player","elo"])
-    wta = load_csv(args.elo_wta, ["player","elo"])
-    injuries_list = load_injuries(args.injuries)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    df = df[(df["date"] >= start) & (df["date"] <= end)].copy()
 
-    # Types / parse
-    hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
-    hist = hist.dropna(subset=["date"])
-    hist = hist[(hist["date"] >= pd.to_datetime(args.start)) & (hist["date"] <= pd.to_datetime(args.end))]
-    for c in ["best_odds","result"]:
-        hist[c] = pd.to_numeric(hist[c], errors="coerce")
-    hist["surface"] = hist.get("surface", "")
-    hist = hist.dropna(subset=["best_odds","result"])
+    # Odds bands
+    dog_lo, dog_hi = parse_band(args.dog_band)
+    fav_lo, fav_hi = parse_band(args.fav_band)
 
-    # Sort by date
-    hist = hist.sort_values("date").reset_index(drop=True)
+    # Implied probabilities
+    df["implied_prob"] = df["odds"].apply(odds_to_prob)
 
-    logs = []
+    # Optional Elo snapshots (not required, build already gives per-match pre ELOs)
+    # If snapshot files exist, we won't override per-match pre ratings; we’ll just ensure columns exist.
+    if "elo_player" not in df.columns or "elo_opponent" not in df.columns:
+        df["elo_player"] = 1500.0
+        df["elo_opponent"] = 1500.0
+
+    # Prepare injury list
+    injuries = load_injuries(args.injuries)
+
+    # Recent form tracking (rolling last N=10 outcomes for each player BEFORE current match)
+    N_FORM = 10
+    df = df.sort_values(["date", "tour", "player"]).reset_index(drop=True)
+    form_map = {}  # key=(tour, player) -> list of last N results (1/0)
+
+    form_rates = []
+    for i, r in df.iterrows():
+        key = (r["tour"], r["player"])
+        hist = form_map.get(key, [])
+        # winrate BEFORE this match
+        winrate = np.mean(hist) if hist else np.nan
+        form_rates.append(winrate)
+        # update history with current result (no look-ahead)
+        res = r.get("result", np.nan)
+        if pd.notna(res):
+            hist = (hist + [int(res)])[-N_FORM:]
+            form_map[key] = hist
+
+    df["recent_form_wr"] = form_rates
+
+    # Price edge vs "fair" prob from Elo (soft transform): convert Elo diff -> expected prob
+    # Logistic transform: p = 1 / (1 + 10^(-elo_diff/400))
+    elo_diff = df["elo_player"].astype(float) - df["elo_opponent"].astype(float)
+    df["p_elo"] = 1.0 / (1.0 + 10 ** (-(elo_diff / 400.0)))
+
+    # Base price edge in [-1,+1]: (p_elo - p_market) / max(p_market, 1e-6)
+    df["price_edge"] = (df["p_elo"] - df["implied_prob"]) / df["implied_prob"].clip(lower=1e-6)
+
+    # Elo edge in "bp" units: center to ~[-1,+1]
+    df["elo_edge_bp"] = (elo_diff / 200.0).clip(-2.0, 2.0) / 2.0  # scale 200 Elo ~ 0.5
+
+    # Tuners
+    df["surf_boost"] = df.get("surface", "").apply(lambda s: surface_boost_factor(s, args.surface_boost))
+    df["form_boost"] = df["recent_form_wr"].apply(lambda wr: recent_form_boost(wr, args.recent_form_weight))
+
+    # Injury penalty per match (only for our selected player)
+    inj_pen = []
+    for _, r in df.iterrows():
+        inj, imp = player_injured(injuries, r["player"], r["date"])
+        inj_pen.append(args.injury_penalty * imp if inj else 0.0)
+    df["inj_pen"] = inj_pen
+
+    # TE8 score
+    df["te8"] = df.apply(
+        lambda r: te8_score(
+            base_price_edge=float(r["price_edge"]) if pd.notna(r["price_edge"]) else 0.0,
+            elo_edge_bp=float(r["elo_edge_bp"]) if pd.notna(r["elo_edge_bp"]) else 0.0,
+            surf_boost=float(r["surf_boost"]) if pd.notna(r["surf_boost"]) else 0.0,
+            form_boost=float(r["form_boost"]) if pd.notna(r["form_boost"]) else 0.0,
+            injury_pen=float(r["inj_pen"]) if pd.notna(r["inj_pen"]) else 0.0,
+        ),
+        axis=1
+    )
+
+    # Classify dog/fav by odds
+    df["is_dog"] = df["odds"] >= 2.00
+
+    # Band filters
+    dog_mask = (df["odds"] >= dog_lo) & (df["odds"] <= dog_hi)
+    fav_mask = (df["odds"] >= fav_lo) & (df["odds"] <= fav_hi)
+
+    # Entry rules by TE8 threshold
+    df["entry"] = False
+    df.loc[df["is_dog"] & dog_mask & (df["te8"] >= args.te8_dog), "entry"] = True
+    df.loc[(~df["is_dog"]) & fav_mask & (df["te8"] >= args.te8_fav), "entry"] = True
+
+    # Kelly staking per entry
     bankroll = float(args.bankroll)
+    stakes = []
+    kfracs = []
+    profits = []
+    bankrolls = []
 
-    for _, row in hist.iterrows():
-        tour = str(row["tour"]).upper()
-        elo_df = atp if tour == "ATP" else wta
-        date = row["date"]
-        player = str(row["player"]); opponent = str(row["opponent"])
-        odds = float(row["best_odds"])
-        y = int(row["result"])
-
-        if not (odds > 1.0):
+    for _, r in df.iterrows():
+        if not bool(r["entry"]):
+            stakes.append(0.0)
+            kfracs.append(0.0)
+            profits.append(0.0)
+            bankrolls.append(bankroll)
             continue
 
-        # Elo probability
-        p = elo_prob(elo_df, player, opponent)
+        p_est = float(r["te8"])  # using TE8 as confidence proxy in [0,1]
+        b = float(r["odds"]) - 1.0
+        k = kelly_fraction(p_est, b)
 
-        # TE8 score (with tuners)
-        te8, te_detail = trueedge8_for_match(
-            {"player": player, "surface": row.get("surface",""), "home_adv": row.get("home_adv", None)},
-            hist, date, injuries_list,
-            recent_form_weight=args.recent_form_weight,
-            surface_boost=args.surface_boost,
-            injury_penalty=args.injury_penalty
-        )
+        if r["is_dog"]:
+            k *= args.dog_cap  # micro-cap on dogs
 
-        # Kelly
-        k = kelly_fraction(p, odds)
+        stake = bankroll * k
+        stake = min(stake, args.stake_unit)  # optional safety: cap absolute unit (keeps runs realistic)
+        # P/L
+        res = int(r["result"])
+        profit = (r["odds"] - 1.0) * stake if res == 1 else -stake
 
-        # Dog micro-cap
-        is_dog = (dog_min <= odds <= dog_max)
-        is_fav = (fav_min <= odds <= fav_max)
-        if is_dog and k > 0:
-            k = args.dog_cap * k
+        bankroll += profit
+        stakes.append(float(stake))
+        kfracs.append(float(k))
+        profits.append(float(profit))
+        bankrolls.append(float(bankroll))
 
-        # TE8 gate
-        te_thresh = args.te8_dog if is_dog else args.te8_fav
-        bet = (k > 0) and (te8 >= te_thresh)
+    df["kelly_fraction"] = kfracs
+    df["stake"] = stakes
+    df["pnl"] = profits
+    df["bankroll"] = bankrolls
 
-        # Flat 1u P/L if bet
-        profit_flat = (odds - 1.0) if (bet and y == 1) else (-1.0 if bet else 0.0)
+    # Keep only useful output cols (concise)
+    out_cols = [
+        "date","tour","tournament","round","player","opponent",
+        "odds","implied_prob","p_elo","price_edge","elo_player","elo_opponent",
+        "recent_form_wr","surf_boost","inj_pen","te8","is_dog","entry",
+        "kelly_fraction","stake","result","pnl","bankroll","source"
+    ]
+    existing = [c for c in out_cols if c in df.columns]
+    out = df[existing].copy()
+    out = out.sort_values(["date","tour","player"]).reset_index(drop=True)
 
-        # Kelly bankroll sim
-        stake = 0.0
-        if bet and bankroll > 0:
-            stake = bankroll * k
-            bankroll += stake * (odds - 1.0) if y == 1 else -stake
+    Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.out_csv, index=False)
 
-        logs.append({
-            "date": date.date(),
-            "tour": tour,
-            "surface": row.get("surface",""),
-            "player": player,
-            "opponent": opponent,
-            "odds": round(odds,2),
-            "prob": round(p,3),
-            "kelly": round(k,4),
-            "te8": round(te8,2),
-            "bet": bool(bet),
-            "result": int(y),
-            "profit_flat_u": profit_flat,   # units
-            "stake_kelly_eur": round(stake,2),
-            # factor breakdown
-            **te_detail
-        })
+    # Metrics
+    picks = out[out["entry"]]
+    n_picks = len(picks)
+    wins = int(picks["result"].sum()) if n_picks else 0
+    hitrate = wins / n_picks if n_picks else 0.0
+    roi = picks["pnl"].sum() / picks["stake"].sum() if n_picks and picks["stake"].sum() > 0 else 0.0
+    end_bankroll = float(out["bankroll"].iloc[-1]) if len(out) else args.bankroll
+    max_dd = 0.0
+    if n_picks:
+        equity = picks["bankroll"].tolist()
+        peak = equity[0] if equity else args.bankroll
+        for v in equity:
+            peak = max(peak, v)
+            dd = (peak - v) / peak if peak > 0 else 0.0
+            max_dd = max(max_dd, dd)
 
-    if not logs:
-        print("No rows processed or no bets generated. Check inputs and thresholds.")
-        return
+    # Summary MD
+    md = []
+    md.append(f"# TE8 Backtest Summary")
+    md.append("")
+    md.append(f"- Period: **{args.start} → {args.end}**")
+    md.append(f"- TE8 thresholds: **dogs={args.te8_dog:.2f}**, **favs={args.te8_fav:.2f}**")
+    md.append(f"- Bands: **dogs={args.dog_band}**, **favs={args.fav_band}**")
+    md.append(f"- Bankroll start: **€{args.bankroll:,.2f}**")
+    md.append(f"- Stake unit cap: **€{args.stake_unit:,.2f}**")
+    md.append(f"- Dog micro-cap × Kelly: **{args.dog_cap:.2f}x**")
+    md.append("")
+    md.append(f"## Results")
+    md.append(f"- Picks: **{n_picks}** | Wins: **{wins}** | Hit rate: **{hitrate:.1%}**")
+    md.append(f"- ROI on staked: **{roi:.2%}**")
+    md.append(f"- Ending bankroll: **€{end_bankroll:,.2f}**")
+    md.append(f"- Max drawdown: **{max_dd:.1%}**")
+    md.append("")
+    md.append(f"## Tuners")
+    md.append(f"- Surface boost: **{args.surface_boost:.2f}**")
+    md.append(f"- Recent form weight: **{args.recent_form_weight:.2f}**")
+    md.append(f"- Injury penalty: **{args.injury_penalty:.2f}**")
+    md.append("")
+    md.append(f"_Data: {Path(args.input).as_posix()} | Output: {Path(args.out_csv).as_posix()}_")
 
-    R = pd.DataFrame(logs)
-    B = R[R["bet"] == True].copy()
-    total_bets = len(B)
-    if total_bets == 0:
-        print("No bets passed filters (TE8/Kelly). Relax thresholds or check data.")
-        return
+    Path(args.summary).write_text("\n".join(md), encoding="utf-8")
 
-    # Core metrics
-    hit_rate = B["result"].mean()
-    roi_flat = B["profit_flat_u"].mean()
-    profit_flat_total = B["profit_flat_u"].sum()
-    final_bankroll = bankroll
-    roi_kelly = (final_bankroll - float(args.bankroll)) / float(args.bankroll) if args.bankroll > 0 else np.nan
-    avg_kelly = B["kelly"].mean()
+    print(f"Wrote {args.out_csv} and {args.summary}")
 
-    # Brier / Log-loss
-    def brier(p, y): return (p - y) ** 2
-    def logloss(p, y, eps=1e-12):
-        p = min(max(p, eps), 1 - eps)
-        return -(y * math.log(p) + (1 - y) * math.log(1 - p))
-    B["brier"] = [brier(p, y) for p, y in zip(B["prob"], B["result"])]
-    B["logloss"] = [logloss(p, y) for p, y in zip(B["prob"], B["result"])]
-    brier_mean = B["brier"].mean()
-    logloss_mean = B["logloss"].mean()
-
-    # Odds buckets
-    bins = [1.0, 1.5, 2.0, 3.0, 6.0, 20.0]
-    B["odds_bin"] = pd.cut(B["odds"], bins=bins, right=True)
-    bucket = B.groupby("odds_bin").agg(
-        bets=("odds","count"),
-        hit=("result","mean"),
-        avg_odds=("odds","mean"),
-        avg_prob=("prob","mean"),
-        roi_flat=("profit_flat_u","mean")
-    ).reset_index()
-
-    # Surface metrics
-    surf = B.copy()
-    if "surface" in surf.columns:
-        surf["surface"] = surf["surface"].astype(str).str.title()
-        surf_summary = surf.groupby("surface").agg(
-            bets=("odds","count"),
-            hit=("result","mean"),
-            avg_odds=("odds","mean"),
-            roi_flat=("profit_flat_u","mean")
-        ).reset_index()
-    else:
-        surf_summary = pd.DataFrame(columns=["surface","bets","hit","avg_odds","roi_flat"])
-
-    # Summary text
-    lines = []
-    lines.append(f"### Backtest — TrueEdge8 + Kelly (tunable)")
-    lines.append(f"- Period: {R['date'].min()} to {R['date'].max()}")
-    lines.append(f"- Total bets: **{total_bets}**")
-    lines.append(f"- **Hit rate:** {hit_rate*100:.1f}%")
-    lines.append(f"- **ROI (flat 1u):** {roi_flat*100:.2f}% per bet (Total: {profit_flat_total:.2f}u)")
-    if not np.isnan(roi_kelly):
-        lines.append(f"- **ROI (Kelly sim):** {roi_kelly*100:.2f}% (Final bankroll: €{final_bankroll:.2f})")
-    lines.append(f"- **Avg Kelly fraction (post dog-cap):** {avg_kelly:.3f}")
-    lines.append(f"- **Brier:** {brier_mean:.3f}  •  **Logloss:** {logloss_mean:.3f}")
-    lines.append("")
-    lines.append("#### By odds band (bets | hit% | avg_odds | avg_p | ROI flat per bet)")
-    for _, b in bucket.iterrows():
-        lines.append(f"- {b['odds_bin']}: {int(b['bets'])} | {b['hit']*100:.1f}% | {b['avg_odds']:.2f} | {b['avg_prob']:.2f} | {b['roi_flat']*100:.2f}%")
-
-    if not surf_summary.empty:
-        lines.append("")
-        lines.append("#### By surface (bets | hit% | avg_odds | ROI flat per bet)")
-        for _, s in surf_summary.iterrows():
-            lines.append(f"- {s['surface']}: {int(s['bets'])} | {s['hit']*100:.1f}% | {s['avg_odds']:.2f} | {s['roi_flat']*100:.2f}%")
-
-    summary_text = "\n".join(lines)
-    print(summary_text)
-
-    # Write outputs
-    B.sort_values(["date","tour"], inplace=True)
-    B.to_csv(args.out_csv, index=False)
-    with open(args.summary, "w", encoding="utf-8") as f:
-        f.write(summary_text)
 
 if __name__ == "__main__":
     main()
