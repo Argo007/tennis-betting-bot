@@ -57,20 +57,19 @@ jobs:
         run: |
           mkdir -p data/raw/odds data/raw/odds_normalized data
 
-      # ----- NO HEREDOCS: write the seed CSV with Python -----
+      # Write the seed CSV via Python (no heredoc risk)
       - name: Seed sample odds if none
         if: ${{ github.event.inputs.use_synth == 'yes' }}
         run: |
           python - << 'PY'
           import os, csv
-          path1 = "data/raw/odds"
-          path2 = "data/raw/odds_normalized"
-          has_files = any(os.scandir(path1)) if os.path.isdir(path1) else False
-          has_norm  = any(os.scandir(path2)) if os.path.isdir(path2) else False
-          if has_files or has_norm:
+          p1, p2 = "data/raw/odds", "data/raw/odds_normalized"
+          has_odds = os.path.isdir(p1) and any(os.scandir(p1))
+          has_norm = os.path.isdir(p2) and any(os.scandir(p2))
+          if has_odds or has_norm:
               print("Local odds exist, skipping seed.")
           else:
-              os.makedirs(path1, exist_ok=True)
+              os.makedirs(p1, exist_ok=True)
               rows = [
                 ["date","player_a","player_b","odds_a","odds_b"],
                 ["2023-06-11","Novak Djokovic","Casper Ruud","1.33","3.40"],
@@ -81,7 +80,7 @@ jobs:
                 ["2023-07-15","Marketa Vondrousova","Ons Jabeur","2.30","1.65"],
                 ["2024-07-13","Barbora Krejcikova","Jasmine Paolini","1.60","2.40"],
               ]
-              with open(os.path.join(path1,"sample_odds.csv"), "w", newline="", encoding="utf-8") as f:
+              with open(os.path.join(p1,"sample_odds.csv"), "w", newline="", encoding="utf-8") as f:
                   csv.writer(f).writerows(rows)
               print("Seeded data/raw/odds/sample_odds.csv")
           PY
@@ -185,12 +184,8 @@ jobs:
             echo "" >> backtest_summary.md
             echo "_Dataset missing or empty._" >> backtest_summary.md
           else
-            python - << 'PY'
-            import pandas as pd
-            df=pd.read_csv("data/historical_matches.csv")
-            open("nrows.txt","w").write(str(len(df)))
-            PY
-            if [ "$(cat nrows.txt)" = "0" ]; then
+            N=$(python -c "import pandas as pd; print(len(pd.read_csv('data/historical_matches.csv')))") || N=0
+            if [ "$N" = "0" ]; then
               echo "# TE8 Backtest Summary" > backtest_summary.md
               echo "" >> backtest_summary.md
               echo "_No rows to backtest (0 linked games)._" >> backtest_summary.md
@@ -204,6 +199,7 @@ jobs:
                 --out-csv backtest_results.csv \
                 --summary backtest_summary.md
             fi
+          fi
 
       - name: Job summary
         run: |
