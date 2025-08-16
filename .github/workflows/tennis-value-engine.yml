@@ -2,44 +2,44 @@ name: Tennis Value Engine (Daily Picks)
 
 on:
   schedule:
-    - cron: "0 7 * * *"        # daily 07:00 UTC
+    - cron: "0 7 * * *"      # daily 07:00 UTC
   workflow_dispatch:
     inputs:
       region:
-        description: "Feed region for picks_pro (e.g., EU/US)"
+        description: "Feed region (picks_pro)"
         required: false
         default: "EU"
       lookahead_h:
-        description: "Odds freshness window (hours) -> picks_pro --lookahead-h"
+        description: "Odds freshness window (hours)"
         required: false
         default: "6"
       kelly:
-        description: "Kelly fraction sent to picks_pro (picks_pro may ignore if not used)"
+        description: "Kelly fraction sent to picks_pro (if used)"
         required: false
         default: "1.0"
       # Engine controls
       min_edge:
-        description: "Engine: minimum edge (e.g., 0.03 = 3%)"
+        description: "Minimum edge (e.g., 0.03 = 3%)"
         required: false
         default: "0.03"
       kelly_cap:
-        description: "Engine: Kelly cap (fraction of full Kelly)"
+        description: "Kelly cap (fraction of full Kelly)"
         required: false
         default: "0.20"
       max_risk:
-        description: "Engine: max fraction of bankroll per bet"
+        description: "Max bankroll fraction per bet"
         required: false
         default: "0.05"
       bankroll:
-        description: "Engine: bankroll (€)"
+        description: "Bankroll (€)"
         required: false
         default: "1000"
       max_picks:
-        description: "Engine: top N picks to output"
+        description: "Top N to output"
         required: false
         default: "20"
       publish_md:
-        description: "Publish markdown summary to job log?"
+        description: "Publish markdown to job log?"
         required: true
         type: choice
         default: "yes"
@@ -80,33 +80,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests pyyaml tabulate openpyxl matplotlib unidecode rapidfuzz
 
-      - name: Verify scripts present
+      - name: Locate scripts (root or scripts/)
+        id: locate
+        shell: bash
         run: |
-          test -f tennis_value_picks_pro.py || { echo "::error ::tennis_value_picks_pro.py missing"; exit 1; }
-          test -f tennis_value_engine.py    || { echo "::error ::tennis_value_engine.py missing"; exit 1; }
+          set -e
+          P1=$(git ls-files 'tennis_value_picks_pro.py' 'scripts/tennis_value_picks_pro.py' | head -n1 || true)
+          P2=$(git ls-files 'tennis_value_engine.py'    'scripts/tennis_value_engine.py'    | head -n1 || true)
+          echo "picks_pro_path=$P1" >> $GITHUB_OUTPUT
+          echo "engine_path=$P2"    >> $GITHUB_OUTPUT
+          echo "Found picks_pro at: ${P1:-<missing>}"
+          echo "Found engine    at: ${P2:-<missing>}"
+          if [ -z "$P1" ]; then echo "::error ::tennis_value_picks_pro.py missing (root or scripts/)"; exit 1; fi
+          if [ -z "$P2" ]; then echo "::error ::tennis_value_engine.py missing (root or scripts/)"; exit 1; fi
           mkdir -p outputs
 
-      # 1) Build candidate list
       - name: Run picks_pro (build candidates)
         shell: bash
         run: |
           set -euo pipefail
-          echo "Running picks_pro…" | tee outputs/engine_run.log
-          python tennis_value_picks_pro.py \
+          echo "Running ${{ steps.locate.outputs.picks_pro_path }}…" | tee outputs/engine_run.log
+          python "${{ steps.locate.outputs.picks_pro_path }}" \
             --region "${REGION}" \
             --lookahead-h "${LOOKAHEAD_H}" \
             --kelly "${KELLY}" \
             --out value_picks_pro.csv 2>&1 | tee -a outputs/engine_run.log
-          # Keep pipeline alive even if zero rows
           test -f value_picks_pro.csv || echo "date,player,opponent,odds,model_conf,book_count" > value_picks_pro.csv
 
-      # 2) Decide + size bets
       - name: Run decision engine
         shell: bash
         run: |
           set -euo pipefail
-          echo "Running engine…" | tee -a outputs/engine_run.log
-          python tennis_value_engine.py \
+          echo "Running ${{ steps.locate.outputs.engine_path }}…" | tee -a outputs/engine_run.log
+          python "${{ steps.locate.outputs.engine_path }}" \
             --input value_picks_pro.csv \
             --elo-atp data/atp_elo.csv \
             --elo-wta data/wta_elo.csv \
