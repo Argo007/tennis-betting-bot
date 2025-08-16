@@ -2,13 +2,13 @@ name: Courtsense (Build + optional Backtest)
 
 on:
   schedule:
-    - cron: "0 8 * * *"
+    - cron: "0 8 * * *"   # Daily build at 08:00 UTC
   workflow_dispatch:
     inputs:
       years_csv:
         description: "Years to fetch (space-separated)"
         required: false
-        default: "2024"
+        default: "2021 2022 2023 2024"
       do_backtest:
         description: "Run TE8 backtest after build?"
         required: true
@@ -18,7 +18,7 @@ on:
       start_date:
         description: "Backtest start (YYYY-MM-DD)"
         required: false
-        default: "2024-01-01"
+        default: "2021-01-01"
       end_date:
         description: "Backtest end (YYYY-MM-DD)"
         required: false
@@ -46,7 +46,7 @@ on:
 
 env:
   TZ: Europe/Amsterdam
-  YEARS_CSV: ${{ github.event.inputs.years_csv || '2024' }}
+  YEARS_CSV: ${{ github.event.inputs.years_csv || '2021 2022 2023 2024' }}
 
 permissions:
   contents: read
@@ -266,10 +266,8 @@ jobs:
           }
           with open(META,"w") as f: json.dump(meta,f)
 
-          # build summary
           lines = []
-          lines.append("# Build summary")
-          lines.append("")
+          lines.append("# Build summary\n")
           lines.append(f"- Years: **{YEARS}**")
           lines.append("- Sackmann pulls:")
           for (tour, y), n in sorted(year_counts.items()):
@@ -283,11 +281,13 @@ jobs:
               head = linked.head(10).to_markdown(index=False)
               lines.append("\n<details><summary>Sample (first 10 rows)</summary>\n\n"+head+"\n\n</details>")
           else:
-              lines.append("> No linked rows. Check that:")
-              lines.append("  1. Odds files are in `data/raw/odds/` (CSV/XLSX).")
-              lines.append("  2. Columns exist: `date, player_a, player_b, odds_a, odds_b` (case-insensitive ok).")
-              lines.append("  3. The odds dates are within ±7 days of the match dates.")
-              lines.append("  4. Names are close after ASCII folding (e.g., 'Rafael Nadal', not nicknames).")
+              lines += [
+                "> No linked rows. Check that:",
+                "  1. Odds files are in `data/raw/odds/` (CSV/XLSX).",
+                "  2. Columns exist: `date, player_a, player_b, odds_a, odds_b` (case-insensitive ok).",
+                "  3. Odds dates are within ±7 days of the match dates.",
+                "  4. Names are close after ASCII folding (e.g., 'Rafael Nadal', not nicknames)."
+              ]
           with open(BUILD_MD, "w") as f: f.write("\n".join(lines))
           print("[DONE] Build summary saved.")
           PY
