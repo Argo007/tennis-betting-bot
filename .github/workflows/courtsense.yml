@@ -2,7 +2,7 @@ name: Courtsense (Build + Normalize + Backtest)
 
 on:
   schedule:
-    - cron: "0 8 * * *" # Daily at 08:00 UTC
+    - cron: "0 8 * * *"   # Daily at 08:00 UTC
   workflow_dispatch:
     inputs:
       years_csv:
@@ -59,6 +59,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,7 +67,7 @@ jobs:
 
       - name: Prepare requirements
         run: |
-          printf "pandas\nnumpy\nrequests\nopenpyxl\nrapidfuzz\npython-dateutil\nUnidecode\n" > requirements.txt
+          printf "pandas\nnumpy\nrequests\nopenpyxl\nrapidfuzz\npython-dateutil\nUnidecode\ntabulate\n" > requirements.txt
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -80,7 +81,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Optional: seed tiny odds so you always see something
       - name: Seed sample odds if none present
         run: |
           mkdir -p data/raw/odds
@@ -113,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, io, sys, glob, json, re, time
+          import os, glob, json, re, time
           from datetime import datetime
           import requests, pandas as pd
           from rapidfuzz import fuzz, process
@@ -256,6 +256,12 @@ jobs:
                 "date_max": (linked["date"].max().isoformat() if len(linked) else None)}
           with open(META,"w") as f: json.dump(meta,f)
 
+          def safe_table(df):
+              try:
+                  return df.to_markdown(index=False)
+              except Exception:
+                  return df.to_csv(index=False)
+
           lines=[]
           lines.append("# Build summary\n")
           lines.append(f"- Years: **{YEARS}**")
@@ -270,10 +276,10 @@ jobs:
           if len(linked):
               lines.append(f"- Dataset date range: **{linked['date'].min()} → {linked['date'].max()}**")
               lines.append(f"- Unique players: **{linked['player'].nunique()}**")
-              head=linked.head(10).to_markdown(index=False)
+              head=safe_table(linked.head(10))
               lines.append("\n<details><summary>Sample (first 10 rows)</summary>\n\n"+head+"\n\n</details>")
           elif not unmatched.empty:
-              miss = unmatched.head(10).to_markdown(index=False)
+              miss=safe_table(unmatched.head(10))
               lines.append("\n<details><summary>Unmatched sample (first 10)</summary>\n\n"+miss+"\n\n</details>")
           else:
               lines.append("> No linked rows and no unmatched sample available.")
@@ -313,6 +319,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
