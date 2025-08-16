@@ -12,8 +12,8 @@ on:
       do_backtest:
         description: "Run TE8 backtest after build?"
         required: true
-        default: "yes"
         type: choice
+        default: "yes"
         options: ["yes","no"]
       start_date:
         description: "Backtest start (YYYY-MM-DD)"
@@ -73,7 +73,7 @@ jobs:
         uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Prepare requirements (lean)
+      - name: Prepare requirements
         run: |
           printf "pandas\nrequests\nopenpyxl\nrapidfuzz\npython-dateutil\nUnidecode\n" > requirements.txt
 
@@ -103,6 +103,7 @@ jobs:
           from rapidfuzz import fuzz, process
           from unidecode import unidecode
 
+          # ------------ config ------------
           YEARS = [int(y) for y in os.getenv("YEARS_CSV","2024").split() if y.strip().isdigit()]
           ODDS_DIR = "data/raw/odds"
           OUT_CSV  = "data/historical_matches.csv"
@@ -110,55 +111,49 @@ jobs:
           WTA_ELO  = "data/wta_elo.csv"
           META     = "data/dataset_info.json"
 
-          # columns we always promise downstream
-          OUTPUT_COLUMNS = [
-              "date","tour","tournament","round",
-              "player","opponent","odds","opp_odds",
-              "result","elo_player","elo_opponent","source"
-          ]
+          OUTPUT_COLUMNS = ["date","tour","tournament","round","player","opponent",
+                            "odds","opp_odds","result","elo_player","elo_opponent","source"]
 
-          REQ_TIMEOUT = 12   # seconds
+          REQ_TIMEOUT = 12
           RETRIES     = 3
-          SLEEP_BACKOFF = [0, 1.5, 3.0]
+          BACKOFF     = [0, 1.5, 3.0]
 
-          def norm_name(s: str) -> str:
+          # ------------ utils ------------
+          def norm_name(s):
               if not isinstance(s, str): return ""
               s = unidecode(s).lower()
               s = re.sub(r"[^a-z ]", " ", s)
-              s = re.sub(r"\s+", " ", s).strip()
-              return s
+              return re.sub(r"\s+"," ",s).strip()
 
           def safe_date(x):
               if pd.isna(x): return pd.NaT
-              try: return pd.to_datetime(x).normalize()
-              except:
-                  try: return pd.to_datetime(parser.parse(str(x))).normalize()
-                  except: return pd.NaT
+              for fn in (pd.to_datetime, lambda z: pd.to_datetime(parser.parse(str(z)))):
+                  try: return fn(x).normalize()
+                  except: pass
+              return pd.NaT
 
-          def fetch_csv_with_retry(url: str) -> pd.DataFrame:
-              last = None
+          def fetch_csv(url):
+              err = None
               for i in range(RETRIES):
                   try:
                       r = requests.get(url, timeout=REQ_TIMEOUT)
                       r.raise_for_status()
                       return pd.read_csv(io.StringIO(r.text))
                   except Exception as e:
-                      last = e
-                      time.sleep(SLEEP_BACKOFF[min(i, len(SLEEP_BACKOFF)-1)])
-              raise RuntimeError(f"Failed to fetch after {RETRIES} tries: {url} ({last})")
+                      err = e; time.sleep(BACKOFF[min(i,len(BACKOFF)-1)])
+              raise RuntimeError(f"Fetch failed {url}: {err}")
 
+          # ------------ data ------------
           def fetch_sackmann():
               frames=[]
               for tour, repo in [("ATP","tennis_atp"),("WTA","tennis_wta")]:
                   for y in YEARS:
                       url=f"https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{tour.lower()}_matches_{y}.csv"
-                      print(f"[DL] {tour} {y} ...", flush=True)
-                      df=fetch_csv_with_retry(url)
-                      df["tour"]=tour
-                      frames.append(df)
+                      print(f"[DL] {tour} {y}")
+                      df=fetch_csv(url); df["tour"]=tour; frames.append(df)
               res=pd.concat(frames, ignore_index=True)
               res["tourney_date"]=pd.to_datetime(res["tourney_date"].astype(str), format="%Y%m%d", errors="coerce")
-              keep=["tour","tourney_name","tourney_date","surface","round","winner_name","loser_name","score","best_of","minutes"]
+              keep=["tour","tourney_name","tourney_date","surface","round","winner_name","loser_name"]
               for k in keep:
                   if k not in res.columns: res[k]=pd.NA
               res=res[keep].copy()
@@ -190,14 +185,14 @@ jobs:
                            glob.glob(os.path.join(ODDS_DIR,"**/*.xlsx"),recursive=True)+
                            glob.glob(os.path.join(ODDS_DIR,"**/*.xls"),recursive=True))
               if not files:
-                  print("[WARN] No local odds in data/raw/odds/* — continuing with zero rows.", file=sys.stderr)
+                  print("[WARN] No local odds in data/raw/odds/* — continuing with empty dataset.")
                   return pd.DataFrame(columns=["date","player_a","player_b","odds_a","odds_b","a_norm","b_norm","source"])
               frames=[]
               for path in files:
                   try:
                       df=pd.read_excel(path) if path.lower().endswith((".xlsx",".xls")) else pd.read_csv(path)
                   except Exception as e:
-                      print(f"[WARN] skip {path}: {e}", file=sys.stderr); continue
+                      print(f"[WARN] skip {path}: {e}"); continue
                   lower={c.lower():c for c in df.columns}
                   def pick(*opts):
                       for o in opts:
@@ -211,7 +206,7 @@ jobs:
                   c_market=pick("market","bettype","bet_type")
                   c_src=pick("book","bookmaker","source")
                   if None in (c_date,c_pa,c_pb,c_odds_a,c_odds_b):
-                      print(f"[WARN] {path}: missing required headers, skipping.", file=sys.stderr); continue
+                      print(f"[WARN] {path}: missing required headers, skipping."); continue
                   tmp=pd.DataFrame({
                       "date":pd.to_datetime(df[c_date].apply(safe_date)),
                       "player_a":df[c_pa].astype(str),
@@ -230,8 +225,7 @@ jobs:
               return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
           def link_odds(res, elo_hist, odds):
-              if odds is None or odds.empty:
-                  return empty_output_df()
+              if odds is None or odds.empty: return empty_output_df()
               res_small=res[["tour","date","tourney_name","round","w_norm","l_norm","pair_norm_sorted"]].copy()
               out=[]
               for _,o in odds.iterrows():
@@ -275,23 +269,18 @@ jobs:
               return pd.DataFrame(out, columns=OUTPUT_COLUMNS) if out else empty_output_df()
 
           print(f"[SETUP] Years: {YEARS}")
-          print("[1/4] Fetching Sackmann..."); res=fetch_sackmann(); print(f"  -> {len(res):,} rows")
-          print("[2/4] Building Elo history..."); elo_hist=build_elo(res); print(f"  -> {len(elo_hist):,} rows")
-          print("[3/4] Loading local odds..."); odds=load_local_odds()
-          print(f"  -> {0 if odds is None else len(odds):,} rows")
-          print("[4/4] Linking odds to results..."); linked=link_odds(res, elo_hist, odds)
-
+          res=fetch_sackmann();      print(f"[1] Sackmann rows: {len(res):,}")
+          elo_hist=build_elo(res);   print(f"[2] Elo updates:   {len(elo_hist):,}")
+          odds=load_local_odds();    print(f"[3] Odds rows:     {0 if odds is None else len(odds):,}")
+          linked=link_odds(res, elo_hist, odds)
           os.makedirs("data", exist_ok=True)
           if len(linked):
               linked.sort_values(["date","tour","tournament","player"], inplace=True)
-          else:
-              print("[INFO] No linked rows; writing empty dataset with headers.")
-
           linked.to_csv(OUT_CSV, index=False)
-          meta={"years":YEARS,"built_at_utc":datetime.utcnow().isoformat(timespec="seconds"),"rows":int(len(linked))}
-          with open(META,"w") as f: json.dump(meta,f)
-          print(f"[DONE] Saved -> {OUT_CSV} ({len(linked):,} rows)")
-          print(f"[DONE] Saved -> {ATP_ELO}, {WTA_ELO}")
+          with open(META,"w") as f:
+              json.dump({"years":YEARS,"built_at_utc":datetime.utcnow().isoformat(timespec="seconds"),
+                         "rows":int(len(linked))}, f)
+          print(f"[DONE] historical_matches.csv rows: {len(linked):,}")
           PY
 
           python scripts/fetch_and_join.py
@@ -382,7 +371,7 @@ jobs:
         run: |
           if [ -f backtest_summary.md ]; then
             cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
-          else
+          else:
             echo "_No backtest summary produced._" >> "$GITHUB_STEP_SUMMARY"
           fi
 
