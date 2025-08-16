@@ -9,6 +9,12 @@ on:
         description: "Years (space-separated)"
         required: false
         default: "2021 2022 2023 2024"
+      use_synth:
+        description: "If no odds, auto-generate synthetic odds"
+        required: true
+        type: choice
+        default: "yes"
+        options: ["yes","no"]
       do_backtest:
         description: "Run TE8 backtest?"
         required: true
@@ -81,29 +87,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Seed sample odds if none present
+      - name: Ensure odds dir
+        run: mkdir -p data/raw/odds
+
+      - name: Generate synthetic odds (only if none exist and enabled)
+        if: ${{ github.event.inputs.use_synth == 'yes' }}
         run: |
-          mkdir -p data/raw/odds
-          python - <<'PY'
-          from pathlib import Path
-          d=Path("data/raw/odds")
-          has= any(d.glob("*.csv")) or any(d.glob("*.xlsx")) or any(d.glob("*.xls"))
-          if not has:
-            (d/"atp_sample_odds.csv").write_text(
-              "date,player_a,player_b,odds_a,odds_b\n"
-              "2021-09-12,Daniil Medvedev,Novak Djokovic,2.60,1.55\n"
-              "2022-07-10,Novak Djokovic,Nick Kyrgios,1.30,3.60\n"
-              "2023-06-11,Novak Djokovic,Casper Ruud,1.33,3.40\n"
-              "2024-01-28,Jannik Sinner,Daniil Medvedev,1.85,2.05\n", encoding="utf-8")
-            (d/"wta_sample_odds.csv").write_text(
-              "date,player_a,player_b,odds_a,odds_b\n"
-              "2021-06-12,Barbora Krejcikova,Anastasia Pavlyuchenkova,1.75,2.10\n"
-              "2023-07-15,Marketa Vondrousova,Ons Jabeur,2.30,1.65\n"
-              "2024-07-13,Barbora Krejcikova,Jasmine Paolini,1.60,2.40\n", encoding="utf-8")
-            print("Seeded sample odds.")
-          else:
-            print("Odds exist; no seed.")
-          PY
+          if ls data/raw/odds/*.* >/dev/null 2>&1; then
+            echo "Local odds found -> skipping synthetic generation."
+          else
+            echo "No local odds detected -> making synthetic_odds.csv"
+            python scripts/make_synthetic_odds.py --years "${{ env.YEARS_CSV }}" --rows 6000
+          fi
 
       - name: Normalize local odds (names & snap dates)
         run: |
@@ -249,7 +244,7 @@ jobs:
 
           os.makedirs("data", exist_ok=True)
           linked.sort_values(["date","tour","tournament","player"], inplace=True, ignore_index=True)
-          linked.to_csv(OUT_CSV, index=False)  # ALWAYS writes headers
+          linked.to_csv(OUT_CSV, index=False)  # ALWAYS write headers
 
           meta={"years":YEARS,"built_at_utc":datetime.utcnow().isoformat(timespec="seconds"),
                 "rows":int(len(linked)), "date_min": (linked["date"].min().isoformat() if len(linked) else None),
