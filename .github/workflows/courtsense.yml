@@ -187,27 +187,35 @@ jobs:
           PY
 
       - name: Backtest (skip gracefully on 0 rows)
-        run: |
-          if [ ! -s data/historical_matches.csv ]; then
-            echo "# TE8 Backtest Summary" > backtest_summary.md
-            echo "" >> backtest_summary.md
-            echo "_Dataset missing or empty._" >> backtest_summary.md
-          else
-            N=$(python -c "import pandas as pd; import sys; 
-df=pd.read_csv('data/historical_matches.csv'); 
-print(len(df))" 2>/dev/null || echo 0)
-            if [ "$N" = "0" ]; then
-              echo "# TE8 Backtest Summary" > backtest_summary.md
-              echo "" >> backtest_summary.md
-              echo "_No rows to backtest (0 linked games)._" >> backtest_summary.md
-            else
-              python backtest_te8.py \
-                --input data/historical_matches.csv \
-                --start "${{ github.event.inputs.start_date }}" \
-                --end   "${{ github.event.inputs.end_date }}" \
-                --bands "${{ github.event.inputs.bands }}" \
-                --grid  "${{ github.event.inputs.grid }}" \
-                --out-csv backtest_results.csv \
+        - name: Backtest (skip gracefully on 0 rows)
+  run: |
+    if [ -s data/historical_matches.csv ]; then
+      N=$(python - <<'EOF'
+import pandas as pd
+import sys
+df = pd.read_csv('data/historical_matches.csv')
+print(len(df))
+EOF
+      )
+      if [ "$N" = "0" ]; then
+        echo "# TE8 Backtest Summary" > backtest_summary.md
+        echo "" >> backtest_summary.md
+        echo "No rows to backtest (0 linked games)." >> backtest_summary.md
+      else
+        python backtest_te8.py \
+          --input data/historical_matches.csv \
+          --start "${{ github.event.inputs.start_date }}" \
+          --end "${{ github.event.inputs.end_date }}" \
+          --bands "${{ github.event.inputs.bands }}" \
+          --grid "${{ github.event.inputs.grid }}" \
+          --out-csv backtest_results.csv
+      fi
+    else
+      echo "# TE8 Backtest Summary" > backtest_summary.md
+      echo "" >> backtest_summary.md
+      echo "Dataset missing or empty." >> backtest_summary.md
+    fi
+
                 --summary backtest_summary.md
             fi
           fi
