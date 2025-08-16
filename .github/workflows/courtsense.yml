@@ -27,7 +27,9 @@ on:
         description: "Seed synthetic odds if none found"
         required: true
         type: choice
-        options: ["yes","no"]
+        options:
+          - "yes"
+          - "no"
         default: "yes"
 
 permissions:
@@ -46,16 +48,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy requests unidecode tabulate openpyxl
 
-      - name: Ensure dirs
+      - name: Ensure folders
         run: |
           mkdir -p data/raw/odds data/raw/odds_normalized data
 
-      - name: Seed synthetic odds if none
+      - name: Seed sample odds if none
         if: ${{ github.event.inputs.use_synth == 'yes' }}
         run: |
           if ls data/raw/odds/* >/dev/null 2>&1 || ls data/raw/odds_normalized/* >/dev/null 2>&1; then
@@ -71,10 +73,10 @@ date,player_a,player_b,odds_a,odds_b
 2023-07-15,Marketa Vondrousova,Ons Jabeur,2.30,1.65
 2024-07-13,Barbora Krejcikova,Jasmine Paolini,1.60,2.40
 CSV
-            echo "Seeded sample odds."
+            echo "Seeded data/raw/odds/sample_odds.csv"
           fi
 
-      - name: Build dataset (link odds → Sackmann + quick Elo)  # always writes headers
+      - name: Build dataset (link odds to Sackmann + quick Elo) — writes headers even if 0 rows
         env:
           YEARS_CSV: ${{ github.event.inputs.years_csv }}
         run: |
@@ -112,7 +114,7 @@ CSV
 
           results = pd.concat([atp,wta], ignore_index=True)
 
-          # quick Elo per tour
+          # quick Elo (pre-match)
           def build_elo(df):
               E={"ATP":{}, "WTA":{}}
               K=32
@@ -128,7 +130,6 @@ CSV
           pd.DataFrame([{"player":k,"elo":v} for k,v in ELO["ATP"].items()]).to_csv("data/atp_elo.csv", index=False)
           pd.DataFrame([{"player":k,"elo":v} for k,v in ELO["WTA"].items()]).to_csv("data/wta_elo.csv", index=False)
 
-          # load odds
           base = "data/raw/odds_normalized" if glob.glob("data/raw/odds_normalized/*.csv") else "data/raw/odds"
           files = glob.glob(base+"/*.csv")
 
@@ -163,43 +164,26 @@ CSV
               rows=[x for x in (link_row(x) for _,x in odds.iterrows()) if x]
               out = pd.DataFrame(rows, columns=cols)
 
-          out.to_csv("data/historical_matches.csv", index=False)  # headers even if empty
+          out.to_csv("data/historical_matches.csv", index=False)  # ALWAYS headers
           print(f"Linked rows: {len(out)}")
           PY
 
-      - name: Summarize build
-        run: |
-          python - <<'PY'
-          import pandas as pd, os
-          n = 0
-          try:
-              df = pd.read_csv("data/historical_matches.csv")
-              n = len(df.index)
-          except Exception:
-              pass
-          print(f"BUILD_ROWS={n}")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(f"### Build summary\n\nLinked rows: **{n}** → `data/historical_matches.csv`\n")
-          PY
-
-      - name: Run backtest (matrix, skip if 0 rows)
+      - name: Backtest (skip gracefully on 0 rows)
         run: |
           if [ ! -s data/historical_matches.csv ]; then
             echo "# TE8 Backtest Summary" > backtest_summary.md
             echo "" >> backtest_summary.md
-            echo "_Dataset file missing or empty._" >> backtest_summary.md
+            echo "_Dataset missing or empty._" >> backtest_summary.md
           else
             python - <<'PY'
-            import pandas as pd, sys
+            import pandas as pd
             df=pd.read_csv("data/historical_matches.csv")
-            n=len(df.index)
-            open("nrows.txt","w").write(str(n))
-            print("nrows", n)
+            open("nrows.txt","w").write(str(len(df)))
             PY
             if [ "$(cat nrows.txt)" = "0" ]; then
               echo "# TE8 Backtest Summary" > backtest_summary.md
               echo "" >> backtest_summary.md
-              echo "_No rows to backtest (join matched 0 games)._ " >> backtest_summary.md
+              echo "_No rows to backtest (0 linked games)._" >> backtest_summary.md
             else
               python backtest_te8.py \
                 --input data/historical_matches.csv \
@@ -211,10 +195,14 @@ CSV
                 --summary backtest_summary.md
             fi
 
-      - name: Publish summary
+      - name: Job summary
         run: |
-          echo "## Courtsense Backtest" >> "$GITHUB_STEP_SUMMARY"
-          cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY" || echo "_No summary produced._" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Courtsense" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f backtest_summary.md ]; then
+            cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No summary produced._" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -222,6 +210,8 @@ CSV
           name: backtest-output
           path: |
             data/historical_matches.csv
+            data/atp_elo.csv
+            data/wta_elo.csv
             backtest_results.csv
             backtest_summary.md
             grid_results.csv
