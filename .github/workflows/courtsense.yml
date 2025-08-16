@@ -20,11 +20,11 @@ on:
         required: false
         default: "dog=2.20,4.50;fav=1.15,2.00"
       grid:
-        description: "Grid (e.g. min_edge=0.02,0.03;kelly_cap=0.10,0.15;te8_dog=0.58,0.60;te8_fav=0.48,0.50)"
+        description: "Grid (min_edge=...;kelly_cap=...;te8_dog=...;te8_fav=...)"
         required: false
         default: "min_edge=0.02,0.03,0.04;kelly_cap=0.10,0.15,0.20;te8_dog=0.58,0.60;te8_fav=0.48,0.50"
       use_synth:
-        description: "Seed synthetic odds if none found"
+        description: "Seed example odds if none found"
         required: true
         type: choice
         options:
@@ -57,33 +57,40 @@ jobs:
         run: |
           mkdir -p data/raw/odds data/raw/odds_normalized data
 
-            - name: Seed sample odds if none
+      # ----- NO HEREDOCS: write the seed CSV with Python -----
+      - name: Seed sample odds if none
         if: ${{ github.event.inputs.use_synth == 'yes' }}
         run: |
-          if ls data/raw/odds/* >/dev/null 2>&1 || ls data/raw/odds_normalized/* >/dev/null 2>&1; then
-            echo "Local odds exist."
-          else
-            cat > data/raw/odds/sample_odds.csv <<'CSV'
-date,player_a,player_b,odds_a,odds_b
-2025-08-10,Fritz,Sinner,2.35,1.60
-2025-08-10,Alcaraz,Rublev,1.55,2.50
-2025-08-11,Tauson,Rybakina,3.20,1.35
-2025-08-11,Osaka,Keys,1.90,1.90
-2025-08-12,Medvedev,Zverev,1.85,2.00
-2025-08-12,Fernandez,Sabalenka,2.70,1.45
-2025-08-13,Khachanov,Tsitsipas,2.40,1.65
-2025-08-13,Swiatek,Krejcikova,1.25,4.10
-2025-08-14,De Minaur,Hurkacz,2.05,1.80
-2025-08-14,Kasatkina,Jabeur,2.60,1.48
-CSV
-            echo "Seeded data/raw/odds/sample_odds.csv"
-          fi
+          python - << 'PY'
+          import os, csv
+          path1 = "data/raw/odds"
+          path2 = "data/raw/odds_normalized"
+          has_files = any(os.scandir(path1)) if os.path.isdir(path1) else False
+          has_norm  = any(os.scandir(path2)) if os.path.isdir(path2) else False
+          if has_files or has_norm:
+              print("Local odds exist, skipping seed.")
+          else:
+              os.makedirs(path1, exist_ok=True)
+              rows = [
+                ["date","player_a","player_b","odds_a","odds_b"],
+                ["2023-06-11","Novak Djokovic","Casper Ruud","1.33","3.40"],
+                ["2022-07-10","Novak Djokovic","Nick Kyrgios","1.33","3.60"],
+                ["2021-09-12","Daniil Medvedev","Novak Djokovic","2.60","1.55"],
+                ["2024-01-28","Jannik Sinner","Daniil Medvedev","1.85","2.05"],
+                ["2021-06-12","Barbora Krejcikova","Anastasia Pavlyuchenkova","1.75","2.10"],
+                ["2023-07-15","Marketa Vondrousova","Ons Jabeur","2.30","1.65"],
+                ["2024-07-13","Barbora Krejcikova","Jasmine Paolini","1.60","2.40"],
+              ]
+              with open(os.path.join(path1,"sample_odds.csv"), "w", newline="", encoding="utf-8") as f:
+                  csv.writer(f).writerows(rows)
+              print("Seeded data/raw/odds/sample_odds.csv")
+          PY
 
-      - name: Build dataset (link odds to Sackmann + quick Elo) — writes headers even if 0 rows
+      - name: Build dataset (link odds to Sackmann + quick Elo) — always writes headers
         env:
           YEARS_CSV: ${{ github.event.inputs.years_csv }}
         run: |
-          python - <<'PY'
+          python - << 'PY'
           import os, io, time, glob, re, pandas as pd, requests
           from unidecode import unidecode
 
@@ -178,7 +185,7 @@ CSV
             echo "" >> backtest_summary.md
             echo "_Dataset missing or empty._" >> backtest_summary.md
           else
-            python - <<'PY'
+            python - << 'PY'
             import pandas as pd
             df=pd.read_csv("data/historical_matches.csv")
             open("nrows.txt","w").write(str(len(df)))
