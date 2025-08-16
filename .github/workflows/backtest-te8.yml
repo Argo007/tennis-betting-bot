@@ -5,6 +5,10 @@ on:
     - cron: "0 8 * * *"   # Daily build at 08:00 UTC
   workflow_dispatch:
     inputs:
+      years_csv:
+        description: "Years to fetch (space-separated)"
+        required: false
+        default: "2024"
       do_backtest:
         description: "Run TE8 backtest after build?"
         required: true
@@ -14,7 +18,7 @@ on:
       start_date:
         description: "Backtest start (YYYY-MM-DD)"
         required: false
-        default: "2021-01-01"
+        default: "2024-01-01"
       end_date:
         description: "Backtest end (YYYY-MM-DD)"
         required: false
@@ -50,6 +54,7 @@ on:
 
 env:
   TZ: Europe/Amsterdam
+  YEARS_CSV: ${{ github.event.inputs.years_csv || '2024' }}
 
 permissions:
   contents: read
@@ -61,6 +66,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -84,27 +91,40 @@ jobs:
 
       - name: Build dataset (Sackmann + local odds)
         run: |
+          set -euo pipefail
+          echo "YEARS: ${YEARS_CSV}"
           mkdir -p scripts data/raw/odds data
+
           cat > scripts/fetch_and_join.py << 'PY'
-          import os, io, sys, glob, json, re
+          import os, io, sys, glob, json, re, time
           from datetime import datetime
           import requests, pandas as pd
           from dateutil import parser
           from rapidfuzz import fuzz, process
           from unidecode import unidecode
 
-          YEARS = [2021, 2022, 2023, 2024]
+          YEARS = [int(y) for y in os.getenv("YEARS_CSV","2024").split() if y.strip().isdigit()]
           ODDS_DIR = "data/raw/odds"
           OUT_CSV  = "data/historical_matches.csv"
           ATP_ELO  = "data/atp_elo.csv"
           WTA_ELO  = "data/wta_elo.csv"
           META     = "data/dataset_info.json"
 
+          # columns we always promise downstream
+          OUTPUT_COLUMNS = [
+              "date","tour","tournament","round",
+              "player","opponent","odds","opp_odds",
+              "result","elo_player","elo_opponent","source"
+          ]
+
+          REQ_TIMEOUT = 12   # seconds
+          RETRIES     = 3
+          SLEEP_BACKOFF = [0, 1.5, 3.0]
+
           def norm_name(s: str) -> str:
-              """ASCII-fold, strip punctuation, normalize spaces."""
               if not isinstance(s, str): return ""
               s = unidecode(s).lower()
-              s = re.sub(r"[^a-z ]", " ", s)     # keep letters/spaces
+              s = re.sub(r"[^a-z ]", " ", s)
               s = re.sub(r"\s+", " ", s).strip()
               return s
 
@@ -115,16 +135,27 @@ jobs:
                   try: return pd.to_datetime(parser.parse(str(x))).normalize()
                   except: return pd.NaT
 
-          def fetch_csv(url: str):
-              r = requests.get(url, timeout=60); r.raise_for_status()
-              return pd.read_csv(io.StringIO(r.text))
+          def fetch_csv_with_retry(url: str) -> pd.DataFrame:
+              last = None
+              for i in range(RETRIES):
+                  try:
+                      r = requests.get(url, timeout=REQ_TIMEOUT)
+                      r.raise_for_status()
+                      return pd.read_csv(io.StringIO(r.text))
+                  except Exception as e:
+                      last = e
+                      time.sleep(SLEEP_BACKOFF[min(i, len(SLEEP_BACKOFF)-1)])
+              raise RuntimeError(f"Failed to fetch after {RETRIES} tries: {url} ({last})")
 
           def fetch_sackmann():
               frames=[]
               for tour, repo in [("ATP","tennis_atp"),("WTA","tennis_wta")]:
                   for y in YEARS:
                       url=f"https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{tour.lower()}_matches_{y}.csv"
-                      df=fetch_csv(url); df["tour"]=tour; frames.append(df)
+                      print(f"[DL] {tour} {y} ...", flush=True)
+                      df=fetch_csv_with_retry(url)
+                      df["tour"]=tour
+                      frames.append(df)
               res=pd.concat(frames, ignore_index=True)
               res["tourney_date"]=pd.to_datetime(res["tourney_date"].astype(str), format="%Y%m%d", errors="coerce")
               keep=["tour","tourney_name","tourney_date","surface","round","winner_name","loser_name","score","best_of","minutes"]
@@ -144,6 +175,7 @@ jobs:
               rows=[]
               for _,r in res.iterrows():
                   t,w,l=r["tour"],r["w_norm"],r["l_norm"]
+                  if not w or not l: continue
                   ew,el=elos[t].get(w,BASE), elos[t].get(l,BASE)
                   expw=1/(1+10**((el-ew)/400)); expl=1-expw
                   elos[t][w]=ew+K*(1-expw); elos[t][l]=el+K*(0-expl)
@@ -157,6 +189,9 @@ jobs:
               files=sorted(glob.glob(os.path.join(ODDS_DIR,"**/*.csv"),recursive=True)+
                            glob.glob(os.path.join(ODDS_DIR,"**/*.xlsx"),recursive=True)+
                            glob.glob(os.path.join(ODDS_DIR,"**/*.xls"),recursive=True))
+              if not files:
+                  print("[WARN] No local odds in data/raw/odds/* — continuing with zero rows.", file=sys.stderr)
+                  return pd.DataFrame(columns=["date","player_a","player_b","odds_a","odds_b","a_norm","b_norm","source"])
               frames=[]
               for path in files:
                   try:
@@ -189,12 +224,14 @@ jobs:
                   tmp=tmp[mask].dropna(subset=["date","odds_a","odds_b"]).copy()
                   tmp["a_norm"]=tmp["player_a"].apply(norm_name); tmp["b_norm"]=tmp["player_b"].apply(norm_name)
                   frames.append(tmp)
-              if frames: return pd.concat(frames,ignore_index=True)
-              print("[WARN] No local odds found under data/raw/odds/*", file=sys.stderr)
-              return pd.DataFrame(columns=["date","player_a","player_b","odds_a","odds_b","a_norm","b_norm","source"])
+              return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+
+          def empty_output_df():
+              return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
           def link_odds(res, elo_hist, odds):
-              if odds.empty: return pd.DataFrame()
+              if odds is None or odds.empty:
+                  return empty_output_df()
               res_small=res[["tour","date","tourney_name","round","w_norm","l_norm","pair_norm_sorted"]].copy()
               out=[]
               for _,o in odds.iterrows():
@@ -221,24 +258,42 @@ jobs:
                   if p_norm==best["w_norm"]: result,elo_p,elo_o=1,elo_w,elo_l
                   elif p_norm==best["l_norm"]: result,elo_p,elo_o=0,elo_l,elo_w
                   else: continue
-                  out.append({"date":best["date"].date(),"tour":best["tour"],"tournament":best["tourney_name"],
-                              "round":best["round"],"player":o["player_a"],"opponent":o["player_b"],
-                              "odds":o["odds_a"],"opp_odds":o["odds_b"],"result":result,
-                              "elo_player":elo_p,"elo_opponent":elo_o,"source":o.get("source","local")})
-              return pd.DataFrame(out)
+                  out.append({
+                      "date":best["date"].date(),
+                      "tour":best["tour"],
+                      "tournament":best["tourney_name"],
+                      "round":best["round"],
+                      "player":o["player_a"],
+                      "opponent":o["player_b"],
+                      "odds":o["odds_a"],
+                      "opp_odds":o["odds_b"],
+                      "result":result,
+                      "elo_player":elo_p,
+                      "elo_opponent":elo_o,
+                      "source":o.get("source","local")
+                  })
+              return pd.DataFrame(out, columns=OUTPUT_COLUMNS) if out else empty_output_df()
 
+          print(f"[SETUP] Years: {YEARS}")
           print("[1/4] Fetching Sackmann..."); res=fetch_sackmann(); print(f"  -> {len(res):,} rows")
-          print("[2/4] Building Elo history..."); elo_hist=build_elo(res)
-          print("[3/4] Loading local odds..."); odds=load_local_odds(); print(f"  -> {len(odds):,} rows")
+          print("[2/4] Building Elo history..."); elo_hist=build_elo(res); print(f"  -> {len(elo_hist):,} rows")
+          print("[3/4] Loading local odds..."); odds=load_local_odds()
+          print(f"  -> {0 if odds is None else len(odds):,} rows")
           print("[4/4] Linking odds to results..."); linked=link_odds(res, elo_hist, odds)
+
           os.makedirs("data", exist_ok=True)
-          linked.sort_values(["date","tour","tournament","player"], inplace=True)
+          if len(linked):
+              linked.sort_values(["date","tour","tournament","player"], inplace=True)
+          else:
+              print("[INFO] No linked rows; writing empty dataset with headers.")
+
           linked.to_csv(OUT_CSV, index=False)
           meta={"years":YEARS,"built_at_utc":datetime.utcnow().isoformat(timespec="seconds"),"rows":int(len(linked))}
           with open(META,"w") as f: json.dump(meta,f)
-          print(f"Saved -> {OUT_CSV} ({len(linked):,} rows)")
-          print(f"Saved -> {ATP_ELO}, {WTA_ELO}")
+          print(f"[DONE] Saved -> {OUT_CSV} ({len(linked):,} rows)")
+          print(f"[DONE] Saved -> {ATP_ELO}, {WTA_ELO}")
           PY
+
           python scripts/fetch_and_join.py
 
       - name: Upload dataset artifact
@@ -256,6 +311,8 @@ jobs:
     needs: build
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
