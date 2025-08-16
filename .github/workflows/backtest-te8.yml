@@ -68,7 +68,7 @@ jobs:
 
       - name: Prepare requirements (lean)
         run: |
-          printf "pandas\nrequests\nopenpyxl\nrapidfuzz\npython-dateutil\n" > requirements.txt
+          printf "pandas\nrequests\nopenpyxl\nrapidfuzz\npython-dateutil\nUnidecode\n" > requirements.txt
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -86,11 +86,12 @@ jobs:
         run: |
           mkdir -p scripts data/raw/odds data
           cat > scripts/fetch_and_join.py << 'PY'
-          import os, io, sys, glob, json
+          import os, io, sys, glob, json, re
           from datetime import datetime
           import requests, pandas as pd
           from dateutil import parser
           from rapidfuzz import fuzz, process
+          from unidecode import unidecode
 
           YEARS = [2021, 2022, 2023, 2024]
           ODDS_DIR = "data/raw/odds"
@@ -100,12 +101,12 @@ jobs:
           META     = "data/dataset_info.json"
 
           def norm_name(s: str) -> str:
+              """ASCII-fold, strip punctuation, normalize spaces."""
               if not isinstance(s, str): return ""
-              s = s.strip().lower()
-              table = str.maketrans("áàäâãåéèëêíìïîóòöôõúùüûñßčćšžğıøœ","aaaaaaeeeeiiiiooooouuuunssccszgioe")
-              s = s.translate(table)
-              for ch in [".","-","'"]: s = s.replace(ch, " ")
-              return " ".join(s.split())
+              s = unidecode(s).lower()
+              s = re.sub(r"[^a-z ]", " ", s)     # keep letters/spaces
+              s = re.sub(r"\s+", " ", s).strip()
+              return s
 
           def safe_date(x):
               if pd.isna(x): return pd.NaT
@@ -186,8 +187,7 @@ jobs:
                       "source":df[c_src] if c_src else "local"})
                   mask=tmp["market"].astype(str).str.lower().isin(["match_winner","moneyline","1x2","ml","winner","match odds","to win match"])
                   tmp=tmp[mask].dropna(subset=["date","odds_a","odds_b"]).copy()
-                  def n(s): return " ".join(s.lower().replace("."," ").replace("-"," ").replace("'"," ").split())
-                  tmp["a_norm"]=tmp["player_a"].apply(n); tmp["b_norm"]=tmp["player_b"].apply(n)
+                  tmp["a_norm"]=tmp["player_a"].apply(norm_name); tmp["b_norm"]=tmp["player_b"].apply(norm_name)
                   frames.append(tmp)
               if frames: return pd.concat(frames,ignore_index=True)
               print("[WARN] No local odds found under data/raw/odds/*", file=sys.stderr)
@@ -254,9 +254,7 @@ jobs:
 
   backtest:
     needs: build
-    # Run backtest on schedule only if you want; here we do manual or schedule-if-you-change "== 'yes'"
-    if: >
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes')
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
