@@ -57,7 +57,7 @@ jobs:
         run: |
           mkdir -p data/raw/odds data/raw/odds_normalized data
 
-      - name: Seed sample odds if none
+            - name: Seed sample odds if none
         if: ${{ github.event.inputs.use_synth == 'yes' }}
         run: |
           if ls data/raw/odds/* >/dev/null 2>&1 || ls data/raw/odds_normalized/* >/dev/null 2>&1; then
