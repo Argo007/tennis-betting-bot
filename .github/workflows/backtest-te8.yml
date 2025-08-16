@@ -32,23 +32,15 @@ on:
         required: false
         default: "0.50"
       bands:
-        description: "Odds bands dog=min,max;fav=min,max"
+        description: "Odds bands: dog=min,max;fav=min,max"
         required: false
         default: "dog=2.20,4.50;fav=1.15,2.00"
-      dog_cap:
-        description: "Dog micro-cap × Kelly"
+      money:
+        description: "Money params: bankroll=1000;stake_unit=100;dog_cap=0.25"
         required: false
-        default: "0.25"
-      stake_unit:
-        description: "Flat unit stake (€)"
-        required: false
-        default: "100"
-      bankroll:
-        description: "Starting bankroll (€)"
-        required: false
-        default: "1000"
+        default: "bankroll=1000;stake_unit=100;dog_cap=0.25"
       tuners:
-        description: "surface_boost=0.05;recent_form_weight=0.30;injury_penalty=0.15"
+        description: "Tuners: surface_boost=0.05;recent_form_weight=0.30;injury_penalty=0.15"
         required: false
         default: "surface_boost=0.05;recent_form_weight=0.30;injury_penalty=0.15"
 
@@ -67,7 +59,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,7 +85,6 @@ jobs:
           set -euo pipefail
           echo "YEARS: ${YEARS_CSV}"
           mkdir -p scripts data/raw/odds data
-
           cat > scripts/fetch_and_join.py << 'PY'
           import os, io, sys, glob, json, re, time
           from datetime import datetime
@@ -103,7 +93,6 @@ jobs:
           from rapidfuzz import fuzz, process
           from unidecode import unidecode
 
-          # ------------ config ------------
           YEARS = [int(y) for y in os.getenv("YEARS_CSV","2024").split() if y.strip().isdigit()]
           ODDS_DIR = "data/raw/odds"
           OUT_CSV  = "data/historical_matches.csv"
@@ -118,7 +107,6 @@ jobs:
           RETRIES     = 3
           BACKOFF     = [0, 1.5, 3.0]
 
-          # ------------ utils ------------
           def norm_name(s):
               if not isinstance(s, str): return ""
               s = unidecode(s).lower()
@@ -143,7 +131,6 @@ jobs:
                       err = e; time.sleep(BACKOFF[min(i,len(BACKOFF)-1)])
               raise RuntimeError(f"Fetch failed {url}: {err}")
 
-          # ------------ data ------------
           def fetch_sackmann():
               frames=[]
               for tour, repo in [("ATP","tennis_atp"),("WTA","tennis_wta")]:
@@ -185,7 +172,7 @@ jobs:
                            glob.glob(os.path.join(ODDS_DIR,"**/*.xlsx"),recursive=True)+
                            glob.glob(os.path.join(ODDS_DIR,"**/*.xls"),recursive=True))
               if not files:
-                  print("[WARN] No local odds in data/raw/odds/* — continuing with empty dataset.")
+                  print("[WARN] No local odds in data/raw/odds/* — continuing empty.")
                   return pd.DataFrame(columns=["date","player_a","player_b","odds_a","odds_b","a_norm","b_norm","source"])
               frames=[]
               for path in files:
@@ -206,7 +193,7 @@ jobs:
                   c_market=pick("market","bettype","bet_type")
                   c_src=pick("book","bookmaker","source")
                   if None in (c_date,c_pa,c_pb,c_odds_a,c_odds_b):
-                      print(f"[WARN] {path}: missing required headers, skipping."); continue
+                      print(f"[WARN] {path}: missing headers, skipping."); continue
                   tmp=pd.DataFrame({
                       "date":pd.to_datetime(df[c_date].apply(safe_date)),
                       "player_a":df[c_pa].astype(str),
@@ -221,8 +208,7 @@ jobs:
                   frames.append(tmp)
               return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
-          def empty_output_df():
-              return pd.DataFrame(columns=OUTPUT_COLUMNS)
+          def empty_output_df(): return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
           def link_odds(res, elo_hist, odds):
               if odds is None or odds.empty: return empty_output_df()
@@ -253,19 +239,10 @@ jobs:
                   elif p_norm==best["l_norm"]: result,elo_p,elo_o=0,elo_l,elo_w
                   else: continue
                   out.append({
-                      "date":best["date"].date(),
-                      "tour":best["tour"],
-                      "tournament":best["tourney_name"],
-                      "round":best["round"],
-                      "player":o["player_a"],
-                      "opponent":o["player_b"],
-                      "odds":o["odds_a"],
-                      "opp_odds":o["odds_b"],
-                      "result":result,
-                      "elo_player":elo_p,
-                      "elo_opponent":elo_o,
-                      "source":o.get("source","local")
-                  })
+                      "date":best["date"].date(),"tour":best["tour"],"tournament":best["tourney_name"],
+                      "round":best["round"],"player":o["player_a"],"opponent":o["player_b"],
+                      "odds":o["odds_a"],"opp_odds":o["odds_b"],"result":result,
+                      "elo_player":elo_p,"elo_opponent":elo_o,"source":o.get("source","local")})
               return pd.DataFrame(out, columns=OUTPUT_COLUMNS) if out else empty_output_df()
 
           print(f"[SETUP] Years: {YEARS}")
@@ -274,15 +251,13 @@ jobs:
           odds=load_local_odds();    print(f"[3] Odds rows:     {0 if odds is None else len(odds):,}")
           linked=link_odds(res, elo_hist, odds)
           os.makedirs("data", exist_ok=True)
-          if len(linked):
-              linked.sort_values(["date","tour","tournament","player"], inplace=True)
+          if len(linked): linked.sort_values(["date","tour","tournament","player"], inplace=True)
           linked.to_csv(OUT_CSV, index=False)
           with open(META,"w") as f:
               json.dump({"years":YEARS,"built_at_utc":datetime.utcnow().isoformat(timespec="seconds"),
                          "rows":int(len(linked))}, f)
           print(f"[DONE] historical_matches.csv rows: {len(linked):,}")
           PY
-
           python scripts/fetch_and_join.py
 
       - name: Upload dataset artifact
@@ -301,7 +276,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -334,17 +308,27 @@ jobs:
             echo '[]' > injuries.json
           fi
 
-      - name: Run TE8 backtest
+      - name: Parse money & tuners; run TE8 backtest
         shell: bash
         run: |
           test -f backtest_te8.py || { echo "::error ::backtest_te8.py missing in repo root"; exit 1; }
 
-          BANDS="${{ inputs.bands }}"; TUNE="${{ inputs.tuners }}"
+          # Parse bands
+          BANDS="${{ inputs.bands }}"
           DOG_BAND=$(echo "$BANDS" | sed -n 's/.*dog=\([^;]*\).*/\1/p'); [ -z "$DOG_BAND" ] && DOG_BAND="2.20,4.50"
           FAV_BAND=$(echo "$BANDS" | sed -n 's/.*fav=\([^;]*\).*/\1/p'); [ -z "$FAV_BAND" ] && FAV_BAND="1.15,2.00"
-          SURF_BOOST=$(echo "$TUNE" | sed -n 's/.*surface_boost=\([^;]*\).*/\1/p'); [ -z "$SURF_BOOST" ] && SURF_BOOST="0.05"
-          FORM_W=$(echo "$TUNE" | sed -n 's/.*recent_form_weight=\([^;]*\).*/\1/p'); [ -z "$FORM_W" ] && FORM_W="0.30"
-          INJ_PEN=$(echo "$TUNE" | sed -n 's/.*injury_penalty=\([^;]*\).*/\1/p'); [ -z "$INJ_PEN" ] && INJ_PEN="0.15"
+
+          # Parse money: bankroll=...;stake_unit=...;dog_cap=...
+          MONEY="${{ inputs.money }}"
+          BANKROLL=$(echo "$MONEY" | sed -n 's/.*bankroll=\([^;]*\).*/\1/p');   [ -z "$BANKROLL" ] && BANKROLL="1000"
+          STAKE_UNIT=$(echo "$MONEY" | sed -n 's/.*stake_unit=\([^;]*\).*/\1/p');[ -z "$STAKE_UNIT" ] && STAKE_UNIT="100"
+          DOG_CAP=$(echo "$MONEY" | sed -n 's/.*dog_cap=\([^;]*\).*/\1/p');     [ -z "$DOG_CAP" ] && DOG_CAP="0.25"
+
+          # Parse tuners
+          TUNE="${{ inputs.tuners }}"
+          SURF_BOOST=$(echo "$TUNE" | sed -n 's/.*surface_boost=\([^;]*\).*/\1/p');         [ -z "$SURF_BOOST" ] && SURF_BOOST="0.05"
+          FORM_W=$(echo "$TUNE" | sed -n 's/.*recent_form_weight=\([^;]*\).*/\1/p');        [ -z "$FORM_W" ] && FORM_W="0.30"
+          INJ_PEN=$(echo "$TUNE" | sed -n 's/.*injury_penalty=\([^;]*\).*/\1/p');           [ -z "$INJ_PEN" ] && INJ_PEN="0.15"
 
           python backtest_te8.py \
             --input data/historical_matches.csv \
@@ -357,9 +341,9 @@ jobs:
             --te8-fav "${{ inputs.te8_fav }}" \
             --dog-band "$DOG_BAND" \
             --fav-band "$FAV_BAND" \
-            --dog-cap "${{ inputs.dog_cap }}" \
-            --stake-unit "${{ inputs.stake_unit }}" \
-            --bankroll "${{ inputs.bankroll }}" \
+            --dog-cap "$DOG_CAP" \
+            --stake-unit "$STAKE_UNIT" \
+            --bankroll "$BANKROLL" \
             --surface-boost "$SURF_BOOST" \
             --recent-form-weight "$FORM_W" \
             --injury-penalty "$INJ_PEN" \
@@ -371,7 +355,7 @@ jobs:
         run: |
           if [ -f backtest_summary.md ]; then
             cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
-          else:
+          else
             echo "_No backtest summary produced._" >> "$GITHUB_STEP_SUMMARY"
           fi
 
