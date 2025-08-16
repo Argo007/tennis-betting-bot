@@ -6,12 +6,10 @@ Looks for CSVs in:
   - data/raw/odds_live/*.csv
   - data/raw/odds/*.csv
 
-Expected headers in any order (case-insensitive):
-  date, player_a, player_b, odds_a, odds_b
+Headers (case-insensitive): date, player_a, player_b, odds_a, odds_b
 
 Outputs:
-  - value_picks_pro.csv with columns:
-    date,player,opponent,odds,model_conf,book_count
+  - value_picks_pro.csv (date,player,opponent,odds,model_conf,book_count)
 """
 import argparse, glob
 from pathlib import Path
@@ -53,8 +51,6 @@ def main():
     ap.add_argument("--lookahead-h", default="6")
     ap.add_argument("--region", default="EU")
     ap.add_argument("--kelly", default="1.0")
-    ap.add_argument("--min-books", type=int, default=3)
-    ap.add_argument("--max-age-mins", type=int, default=60)
     ap.add_argument("--out", default="value_picks_pro.csv")
     args = ap.parse_args()
 
@@ -71,23 +67,20 @@ def main():
         print("No odds found; wrote empty candidate CSV.")
         return
 
-    # naive model_conf proxy: convert favorites/dogs to 0.60/0.40 +/- small drift
-    # (real model should replace this; engine will override via Elo if missing)
+    # naive model_conf proxy; engine will fall back to Elo if missing
     conf=[]
     for _,r in df.iterrows():
-        if r["odds_a"]<=1.80:
-            conf.append(0.60)
-        elif r["odds_a"]>=2.50:
-            conf.append(0.45)
-        else:
-            conf.append(0.52)
+        if r["odds_a"]<=1.80: conf.append(0.60)
+        elif r["odds_a"]>=2.50: conf.append(0.45)
+        else: conf.append(0.52)
+
     out = pd.DataFrame({
         "date": df["date"].dt.strftime("%Y-%m-%d"),
         "player": df["player_a"],
         "opponent": df["player_b"],
         "odds": df["odds_a"].round(2),
         "model_conf": conf,
-        "book_count": args.min_books  # placeholder; wire real book count if available
+        "book_count": 3   # placeholder; replace if you have real counts
     })
     out.to_csv(args.out, index=False)
     print(f"Wrote {len(out)} candidate rows -> {args.out}")
