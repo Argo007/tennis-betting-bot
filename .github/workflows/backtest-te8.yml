@@ -1,16 +1,16 @@
-name: Courtsense (Build + Backtest)
+name: Courtsense (Build + optional Backtest)
 
 on:
   schedule:
     - cron: "0 8 * * *"   # Daily build at 08:00 UTC
   workflow_dispatch:
     inputs:
-      run_mode:
-        description: "What to run"
+      do_backtest:
+        description: "Run TE8 backtest after build?"
         required: true
-        default: "backtest_using_latest"
+        default: "yes"
         type: choice
-        options: [build_only, backtest_using_latest, build_and_backtest]
+        options: ["yes","no"]
       start_date:
         description: "Backtest start (YYYY-MM-DD)"
         required: false
@@ -53,70 +53,14 @@ env:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: courtsense
   cancel-in-progress: true
 
-# -----------------------------------------------
-# 1) Probe for an existing dataset from past runs.
-#    If found, re-upload it as a per-run artifact.
-# -----------------------------------------------
 jobs:
-  probe_latest:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'backtest_using_latest'
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      have_artifact: ${{ steps.flag.outputs.have_artifact }}
-    steps:
-      - name: Download latest dataset artifact (if exists)
-        id: dl
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: courtsense.yml
-          workflow_conclusion: success
-          name: courtsense-dataset
-          path: data_bundle
-          search_artifacts: true
-          branch: ${{ github.ref_name }}
-        continue-on-error: true
-
-      - name: Flag presence
-        id: flag
-        run: |
-          if [ -f data_bundle/historical_matches.csv ]; then
-            echo "have_artifact=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_artifact=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Re-upload for this run
-        if: steps.flag.outputs.have_artifact == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: dataset-for-this-run
-          path: |
-            data_bundle/historical_matches.csv
-            data_bundle/atp_elo.csv
-            data_bundle/wta_elo.csv
-            data_bundle/dataset_info.json
-          if-no-files-found: error
-
-# ------------------------------------------------
-# 2) Build dataset when scheduled, explicitly asked,
-#    or when probe failed to find any artifact.
-# ------------------------------------------------
-  build_dataset:
-    if: >
-      github.event_name == 'schedule' ||
-      github.event.inputs.run_mode == 'build_only' ||
-      github.event.inputs.run_mode == 'build_and_backtest' ||
-      (github.event.inputs.run_mode == 'backtest_using_latest' &&
-       needs.probe_latest.outputs.have_artifact == 'false')
-    runs-on: ubuntu-latest
-    needs: [probe_latest]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -297,7 +241,7 @@ jobs:
           PY
           python scripts/fetch_and_join.py
 
-      - name: Upload dataset (for reuse across runs)
+      - name: Upload dataset artifact
         uses: actions/upload-artifact@v4
         with:
           name: courtsense-dataset
@@ -306,44 +250,30 @@ jobs:
             data/atp_elo.csv
             data/wta_elo.csv
             data/dataset_info.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
-      - name: Upload dataset for this run
-        uses: actions/upload-artifact@v4
-        with:
-          name: dataset-for-this-run
-          path: |
-            data/historical_matches.csv
-            data/atp_elo.csv
-            data/wta_elo.csv
-            data/dataset_info.json
-          if-no-files-found: error
-
-# ------------------------------------------------
-# 3) Backtest (uses dataset-for-this-run from probe
-#    or build jobs; both paths converge here).
-# ------------------------------------------------
   backtest:
-    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.run_mode == 'backtest_using_latest' || github.event.inputs.run_mode == 'build_and_backtest')
+    needs: build
+    # Run backtest on schedule only if you want; here we do manual or schedule-if-you-change "== 'yes'"
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes')
     runs-on: ubuntu-latest
-    needs: [probe_latest, build_dataset]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download dataset-for-this-run
+      - name: Download dataset from this run
         uses: actions/download-artifact@v4
         with:
-          name: dataset-for-this-run
+          name: courtsense-dataset
           path: data_bundle
 
       - name: Stage dataset
         run: |
           mkdir -p data
-          mv -f data_bundle/historical_matches.csv data/historical_matches.csv
-          mv -f data_bundle/atp_elo.csv           data/atp_elo.csv || true
-          mv -f data_bundle/wta_elo.csv           data/wta_elo.csv || true
+          cp -f data_bundle/historical_matches.csv data/historical_matches.csv || true
+          cp -f data_bundle/atp_elo.csv           data/atp_elo.csv || true
+          cp -f data_bundle/wta_elo.csv           data/wta_elo.csv || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -364,6 +294,7 @@ jobs:
         shell: bash
         run: |
           test -f backtest_te8.py || { echo "::error ::backtest_te8.py missing in repo root"; exit 1; }
+
           BANDS="${{ inputs.bands }}"; TUNE="${{ inputs.tuners }}"
           DOG_BAND=$(echo "$BANDS" | sed -n 's/.*dog=\([^;]*\).*/\1/p'); [ -z "$DOG_BAND" ] && DOG_BAND="2.20,4.50"
           FAV_BAND=$(echo "$BANDS" | sed -n 's/.*fav=\([^;]*\).*/\1/p'); [ -z "$FAV_BAND" ] && FAV_BAND="1.15,2.00"
@@ -400,7 +331,7 @@ jobs:
             echo "_No backtest summary produced._" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload artifacts
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: backtest-output
