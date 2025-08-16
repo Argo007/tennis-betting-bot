@@ -1,4 +1,4 @@
-name: Courtsense (Build + optional Backtest)
+name: Courtsense (Build + Normalize + Backtest)
 
 on:
   schedule:
@@ -58,7 +58,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,13 +81,152 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build dataset (Sackmann + local odds)
+      # Optional guardrail so you can see output immediately
+      - name: Seed sample odds if none present
+        run: |
+          mkdir -p data/raw/odds
+          python - <<'PY'
+          from pathlib import Path
+          root=Path("."); d=root/"data"/"raw"/"odds"
+          has= any(d.glob("*.csv")) or any(d.glob("*.xlsx")) or any(d.glob("*.xls"))
+          if has:
+              print("Odds already present; skipping seed.")
+          else:
+              (d/"atp_sample_odds.csv").write_text(
+                  "date,player_a,player_b,odds_a,odds_b\n"
+                  "2021-09-12,Daniil Medvedev,Novak Djokovic,2.60,1.55\n"
+                  "2022-07-10,Novak Djokovic,Nick Kyrgios,1.30,3.60\n"
+                  "2023-06-11,Novak Djokovic,Casper Ruud,1.33,3.40\n"
+                  "2024-01-28,Jannik Sinner,Daniil Medvedev,1.85,2.05\n", encoding="utf-8")
+              (d/"wta_sample_odds.csv").write_text(
+                  "date,player_a,player_b,odds_a,odds_b\n"
+                  "2021-06-12,Barbora Krejcikova,Anastasia Pavlyuchenkova,1.75,2.10\n"
+                  "2023-07-15,Marketa Vondrousova,Ons Jabeur,2.30,1.65\n"
+                  "2024-07-13,Barbora Krejcikova,Jasmine Paolini,1.60,2.40\n", encoding="utf-8")
+              print("Seeded sample odds.")
+          PY
+
+      - name: Normalize local odds (names & dates)
+        run: |
+          mkdir -p scripts data
+          python - <<'PY'
+          # --- scripts/normalize_odds.py (inline) ---
+          import io, os, re, glob, sys, time
+          from pathlib import Path
+          from datetime import timedelta
+          import requests, pandas as pd
+          from rapidfuzz import process, fuzz
+          from unidecode import unidecode
+
+          YEARS=[int(y) for y in os.getenv("YEARS_CSV","2024").split() if y.strip().isdigit()]
+          IN_DIR=Path("data/raw/odds")
+          OUT_DIR=Path("data/raw/odds_normalized"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+          REPORT=Path("data/normalize_report.md")
+
+          def norm(s):
+              s=unidecode(str(s)).lower()
+              s=re.sub(r"[^a-z ]"," ",s)
+              return re.sub(r"\s+"," ",s).strip()
+
+          def fetch_csv(url):
+              for wait in (0,1.5,3.0):
+                  try:
+                      r=requests.get(url, timeout=12); r.raise_for_status()
+                      import io; return pd.read_csv(io.StringIO(r.text))
+                  except Exception as e:
+                      time.sleep(wait)
+              raise RuntimeError(f"Fetch failed: {url}")
+
+          frames=[]; pulled={}
+          for tour, repo in [("ATP","tennis_atp"),("WTA","tennis_wta")]:
+              for y in YEARS:
+                  url=f"https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{tour.lower()}_matches_{y}.csv"
+                  df=fetch_csv(url); df["tour"]=tour; frames.append(df)
+                  pulled[(tour,y)]=len(df)
+          sack=pd.concat(frames, ignore_index=True)
+          sack["date"]=pd.to_datetime(sack["tourney_date"].astype(str), format="%Y%m%d", errors="coerce").dt.normalize()
+          sack["w_norm"]=sack["winner_name"].map(norm); sack["l_norm"]=sack["loser_name"].map(norm)
+          # canonical name dictionary
+          canon=set(sack["winner_name"].astype(str)).union(set(sack["loser_name"].astype(str)))
+          canon_norm={norm(n):n for n in canon}
+
+          def best(q):
+              if q in canon_norm: return canon_norm[q], 100
+              keys=list(canon_norm.keys())
+              m,score,_=process.extractOne(q, keys, scorer=fuzz.token_sort_ratio)
+              return (canon_norm[m], score) if score>=90 else (None, score)
+
+          files=sorted([p for p in IN_DIR.rglob("*.*") if p.suffix.lower() in (".csv",".xlsx",".xls")])
+          lines=[ "# Normalize Odds Report", "", f"- Years: {YEARS}", "- Sackmann pulls:" ]
+          for (tour,y),n in sorted(pulled.items()):
+              lines.append(f"  - {tour} {y}: **{n:,}** rows")
+          lines.append(f"- Input files: **{len(files)}**\n")
+
+          tot_in=tot_out=tot_drop=0
+          for src in files:
+              try:
+                  df=pd.read_excel(src) if src.suffix.lower() in (".xlsx",".xls") else pd.read_csv(src)
+              except Exception:
+                  lines.append(f"## {src.name}\n- Skipped (unreadable)\n"); continue
+              lower={c.lower():c for c in df.columns}
+              def pick(*opts):
+                  for o in opts:
+                      if o in lower: return lower[o]
+                  return None
+              c_date=pick("date","event_date","match_date"); c_pa=pick("player_a","home","player1","p1","selection","player")
+              c_pb=pick("player_b","away","player2","p2","opponent")
+              c_oa=pick("odds_a","price_a","decimal_odds_a","odds1","home_odds","price1","best_odds_a")
+              c_ob=pick("odds_b","price_b","decimal_odds_b","odds2","away_odds","price2","best_odds_b")
+              if None in (c_date,c_pa,c_pb,c_oa,c_ob):
+                  lines.append(f"## {src.name}\n- Skipped (missing required headers)\n"); continue
+              tmp=pd.DataFrame({
+                  "date":pd.to_datetime(df[c_date], errors="coerce").dt.normalize(),
+                  "pa":df[c_pa].astype(str),"pb":df[c_pb].astype(str),
+                  "oa":pd.to_numeric(df[c_oa], errors="coerce"),"ob":pd.to_numeric(df[c_ob], errors="coerce")
+              }).dropna(subset=["date","oa","ob"])
+              tot_in+=len(tmp)
+
+              # map names to canonical
+              can_a=[]; can_b=[]; drop=0
+              for a,b in zip(tmp["pa"].map(norm), tmp["pb"].map(norm)):
+                  A,_=best(a); B,_=best(b)
+                  can_a.append(A); can_b.append(B)
+                  if A is None or B is None: drop+=1
+              tmp["A"]=can_a; tmp["B"]=can_b
+              cleaned=tmp.dropna(subset=["A","B"]).copy()
+
+              # snap date to nearest match within ±7 days for that pair
+              if not cleaned.empty:
+                  sack_small=sack[["date","w_norm","l_norm","winner_name","loser_name"]].copy()
+                  sack_small["pair"]=sack_small.apply(lambda r: " vs ".join(sorted([r["w_norm"],r["l_norm"]])), axis=1)
+                  from collections import defaultdict
+                  pdict=defaultdict(list)
+                  for _,r in sack_small.iterrows():
+                      pdict[r["pair"]].append(r["date"])
+                  def snap(row):
+                      pair=" vs ".join(sorted([norm(row["A"]), norm(row["B"])]))
+                      ds=pdict.get(pair,[])
+                      if not ds: return row["date"]
+                      best=min(ds, key=lambda d: abs(d-row["date"]))
+                      return best if abs(best-row["date"])<=pd.Timedelta(days=7) else row["date"]
+                  cleaned["date"]=cleaned.apply(snap, axis=1)
+
+              out=cleaned.rename(columns={"A":"player_a","B":"player_b","oa":"odds_a","ob":"odds_b"})[["date","player_a","player_b","odds_a","odds_b"]]
+              out.to_csv(OUT_DIR/(src.stem+"_normalized.csv"), index=False)
+              lines.append(f"## {src.name}\n- In rows: **{len(tmp):,}** | Out rows: **{len(out):,}** | Dropped (unmatched): **{drop:,}**\n")
+              tot_out+=len(out); tot_drop+=drop
+
+          lines += ["\n---", f"- TOTAL in: **{tot_in:,}**", f"- TOTAL out: **{tot_out:,}**", f"- TOTAL dropped: **{tot_drop:,}**",
+                    f"- Output dir: `data/raw/odds_normalized/`"]
+          Path("data/normalize_report.md").write_text("\n".join(lines), encoding="utf-8")
+          print("Normalization complete.")
+          PY
+
+      - name: Build dataset (Sackmann + normalized odds) and write summaries
         run: |
           set -euo pipefail
-          echo "YEARS: ${YEARS_CSV}"
-          mkdir -p scripts data/raw/odds data
-
-          cat > scripts/fetch_and_join.py << 'PY'
+          mkdir -p data
+          python - <<'PY'
           import os, io, sys, glob, json, re, time
           from datetime import datetime
           import requests, pandas as pd
@@ -94,65 +234,43 @@ jobs:
           from rapidfuzz import fuzz, process
           from unidecode import unidecode
 
-          YEARS = [int(y) for y in os.getenv("YEARS_CSV","2024").split() if y.strip().isdigit()]
-          ODDS_DIR = "data/raw/odds"
-          OUT_CSV  = "data/historical_matches.csv"
-          ATP_ELO  = "data/atp_elo.csv"
-          WTA_ELO  = "data/wta_elo.csv"
-          META     = "data/dataset_info.json"
-          BUILD_MD = "data/build_summary.md"
+          YEARS=[int(y) for y in os.getenv("YEARS_CSV","2024").split() if y.strip().isdigit()]
+          ODDS_PRIMARY="data/raw/odds_normalized"
+          ODDS_FALLBACK="data/raw/odds"
+          OUT_CSV="data/historical_matches.csv"
+          ATP_ELO="data/atp_elo.csv"; WTA_ELO="data/wta_elo.csv"
+          BUILD_MD="data/build_summary.md"; META="data/dataset_info.json"
 
-          OUTPUT_COLUMNS = ["date","tour","tournament","round","player","opponent",
-                            "odds","opp_odds","result","elo_player","elo_opponent","source"]
-
-          REQ_TIMEOUT = 12
-          RETRIES     = 3
-          BACKOFF     = [0, 1.5, 3.0]
-
-          def norm_name(s):
-              if not isinstance(s, str): return ""
-              s = unidecode(s).lower()
-              s = re.sub(r"[^a-z ]", " ", s)
+          def norm(s):
+              import re
+              from unidecode import unidecode
+              s=unidecode(str(s)).lower()
+              s=re.sub(r"[^a-z ]"," ",s)
               return re.sub(r"\s+"," ",s).strip()
 
-          def safe_date(x):
-              if pd.isna(x): return pd.NaT
-              for fn in (pd.to_datetime, lambda z: pd.to_datetime(parser.parse(str(z)))):
-                  try: return fn(x).normalize()
-                  except: pass
-              return pd.NaT
-
           def fetch_csv(url):
-              err = None
-              for i in range(RETRIES):
+              for wait in (0,1.5,3.0):
                   try:
-                      r = requests.get(url, timeout=REQ_TIMEOUT)
-                      r.raise_for_status()
-                      return pd.read_csv(io.StringIO(r.text))
-                  except Exception as e:
-                      err = e; time.sleep(BACKOFF[min(i,len(BACKOFF)-1)])
-              raise RuntimeError(f"Fetch failed {url}: {err}")
+                      r=requests.get(url, timeout=12); r.raise_for_status()
+                      import io; return pd.read_csv(io.StringIO(r.text))
+                  except Exception: time.sleep(wait)
+              raise RuntimeError(f"Fetch failed: {url}")
 
-          def fetch_sackmann():
-              frames=[]
-              year_counts={}
+          def fetch_sack():
+              frames=[]; pulled={}
               for tour, repo in [("ATP","tennis_atp"),("WTA","tennis_wta")]:
                   for y in YEARS:
                       url=f"https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{tour.lower()}_matches_{y}.csv"
-                      print(f"[DL] {tour} {y}")
-                      df=fetch_csv(url); df["tour"]=tour; frames.append(df)
-                      year_counts[(tour,y)] = len(df)
+                      df=fetch_csv(url); df["tour"]=tour; frames.append(df); pulled[(tour,y)]=len(df)
               res=pd.concat(frames, ignore_index=True)
-              res["tourney_date"]=pd.to_datetime(res["tourney_date"].astype(str), format="%Y%m%d", errors="coerce")
-              keep=["tour","tourney_name","tourney_date","surface","round","winner_name","loser_name"]
+              res["date"]=pd.to_datetime(res["tourney_date"].astype(str), format="%Y%m%d", errors="coerce").dt.normalize()
+              keep=["tour","tourney_name","date","surface","round","winner_name","loser_name"]
               for k in keep:
                   if k not in res.columns: res[k]=pd.NA
               res=res[keep].copy()
-              res["date"]=res["tourney_date"].dt.normalize()
-              res["w_norm"]=res["winner_name"].apply(norm_name)
-              res["l_norm"]=res["loser_name"].apply(norm_name)
-              res["pair_norm_sorted"]=res.apply(lambda r: " vs ".join(sorted([r["w_norm"], r["l_norm"]])), axis=1)
-              return res, year_counts
+              res["w_norm"]=res["winner_name"].map(norm); res["l_norm"]=res["loser_name"].map(norm)
+              res["pair"]=res.apply(lambda r: " vs ".join(sorted([r["w_norm"],r["l_norm"]])), axis=1)
+              return res, pulled
 
           def build_elo(res):
               K,BASE=32.0,1500.0
@@ -163,24 +281,22 @@ jobs:
                   t,w,l=r["tour"],r["w_norm"],r["l_norm"]
                   if not w or not l: continue
                   ew,el=elos[t].get(w,BASE), elos[t].get(l,BASE)
-                  expw=1/(1+10**((el-ew)/400)); expl=1-expw
-                  elos[t][w]=ew+K*(1-expw); elos[t][l]=el+K*(0-expl)
+                  expw=1/(1+10**((el-ew)/400)); elos[t][w]=ew+K*(1-expw); elos[t][l]=el+K*(0-(1-expw))
                   rows.append({"tour":t,"date":r["date"],"w_norm":w,"l_norm":l,"elo_w_pre":ew,"elo_l_pre":el})
               hist=pd.DataFrame(rows)
               pd.DataFrame([{"player":p,"elo":v} for p,v in elos["ATP"].items()]).to_csv(ATP_ELO,index=False)
               pd.DataFrame([{"player":p,"elo":v} for p,v in elos["WTA"].items()]).to_csv(WTA_ELO,index=False)
               return hist
 
-          def load_local_odds():
-              files=sorted(glob.glob(os.path.join(ODDS_DIR,"**/*.csv"),recursive=True)+
-                           glob.glob(os.path.join(ODDS_DIR,"**/*.xlsx"),recursive=True)+
-                           glob.glob(os.path.join(ODDS_DIR,"**/*.xls"),recursive=True))
+          def load_odds():
+              d=ODDS_PRIMARY if any(glob.glob(ODDS_PRIMARY+"/*.csv")) else ODDS_FALLBACK
+              files=sorted(glob.glob(d+"/*.csv")+glob.glob(d+"/*.xlsx")+glob.glob(d+"/*.xls"))
               frames=[]
-              for path in files:
+              for p in files:
                   try:
-                      df=pd.read_excel(path) if path.lower().endswith((".xlsx",".xls")) else pd.read_csv(path)
+                      df=pd.read_excel(p) if p.lower().endswith((".xlsx",".xls")) else pd.read_csv(p)
                   except Exception as e:
-                      print(f"[WARN] skip {path}: {e}"); continue
+                      print(f"[WARN] skip {p}: {e}"); continue
                   lower={c.lower():c for c in df.columns}
                   def pick(*opts):
                       for o in opts:
@@ -189,117 +305,97 @@ jobs:
                   c_date=pick("date","event_date","match_date")
                   c_pa=pick("player_a","home","player1","p1","selection","player")
                   c_pb=pick("player_b","away","player2","p2","opponent")
-                  c_odds_a=pick("odds_a","price_a","decimal_odds_a","odds1","home_odds","price1","best_odds_a")
-                  c_odds_b=pick("odds_b","price_b","decimal_odds_b","odds2","away_odds","price2","best_odds_b")
-                  c_market=pick("market","bettype","bet_type")
-                  c_src=pick("book","bookmaker","source")
-                  if None in (c_date,c_pa,c_pb,c_odds_a,c_odds_b):
-                      print(f"[WARN] {path}: missing headers, skipping."); continue
+                  c_oa=pick("odds_a","price_a","decimal_odds_a","odds1","home_odds","price1","best_odds_a")
+                  c_ob=pick("odds_b","price_b","decimal_odds_b","odds2","away_odds","price2","best_odds_b")
+                  if None in (c_date,c_pa,c_pb,c_oa,c_ob): continue
                   tmp=pd.DataFrame({
-                      "date":pd.to_datetime(df[c_date].apply(safe_date)),
-                      "player_a":df[c_pa].astype(str),
-                      "player_b":df[c_pb].astype(str),
-                      "odds_a":pd.to_numeric(df[c_odds_a], errors="coerce"),
-                      "odds_b":pd.to_numeric(df[c_odds_b], errors="coerce"),
-                      "market":df[c_market] if c_market else "match_winner",
-                      "source":df[c_src] if c_src else "local"})
-                  mask=tmp["market"].astype(str).str.lower().isin(["match_winner","moneyline","1x2","ml","winner","match odds","to win match"])
-                  tmp=tmp[mask].dropna(subset=["date","odds_a","odds_b"]).copy()
-                  tmp["a_norm"]=tmp["player_a"].apply(norm_name); tmp["b_norm"]=tmp["player_b"].apply(norm_name)
+                      "date":pd.to_datetime(df[c_date], errors="coerce").dt.normalize(),
+                      "pa":df[c_pa].astype(str),"pb":df[c_pb].astype(str),
+                      "oa":pd.to_numeric(df[c_oa], errors="coerce"),"ob":pd.to_numeric(df[c_ob], errors="coerce")
+                  }).dropna(subset=["date","oa","ob"])
+                  tmp["a"]=tmp["pa"]; tmp["b"]=tmp["pb"]; # already canonical after normalize step
                   frames.append(tmp)
-              return (pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(),
-                      [f for f in files])
+              return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), d, files)
 
-          def empty_output_df(): return pd.DataFrame(columns=OUTPUT_COLUMNS)
+          def link(res, elo, odds):
+              if odds is None or odds.empty: return pd.DataFrame(columns=[])
 
-          def link_odds(res, elo_hist, odds):
-              if odds is None or odds.empty: return empty_output_df()
-              res_small=res[["tour","date","tourney_name","round","w_norm","l_norm","pair_norm_sorted"]].copy()
+              res_small=res[["tour","date","tourney_name","round","w_norm","l_norm","pair","surface"]].copy()
               out=[]
               for _,o in odds.iterrows():
-                  d0=pd.to_datetime(o["date"]); 
-                  if pd.isna(d0): continue
-                  dmin,dmax=d0-pd.Timedelta(days=7), d0+pd.Timedelta(days=7)
-                  cand=res_small[(res_small["date"]>=dmin)&(res_small["date"]<=dmax)]
+                  d0=o["date"]; pair=" vs ".join(sorted([norm(o["a"]), norm(o["b"])]))
+                  cand=res_small[(res_small["pair"]==pair)&(res_small["date"].between(d0-pd.Timedelta(days=7), d0+pd.Timedelta(days=7)))]
                   if cand.empty: continue
-                  pair=" vs ".join(sorted([o["a_norm"],o["b_norm"]]))
-                  exact=cand[cand["pair_norm_sorted"]==pair]
-                  if not exact.empty: best=exact.iloc[0]
-                  else:
-                      choices=cand["pair_norm_sorted"].tolist()
-                      match,score,_=process.extractOne(pair, choices, scorer=fuzz.token_sort_ratio)
-                      if score<90: continue
-                      best=cand[cand["pair_norm_sorted"]==match].iloc[0]
-                  e_sub=elo_hist[(elo_hist["tour"]==best["tour"])&(elo_hist["date"]<=best["date"])]
-                  def last_elo(pn,side):
+                  m=cand.sort_values("date", key=lambda s: (s-d0).abs()).iloc[0]
+                  e_sub=elo[(elo["tour"]==m["tour"])&(elo["date"]<=m["date"])]
+                  def last(p,side):
                       col="elo_w_pre" if side=="w" else "elo_l_pre"
-                      dfp=e_sub[e_sub[f"{side}_norm"]==pn]
+                      dfp=e_sub[e_sub[f"{side}_norm"]==p]
                       return dfp[col].iloc[-1] if not dfp.empty else 1500.0
-                  elo_w,elo_l=last_elo(best["w_norm"],"w"), last_elo(best["l_norm"],"l")
-                  p_norm,o_norm=o["a_norm"],o["b_norm"]
-                  if p_norm==best["w_norm"]: result,elo_p,elo_o=1,elo_w,elo_l
-                  elif p_norm==best["l_norm"]: result,elo_p,elo_o=0,elo_l,elo_w
-                  else: continue
+                  elo_w,elo_l=last(m["w_norm"],"w"), last(m["l_norm"],"l")
+                  # who is player?
+                  pn, on = norm(o["a"]), norm(o["b"])
+                  res=1 if pn==m["w_norm"] else 0
                   out.append({
-                      "date":best["date"].date(),"tour":best["tour"],"tournament":best["tourney_name"],
-                      "round":best["round"],"player":o["player_a"],"opponent":o["player_b"],
-                      "odds":o["odds_a"],"opp_odds":o["odds_b"],"result":result,
-                      "elo_player":elo_p,"elo_opponent":elo_o,"source":o.get("source","local")})
-              return pd.DataFrame(out, columns=OUTPUT_COLUMNS) if out else empty_output_df()
+                      "date":m["date"].date(),"tour":m["tour"],"tournament":m["tourney_name"],"round":m["round"],
+                      "player":o["a"],"opponent":o["b"],"odds":o["oa"],"opp_odds":o["ob"],"result":res,
+                      "elo_player": (elo_w if pn==m["w_norm"] else elo_l),
+                      "elo_opponent": (elo_l if pn==m["w_norm"] else elo_w),
+                      "surface":m["surface"],"source":"normalized"
+                  })
+              return pd.DataFrame(out)
 
-          # ---------- pipeline ----------
-          res, year_counts = fetch_sackmann()
-          elo_hist = build_elo(res)
-          odds, odds_files = load_local_odds()
-          linked = link_odds(res, elo_hist, odds)
+          res,pulled=fetch_sack()
+          elo=build_elo(res)
+          odds, which_dir, files = load_odds()
+          linked=link(res, elo, odds)
 
           os.makedirs("data", exist_ok=True)
           if len(linked): linked.sort_values(["date","tour","tournament","player"], inplace=True)
           linked.to_csv(OUT_CSV, index=False)
-
-          meta = {
-            "years": YEARS,
-            "built_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
-            "rows": int(len(linked)),
-            "date_min": (linked["date"].min().isoformat() if len(linked) else None),
-            "date_max": (linked["date"].max().isoformat() if len(linked) else None)
-          }
+          meta={"years":YEARS,"built_at_utc":datetime.utcnow().isoformat(timespec="seconds"),
+                "rows":int(len(linked)), "date_min": (linked["date"].min().isoformat() if len(linked) else None),
+                "date_max": (linked["date"].max().isoformat() if len(linked) else None)}
           with open(META,"w") as f: json.dump(meta,f)
 
-          lines = []
+          lines=[]
           lines.append("# Build summary\n")
           lines.append(f"- Years: **{YEARS}**")
           lines.append("- Sackmann pulls:")
-          for (tour, y), n in sorted(year_counts.items()):
+          for (tour,y),n in sorted(pulled.items()):
               lines.append(f"  - {tour} {y}: **{n:,}** rows")
-          lines.append(f"- Local odds files: **{len(odds_files)}**")
+          lines.append(f"- Local odds directory used: `{which_dir}`")
+          lines.append(f"- Local odds files: **{len(files)}**")
           lines.append(f"- Local odds rows: **{0 if odds is None else len(odds):,}**")
           lines.append(f"- Linked rows written: **{len(linked):,}** → `data/historical_matches.csv`")
           if len(linked):
               lines.append(f"- Dataset date range: **{linked['date'].min()} → {linked['date'].max()}**")
               lines.append(f"- Unique players: **{linked['player'].nunique()}**")
-              head = linked.head(10).to_markdown(index=False)
+              head=linked.head(10).to_markdown(index=False)
               lines.append("\n<details><summary>Sample (first 10 rows)</summary>\n\n"+head+"\n\n</details>")
           else:
               lines += [
-                "> No linked rows. Check that:",
-                "  1. Odds files are in `data/raw/odds/` (CSV/XLSX).",
-                "  2. Columns exist: `date, player_a, player_b, odds_a, odds_b` (case-insensitive ok).",
-                "  3. Odds dates are within ±7 days of the match dates.",
-                "  4. Names are close after ASCII folding (e.g., 'Rafael Nadal', not nicknames)."
+                "> No linked rows. Check:",
+                "  1) Odds are in `data/raw/odds/` or `data/raw/odds_normalized/`",
+                "  2) Headers: date, player_a, player_b, odds_a, odds_b",
+                "  3) Dates within ±7 days of match date",
+                "  4) Names normalized (see `data/normalize_report.md`)."
               ]
-          with open(BUILD_MD, "w") as f: f.write("\n".join(lines))
+          with open(BUILD_MD,"w") as f: f.write("\n".join(lines))
           print("[DONE] Build summary saved.")
           PY
 
-          python scripts/fetch_and_join.py
-
-      - name: Publish build summary
+      - name: Publish build & normalize summaries
         run: |
+          if [ -f data/normalize_report.md ]; then
+            echo "## Normalize report" >> "$GITHUB_STEP_SUMMARY"
+            cat data/normalize_report.md >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ -f data/build_summary.md ]; then
+            echo "## Build summary" >> "$GITHUB_STEP_SUMMARY"
             cat data/build_summary.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "_No build summary produced._" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload dataset artifact
@@ -312,6 +408,7 @@ jobs:
             data/wta_elo.csv
             data/dataset_info.json
             data/build_summary.md
+            data/normalize_report.md
           if-no-files-found: warn
 
   backtest:
@@ -319,6 +416,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.do_backtest == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -351,7 +449,7 @@ jobs:
             echo '[]' > injuries.json
           fi
 
-      - name: Parse money & tuners; run TE8 backtest
+      - name: Parse inputs; run TE8 backtest
         shell: bash
         run: |
           test -f backtest_te8.py || { echo "::error ::backtest_te8.py missing in repo root"; exit 1; }
@@ -390,7 +488,7 @@ jobs:
             --out-csv backtest_results.csv \
             --summary backtest_summary.md
 
-      - name: Publish summary
+      - name: Publish summaries
         if: always()
         run: |
           if [ -f data_bundle/build_summary.md ]; then
@@ -404,7 +502,7 @@ jobs:
             echo "_No backtest summary produced._" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload results
+      - name: Upload results (CSV + MD)
         uses: actions/upload-artifact@v4
         with:
           name: backtest-output
