@@ -42,7 +42,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
+        shell: bash
         run: |
+          set -e
           pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -51,7 +53,9 @@ jobs:
           fi
 
       - name: Build dataset
+        shell: bash
         run: |
+          set -e
           mkdir -p data raw
           if [ -f scripts/build_dataset.py ]; then
             python scripts/build_dataset.py
@@ -61,23 +65,31 @@ jobs:
 
       - name: Resolve dates
         id: dates
+        shell: bash
         run: |
-          echo "start=${START_DATE:-2024-01-01}" >> $GITHUB_OUTPUT
-          echo "end=${END_DATE:-2024-12-31}" >> $GITHUB_OUTPUT
+          echo "start=${START_DATE:-2024-01-01}" >> "$GITHUB_OUTPUT"
+          echo "end=${END_DATE:-2024-12-31}" >> "$GITHUB_OUTPUT"
 
       - name: Save params.json
+        shell: bash
         run: |
+          set -e
           MATRIX_BANDS="${{ matrix.bands }}"
           MATRIX_GRID="${{ matrix.grid }}"
-          printf '%s' "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${{ steps.dates.outputs.start }}\",\"end\":\"${{ steps.dates.outputs.end }}\"}" > params.json
+          printf '%s' \
+          "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${{ steps.dates.outputs.start }}\",\"end\":\"${{ steps.dates.outputs.end }}\"}" \
+          > params.json
 
       - name: Init summary
+        shell: bash
         run: |
           echo "# TE8 Backtest Summary" > summary.md
           echo "" >> summary.md
 
       - name: Run backtest
+        shell: bash
         run: |
+          set -e
           if [ -s data/historical_matches.csv ]; then
             python backtest_te8.py \
               --input data/historical_matches.csv \
@@ -91,15 +103,20 @@ jobs:
           fi
 
       - name: Append metrics (if present)
+        shell: bash
         run: |
+          set -e
           if [ -f backtest_metrics.json ]; then
-            python -c "import json; m=json.load(open('backtest_metrics.json')); \
-f=open('summary.md','a'); \
-f.write('**Bets:** %d\\n\\n' % m.get('n_bets',0)); \
-f.write('**Hit-rate:** {:.2%}\\n\\n'.format(m.get('hit_rate',0))); \
-f.write('**ROI:** {:.2%}\\n\\n'.format(m.get('roi',0))); \
-f.write('**Max DD (units):** {:.2f}\\n'.format(m.get('max_drawdown',0))); \
-f.close()"
+            python - <<'PY'
+import json
+with open('backtest_metrics.json') as f:
+    m = json.load(f)
+with open('summary.md','a') as out:
+    out.write("**Bets:** %d\n\n" % m.get('n_bets',0))
+    out.write("**Hit-rate:** {:.2%}\n\n".format(m.get('hit_rate',0)))
+    out.write("**ROI:** {:.2%}\n\n".format(m.get('roi',0)))
+    out.write("**Max DD (units):** {:.2f}\n".format(m.get('max_drawdown',0)))
+PY
           fi
 
       - name: Upload artifacts
@@ -116,6 +133,7 @@ f.close()"
   collate:
     runs-on: ubuntu-latest
     needs: backtest
+
     steps:
       - name: Download all run artifacts
         uses: actions/download-artifact@v4
@@ -128,22 +146,34 @@ f.close()"
           python-version: "3.11"
 
       - name: Install pandas
+        shell: bash
         run: pip install pandas
 
       - name: Rank matrix and create report
+        shell: bash
         run: |
-          python -c 'import os,json,glob,pandas as pd; \
-rows=[]; \
-[ rows.append({**(json.load(open(os.path.join(d,\"params.json\"))) if os.path.exists(os.path.join(d,\"params.json\")) else {}), \
-               **(json.load(open(os.path.join(d,\"backtest_metrics.json\"))) if os.path.exists(os.path.join(d,\"backtest_metrics.json\")) else {}), \
-               \"artifact\": os.path.basename(d)}) \
-  for d in glob.glob(\"artifacts/*\") ]; \
-df=pd.DataFrame(rows); \
-open(\"index.html\",\"w\").write(\"<h1>Courtsense Backtest Matrix</h1>\"+(df.to_html(index=False) if not df.empty else \"<p>No artifacts found</p>\")); \
-(df.fillna({\"roi\":0,\"hit_rate\":0,\"n_bets\":0,\"max_drawdown\":0}) \
- .assign(roi_rank=lambda x: x[\"roi\"].rank(ascending=False,method=\"min\")) \
- .sort_values([\"roi\",\"hit_rate\"], ascending=[False,False]) \
- .to_csv(\"matrix_rankings.csv\", index=False))'
+          set -e
+          python - <<'PY'
+import os, json, glob, pandas as pd
+rows=[]
+for d in glob.glob("artifacts/*"):
+    params_path = os.path.join(d,"params.json")
+    metrics_path = os.path.join(d,"backtest_metrics.json")
+    params = json.load(open(params_path)) if os.path.exists(params_path) else {}
+    metrics = json.load(open(metrics_path)) if os.path.exists(metrics_path) else {}
+    rows.append({**params, **metrics, "artifact": os.path.basename(d)})
+
+df=pd.DataFrame(rows)
+if df.empty:
+    open("index.html","w").write("<h1>No artifacts found</h1>")
+    pd.DataFrame().to_csv("matrix_rankings.csv",index=False)
+else:
+    df=df.fillna({'roi':0,'hit_rate':0,'n_bets':0,'max_drawdown':0})
+    df['roi_rank']=df['roi'].rank(ascending=False,method='min')
+    df.sort_values(['roi','hit_rate'], ascending=[False,False], inplace=True)
+    df.to_csv("matrix_rankings.csv", index=False)
+    open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+df.to_html(index=False))
+PY
 
       - name: Upload matrix report
         uses: actions/upload-artifact@v4
