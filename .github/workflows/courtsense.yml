@@ -29,9 +29,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        shell: bash
         run: |
-          set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -40,50 +38,13 @@ jobs:
           fi
 
       - name: Ensure dataset exists
-        shell: bash
-        run: |
-          set -e
-          mkdir -p data
-          if [ ! -f data/historical_matches.csv ]; then
-            python -c "import pandas as pd; pd.DataFrame(columns=['date','tournament','round','player1','player2','odds1','odds2','result']).to_csv('data/historical_matches.csv', index=False)"
-          fi
+        run: python scripts/ensure_dataset.py
 
       - name: Run backtest
-        shell: bash
-        run: |
-          set -e
-          START="${START:-2024-01-01}"
-          END="${END:-2024-12-31}"
+        run: python scripts/run_backtest.py --start "$START" --end "$END"
 
-          echo "# TE8 Backtest Summary" > summary.md
-          echo "" >> summary.md
-
-          if [ -s data/historical_matches.csv ]; then
-            # Adjust args here if your script needs more (e.g., --bands/--grid)
-            python backtest_te8.py \
-              --input data/historical_matches.csv \
-              --start "$START" \
-              --end   "$END" \
-              --out-csv results.csv || true
-          else
-            echo "Dataset missing or empty." >> summary.md
-          fi
-
-      - name: Append metrics to summary (if present)
-        shell: bash
-        run: |
-          set -e
-          if [ -f backtest_metrics.json ]; then
-            python -c "import json; m=json.load(open('backtest_metrics.json')); \
-f=open('summary.md','a'); \
-f.write('**Bets:** %d\\n\\n' % m.get('n_bets',0)); \
-f.write('**Hit-rate:** %.2f%%\\n\\n' % (100*m.get('hit_rate',0))); \
-f.write('**ROI:** %.2f%%\\n\\n' % (100*m.get('roi',0))); \
-f.write('**Max DD (units):** %.2f\\n' % m.get('max_drawdown',0)); \
-f.close()"
-          elif [ -f results.csv ]; then
-            echo "Backtest completed. See results.csv." >> summary.md
-          fi
+      - name: Append metrics to summary
+        run: python scripts/append_metrics.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
