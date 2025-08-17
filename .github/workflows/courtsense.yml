@@ -31,11 +31,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy
-          fi
+          # Add matplotlib for the equity curve in the report
+          pip install pandas numpy matplotlib
 
       - name: Ensure dataset exists
         run: python scripts/ensure_dataset.py
@@ -46,6 +43,9 @@ jobs:
       - name: Append metrics to summary
         run: python scripts/append_metrics.py
 
+      - name: Generate HTML report
+        run: python scripts/generate_report.py
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -54,4 +54,5 @@ jobs:
             summary.md
             results.csv
             backtest_metrics.json
+            index.html
           if-no-files-found: ignore
