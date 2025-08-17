@@ -12,7 +12,7 @@ on:
         required: true
         default: "2024-12-31"
   schedule:
-    - cron: "15 6 * * *"   # daily 06:15 UTC
+    - cron: "15 6 * * *"  # daily 06:15 UTC
 
 permissions:
   contents: read
@@ -28,6 +28,9 @@ jobs:
           - "1.10,1.30,1.55,1.85,2.20,3.00"
           - "1.15,1.35,1.60,1.90,2.30,3.20"
         grid: [ "HARD,CLAY,GRASS,INDOOR", "HARD,CLAY" ]
+    env:
+      START_DATE: ${{ github.event.inputs.start_date }}
+      END_DATE:   ${{ github.event.inputs.end_date }}
 
     steps:
       - name: Checkout
@@ -58,9 +61,10 @@ jobs:
             python scripts/build_dataset.py
           else
             python - <<'PY'
-import pandas as pd
-pd.DataFrame(columns=['date','tournament','round','player1','player2','odds1','odds2','result'])\
-  .to_csv('data/historical_matches.csv', index=False)
+import os, pandas as pd
+os.makedirs('data', exist_ok=True)
+cols = ['date','tournament','round','player1','player2','odds1','odds2','result']
+pd.DataFrame(columns=cols).to_csv('data/historical_matches.csv', index=False)
 print("Created empty data/historical_matches.csv")
 PY
           fi
@@ -69,20 +73,29 @@ PY
         shell: bash
         run: |
           set -e
+
+          # Resolve defaults in bash (safe, no YAML tricks)
+          START="${START_DATE:-2024-01-01}"
+          END="${END_DATE:-2024-12-31}"
+
           SUMMARY="summary.md"
           RESULTS="results.csv"
 
-          # Save params (heredoc to avoid YAML quoting issues)
+          # Save params for collation
           python - <<'PY'
-import json
+import json, os
 params = {
-  "bands": "${{ matrix.bands }}",
-  "grid": "${{ matrix.grid }}",
-  "start": "${{ github.event.inputs.start_date || '2024-01-01' }}",
-  "end":   "${{ github.event.inputs.end_date   || '2024-12-31' }}"
+  "bands": os.environ.get("MATRIX_BANDS",""),
+  "grid": os.environ.get("MATRIX_GRID",""),
+  "start": os.environ.get("START",""),
+  "end": os.environ.get("END","")
 }
 json.dump(params, open("params.json","w"))
 PY
+          # Export matrix values for the heredoc above
+          export MATRIX_BANDS="${{ matrix.bands }}"
+          export MATRIX_GRID="${{ matrix.grid }}"
+          export START END
 
           echo "# TE8 Backtest Summary" > "$SUMMARY"
           echo "" >> "$SUMMARY"
@@ -90,8 +103,8 @@ PY
           if [ -s data/historical_matches.csv ]; then
             python backtest_te8.py \
               --input data/historical_matches.csv \
-              --start "${{ github.event.inputs.start_date || '2024-01-01' }}" \
-              --end   "${{ github.event.inputs.end_date   || '2024-12-31' }}" \
+              --start "$START" \
+              --end   "$END" \
               --bands "${{ matrix.bands }}" \
               --grid  "${{ matrix.grid }}" \
               --out-csv "$RESULTS"
@@ -125,6 +138,7 @@ PY
   collate:
     runs-on: ubuntu-latest
     needs: backtest
+
     steps:
       - name: Download all run artifacts
         uses: actions/download-artifact@v4
@@ -138,8 +152,7 @@ PY
 
       - name: Install pandas
         shell: bash
-        run: |
-          pip install pandas
+        run: pip install pandas
 
       - name: Rank matrix and create report
         shell: bash
