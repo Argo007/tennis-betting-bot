@@ -16,43 +16,25 @@ on:
         required: false
         default: "1.05,1.25,1.50,1.80,2.20,3.00"
       grid:
-        description: "Surface grid or config"
+        description: "Surface grid/config"
         required: false
         default: "HARD,CLAY,GRASS,INDOOR"
 
 permissions:
   contents: read
 
-concurrency:
-  group: courtsense-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      # 1) Checkout
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Cache pip (best effort)
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 4) Install deps (fallback to essentials if no requirements)
       - name: Install dependencies
         shell: bash
         run: |
@@ -64,9 +46,6 @@ jobs:
             pip install pandas numpy requests pyyaml beautifulsoup4
           fi
 
-      # 5) (Optional) Prepare dataset. If your upstream step/script creates
-      #    data/historical_matches.csv, great. If not, we create an empty one
-      #    so the next step can exit cleanly with a summary.
       - name: Ensure dataset exists (safe no-op if present)
         shell: bash
         run: |
@@ -74,14 +53,13 @@ jobs:
           mkdir -p data
           if [ ! -f data/historical_matches.csv ]; then
             python - <<'PY'
-import pandas as pd, os
+import pandas as pd
 cols = ["date","tournament","round","player1","player2","odds1","odds2","result"]
 pd.DataFrame(columns=cols).to_csv("data/historical_matches.csv", index=False)
 print("Created empty data/historical_matches.csv")
 PY
           fi
 
-      # 6) Backtest — skip gracefully on 0 rows or missing file
       - name: Backtest (skip gracefully on 0 rows)
         shell: bash
         run: |
@@ -98,11 +76,11 @@ import pandas as pd
 try:
     df = pd.read_csv('data/historical_matches.csv')
     print(len(df))
-except Exception as e:
+except Exception:
     print(0)
 EOF
 )
-            echo "Detected $N rows in dataset."
+            echo "Rows detected: $N"
             if [ "$N" = "0" ]; then
               echo "No rows to backtest (0 linked games)." >> "$SUMMARY"
             else
@@ -113,7 +91,6 @@ EOF
                 --bands "${{ github.event.inputs.bands }}" \
                 --grid  "${{ github.event.inputs.grid }}" \
                 --out-csv "$RESULTS"
-
               if [ -f "$RESULTS" ]; then
                 echo "Backtest completed. Results written to $RESULTS." >> "$SUMMARY"
               else
@@ -124,7 +101,6 @@ EOF
             echo "Dataset missing or unreadable: data/historical_matches.csv" >> "$SUMMARY"
           fi
 
-      # 7) Always upload artifacts so you can inspect outputs even on soft-fail
       - name: Upload summary
         if: always()
         uses: actions/upload-artifact@v4
