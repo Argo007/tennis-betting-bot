@@ -75,7 +75,7 @@ jobs:
           SUMMARY="summary.md"
           RESULTS="results.csv"
 
-          # Save params (printf is safest)
+          # Save params for collation (printf avoids YAML/heredoc issues)
           MATRIX_BANDS="${{ matrix.bands }}"
           MATRIX_GRID="${{ matrix.grid }}"
           printf '%s' \
@@ -97,20 +97,15 @@ jobs:
             echo "Dataset missing or empty." >> "$SUMMARY"
           fi
 
-          # Append metrics safely inside Python
+          # Append metrics safely (no heredoc, no shell redirection)
           if [ -f backtest_metrics.json ]; then
-            python - <<'PY'
-import json
-
-with open("backtest_metrics.json") as f:
-    m = json.load(f)
-
-with open("summary.md", "a") as out:
-    out.write(f"**Bets:** {m.get('n_bets', 0)}\n\n")
-    out.write(f"**Hit-rate:** {m.get('hit_rate', 0):.2%}\n\n")
-    out.write(f"**ROI:** {m.get('roi', 0):.2%}\n\n")
-    out.write(f"**Max DD (units):** {m.get('max_drawdown', 0):.2f}\n")
-PY
+            python -c "import json; m=json.load(open('backtest_metrics.json')); \
+f=open('summary.md','a'); \
+f.write('**Bets:** %d\\n\\n' % m.get('n_bets',0)); \
+f.write('**Hit-rate:** {:.2%}\\n\\n'.format(m.get('hit_rate',0))); \
+f.write('**ROI:** {:.2%}\\n\\n'.format(m.get('roi',0))); \
+f.write('**Max DD (units):** {:.2f}\\n'.format(m.get('max_drawdown',0))); \
+f.close()"
           fi
 
       - name: Upload artifacts
@@ -146,27 +141,19 @@ PY
         shell: bash
         run: |
           set -e
-          python - <<'PY'
-import os, json, glob, pandas as pd
-rows=[]
-for d in glob.glob("artifacts/*"):
-    params_path = os.path.join(d,"params.json")
-    metrics_path = os.path.join(d,"backtest_metrics.json")
-    params = json.load(open(params_path)) if os.path.exists(params_path) else {}
-    metrics = json.load(open(metrics_path)) if os.path.exists(metrics_path) else {}
-    rows.append({**params, **metrics, "artifact": os.path.basename(d)})
-
-df=pd.DataFrame(rows)
-if df.empty:
-    open("index.html","w").write("<h1>No artifacts found</h1>")
-    pd.DataFrame().to_csv("matrix_rankings.csv",index=False)
-else:
-    df=df.fillna({'roi':0,'hit_rate':0,'n_bets':0,'max_drawdown':0})
-    df['roi_rank']=df['roi'].rank(ascending=False,method='min')
-    df.sort_values(['roi','hit_rate'], ascending=[False,False], inplace=True)
-    df.to_csv("matrix_rankings.csv", index=False)
-    open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+df.to_html(index=False))
-PY
+          python -c 'import os,json,glob,pandas as pd; \
+rows=[]; \
+[ rows.append({**(json.load(open(os.path.join(d,"params.json"))) if os.path.exists(os.path.join(d,"params.json")) else {}), \
+               **(json.load(open(os.path.join(d,"backtest_metrics.json"))) if os.path.exists(os.path.join(d,"backtest_metrics.json")) else {}), \
+               "artifact": os.path.basename(d)}) \
+  for d in glob.glob("artifacts/*") ]; \
+df=pd.DataFrame(rows); \
+import builtins; \
+open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+(df.to_html(index=False) if not df.empty else "<p>No artifacts found</p>")); \
+(df.fillna({"roi":0,"hit_rate":0,"n_bets":0,"max_drawdown":0}) \
+ .assign(roi_rank=lambda x: x["roi"].rank(ascending=False,method="min")) \
+ .sort_values(["roi","hit_rate"], ascending=[False,False]) \
+ .to_csv("matrix_rankings.csv", index=False))'
 
       - name: Upload matrix report
         uses: actions/upload-artifact@v4
