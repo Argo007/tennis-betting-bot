@@ -75,7 +75,7 @@ jobs:
           SUMMARY="summary.md"
           RESULTS="results.csv"
 
-          # Save params for collation (printf avoids YAML/Python heredoc issues)
+          # Save params (printf is safest)
           MATRIX_BANDS="${{ matrix.bands }}"
           MATRIX_GRID="${{ matrix.grid }}"
           printf '%s' \
@@ -97,15 +97,19 @@ jobs:
             echo "Dataset missing or empty." >> "$SUMMARY"
           fi
 
-          # Append metrics (safe heredoc redirect)
+          # Append metrics safely inside Python
           if [ -f backtest_metrics.json ]; then
-            python - <<'PY' >> "$SUMMARY"
+            python - <<'PY'
 import json
-m = json.load(open('backtest_metrics.json'))
-print(f"**Bets:** {m.get('n_bets', 0)}\n")
-print(f"**Hit-rate:** {m.get('hit_rate', 0):.2%}\n")
-print(f"**ROI:** {m.get('roi', 0):.2%}\n")
-print(f"**Max DD (units):** {m.get('max_drawdown', 0):.2f}\n")
+
+with open("backtest_metrics.json") as f:
+    m = json.load(f)
+
+with open("summary.md", "a") as out:
+    out.write(f"**Bets:** {m.get('n_bets', 0)}\n\n")
+    out.write(f"**Hit-rate:** {m.get('hit_rate', 0):.2%}\n\n")
+    out.write(f"**ROI:** {m.get('roi', 0):.2%}\n\n")
+    out.write(f"**Max DD (units):** {m.get('max_drawdown', 0):.2f}\n")
 PY
           fi
 
