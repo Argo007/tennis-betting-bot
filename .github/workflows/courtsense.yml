@@ -60,7 +60,7 @@ jobs:
           if [ -f scripts/build_dataset.py ]; then
             python scripts/build_dataset.py
           else
-            python -c "import os; os.makedirs('data', exist_ok=True); import pandas as pd; cols=['date','tournament','round','player1','player2','odds1','odds2','result']; pd.DataFrame(columns=cols).to_csv('data/historical_matches.csv', index=False)"
+            python -c "import os,pandas as pd; os.makedirs('data',exist_ok=True); pd.DataFrame(columns=['date','tournament','round','player1','player2','odds1','odds2','result']).to_csv('data/historical_matches.csv',index=False)"
           fi
 
       - name: Resolve dates
@@ -76,9 +76,7 @@ jobs:
           set -e
           MATRIX_BANDS="${{ matrix.bands }}"
           MATRIX_GRID="${{ matrix.grid }}"
-          printf '%s' \
-          "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${{ steps.dates.outputs.start }}\",\"end\":\"${{ steps.dates.outputs.end }}\"}" \
-          > params.json
+          printf '%s' "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${{ steps.dates.outputs.start }}\",\"end\":\"${{ steps.dates.outputs.end }}\"}" > params.json
 
       - name: Init summary
         shell: bash
@@ -107,16 +105,10 @@ jobs:
         run: |
           set -e
           if [ -f backtest_metrics.json ]; then
-            python - <<'PY'
-import json
-with open('backtest_metrics.json') as f:
-    m = json.load(f)
-with open('summary.md','a') as out:
-    out.write("**Bets:** %d\n\n" % m.get('n_bets',0))
-    out.write("**Hit-rate:** {:.2%}\n\n".format(m.get('hit_rate',0)))
-    out.write("**ROI:** {:.2%}\n\n".format(m.get('roi',0)))
-    out.write("**Max DD (units):** {:.2f}\n".format(m.get('max_drawdown',0)))
-PY
+            python -c "import json; m=json.load(open('backtest_metrics.json')); open('summary.md','a').write('**Bets:** %d\\n\\n' % m.get('n_bets',0))"
+            python -c "import json; m=json.load(open('backtest_metrics.json')); open('summary.md','a').write('**Hit-rate:** %.2f%%\\n\\n' % (m.get('hit_rate',0)*100))"
+            python -c "import json; m=json.load(open('backtest_metrics.json')); open('summary.md','a').write('**ROI:** %.2f%%\\n\\n' % (m.get('roi',0)*100))"
+            python -c "import json; m=json.load(open('backtest_metrics.json')); open('summary.md','a').write('**Max DD (units):** %.2f\\n' % (m.get('max_drawdown',0)))"
           fi
 
       - name: Upload artifacts
@@ -147,7 +139,8 @@ PY
 
       - name: Install pandas
         shell: bash
-        run: pip install pandas
+        run: |
+          pip install pandas
 
       - name: Rank matrix and create report
         shell: bash
@@ -155,24 +148,31 @@ PY
           set -e
           python - <<'PY'
 import os, json, glob, pandas as pd
-rows=[]
-for d in glob.glob("artifacts/*"):
-    params_path = os.path.join(d,"params.json")
-    metrics_path = os.path.join(d,"backtest_metrics.json")
-    params = json.load(open(params_path)) if os.path.exists(params_path) else {}
-    metrics = json.load(open(metrics_path)) if os.path.exists(metrics_path) else {}
-    rows.append({**params, **metrics, "artifact": os.path.basename(d)})
 
-df=pd.DataFrame(rows)
+rows = []
+for d in glob.glob("artifacts/*"):
+    params_path  = os.path.join(d, "params.json")
+    metrics_path = os.path.join(d, "backtest_metrics.json")
+    params  = json.load(open(params_path))  if os.path.exists(params_path)  else {}
+    metrics = json.load(open(metrics_path)) if os.path.exists(metrics_path) else {}
+    if params or metrics:
+        rec = {}
+        rec.update(params)
+        rec.update(metrics)
+        rec["artifact"] = os.path.basename(d)
+        rows.append(rec)
+
+df = pd.DataFrame(rows)
+
 if df.empty:
     open("index.html","w").write("<h1>No artifacts found</h1>")
-    pd.DataFrame().to_csv("matrix_rankings.csv",index=False)
-else:
-    df=df.fillna({'roi':0,'hit_rate':0,'n_bets':0,'max_drawdown':0})
-    df['roi_rank']=df['roi'].rank(ascending=False,method='min')
-    df.sort_values(['roi','hit_rate'], ascending=[False,False], inplace=True)
     df.to_csv("matrix_rankings.csv", index=False)
-    open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+df.to_html(index=False))
+else:
+    df = (df.fillna({"roi":0,"hit_rate":0,"n_bets":0,"max_drawdown":0})
+            .assign(roi_rank=lambda x: x["roi"].rank(ascending=False, method="min"))
+            .sort_values(["roi","hit_rate"], ascending=[False, False]))
+    df.to_csv("matrix_rankings.csv", index=False)
+    open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>" + df.to_html(index=False))
 PY
 
       - name: Upload matrix report
