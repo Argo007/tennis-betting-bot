@@ -75,7 +75,7 @@ jobs:
           SUMMARY="summary.md"
           RESULTS="results.csv"
 
-          # Save params for collation (printf avoids YAML/heredoc issues)
+          # Save params (printf avoids heredocs/quoting issues)
           MATRIX_BANDS="${{ matrix.bands }}"
           MATRIX_GRID="${{ matrix.grid }}"
           printf '%s' \
@@ -97,7 +97,7 @@ jobs:
             echo "Dataset missing or empty." >> "$SUMMARY"
           fi
 
-          # Append metrics safely (no heredoc, no shell redirection)
+          # Append metrics (no heredoc, no shell redirection)
           if [ -f backtest_metrics.json ]; then
             python -c "import json; m=json.load(open('backtest_metrics.json')); \
 f=open('summary.md','a'); \
@@ -122,6 +122,7 @@ f.close()"
   collate:
     runs-on: ubuntu-latest
     needs: backtest
+
     steps:
       - name: Download all run artifacts
         uses: actions/download-artifact@v4
@@ -148,7 +149,6 @@ rows=[]; \
                "artifact": os.path.basename(d)}) \
   for d in glob.glob("artifacts/*") ]; \
 df=pd.DataFrame(rows); \
-import builtins; \
 open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+(df.to_html(index=False) if not df.empty else "<p>No artifacts found</p>")); \
 (df.fillna({"roi":0,"hit_rate":0,"n_bets":0,"max_drawdown":0}) \
  .assign(roi_rank=lambda x: x["roi"].rank(ascending=False,method="min")) \
