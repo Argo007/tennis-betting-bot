@@ -68,27 +68,19 @@ jobs:
         run: |
           set -e
 
-          # Resolve defaults in bash (safe)
-          START=\"${START_DATE:-2024-01-01}\"
-          END=\"${END_DATE:-2024-12-31}\"
+          # Resolve defaults in bash
+          START="${START_DATE:-2024-01-01}"
+          END="${END_DATE:-2024-12-31}"
 
           SUMMARY="summary.md"
           RESULTS="results.csv"
 
-          # Save params for collation (use envs to avoid YAML expression soup)
-          export MATRIX_BANDS="${{ matrix.bands }}"
-          export MATRIX_GRID="${{ matrix.grid }}"
-          export START END
-          python - <<'PY'
-import json, os
-params = {
-  "bands": os.environ.get("MATRIX_BANDS",""),
-  "grid": os.environ.get("MATRIX_GRID",""),
-  "start": os.environ.get("START",""),
-  "end": os.environ.get("END","")
-}
-json.dump(params, open("params.json","w"))
-PY
+          # Save params for collation (printf avoids YAML/Python heredoc issues)
+          MATRIX_BANDS="${{ matrix.bands }}"
+          MATRIX_GRID="${{ matrix.grid }}"
+          printf '%s' \
+          "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${START}\",\"end\":\"${END}\"}" \
+          > params.json
 
           echo "# TE8 Backtest Summary" > "$SUMMARY"
           echo "" >> "$SUMMARY"
@@ -105,7 +97,7 @@ PY
             echo "Dataset missing or empty." >> "$SUMMARY"
           fi
 
-          # Append metrics (heredoc is safest here)
+          # Append metrics (safe heredoc redirect)
           if [ -f backtest_metrics.json ]; then
             python - <<'PY' >> "$SUMMARY"
 import json
