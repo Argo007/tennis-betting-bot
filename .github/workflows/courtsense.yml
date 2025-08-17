@@ -1,4 +1,4 @@
- name: Courtsense CI
+name: Courtsense CI
 
 on:
   workflow_dispatch:
