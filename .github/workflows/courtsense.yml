@@ -52,12 +52,8 @@ jobs:
           set -e
           mkdir -p data
           if [ ! -f data/historical_matches.csv ]; then
-            python - <<'PY'
-import pandas as pd
-cols = ["date","tournament","round","player1","player2","odds1","odds2","result"]
-pd.DataFrame(columns=cols).to_csv("data/historical_matches.csv", index=False)
-print("Created empty data/historical_matches.csv")
-PY
+            python -c "import pandas as pd; cols=['date','tournament','round','player1','player2','odds1','odds2','result']; pd.DataFrame(columns=cols).to_csv('data/historical_matches.csv', index=False)"
+            echo "Created empty data/historical_matches.csv"
           fi
 
       - name: Backtest (skip gracefully on 0 rows)
@@ -71,15 +67,7 @@ PY
           echo "" >> "$SUMMARY"
 
           if [ -s data/historical_matches.csv ]; then
-            N=$(python - <<'EOF'
-import pandas as pd
-try:
-    df = pd.read_csv('data/historical_matches.csv')
-    print(len(df))
-except Exception:
-    print(0)
-EOF
-)
+            N=$(python -c "import pandas as pd,sys; print(len(pd.read_csv('data/historical_matches.csv')) if True else 0)")
             echo "Rows detected: $N"
             if [ "$N" = "0" ]; then
               echo "No rows to backtest (0 linked games)." >> "$SUMMARY"
@@ -91,6 +79,7 @@ EOF
                 --bands "${{ github.event.inputs.bands }}" \
                 --grid  "${{ github.event.inputs.grid }}" \
                 --out-csv "$RESULTS"
+
               if [ -f "$RESULTS" ]; then
                 echo "Backtest completed. Results written to $RESULTS." >> "$SUMMARY"
               else
