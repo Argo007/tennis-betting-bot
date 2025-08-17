@@ -1,4 +1,4 @@
-name: Courtsense CI
+ name: Courtsense CI
 
 on:
   workflow_dispatch:
@@ -36,15 +36,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
-          set -e
           pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -53,51 +51,47 @@ jobs:
           fi
 
       - name: Build dataset
-        shell: bash
         run: |
-          set -e
           mkdir -p data raw
           if [ -f scripts/build_dataset.py ]; then
             python scripts/build_dataset.py
           else
-            python -c "import os; os.makedirs('data', exist_ok=True); import pandas as pd; cols=['date','tournament','round','player1','player2','odds1','odds2','result']; pd.DataFrame(columns=cols).to_csv('data/historical_matches.csv', index=False); print('Created empty data/historical_matches.csv')"
+            python -c "import os; os.makedirs('data', exist_ok=True); import pandas as pd; cols=['date','tournament','round','player1','player2','odds1','odds2','result']; pd.DataFrame(columns=cols).to_csv('data/historical_matches.csv', index=False)"
           fi
 
-      - name: Backtest (matrix)
-        shell: bash
+      - name: Resolve dates
+        id: dates
         run: |
-          set -e
+          echo "start=${START_DATE:-2024-01-01}" >> $GITHUB_OUTPUT
+          echo "end=${END_DATE:-2024-12-31}" >> $GITHUB_OUTPUT
 
-          # Resolve defaults in bash
-          START="${START_DATE:-2024-01-01}"
-          END="${END_DATE:-2024-12-31}"
-
-          SUMMARY="summary.md"
-          RESULTS="results.csv"
-
-          # Save params (printf avoids heredocs/quoting issues)
+      - name: Save params.json
+        run: |
           MATRIX_BANDS="${{ matrix.bands }}"
           MATRIX_GRID="${{ matrix.grid }}"
-          printf '%s' \
-          "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${START}\",\"end\":\"${END}\"}" \
-          > params.json
+          printf '%s' "{\"bands\":\"${MATRIX_BANDS}\",\"grid\":\"${MATRIX_GRID}\",\"start\":\"${{ steps.dates.outputs.start }}\",\"end\":\"${{ steps.dates.outputs.end }}\"}" > params.json
 
-          echo "# TE8 Backtest Summary" > "$SUMMARY"
-          echo "" >> "$SUMMARY"
+      - name: Init summary
+        run: |
+          echo "# TE8 Backtest Summary" > summary.md
+          echo "" >> summary.md
 
+      - name: Run backtest
+        run: |
           if [ -s data/historical_matches.csv ]; then
             python backtest_te8.py \
               --input data/historical_matches.csv \
-              --start "$START" \
-              --end   "$END" \
+              --start "${{ steps.dates.outputs.start }}" \
+              --end   "${{ steps.dates.outputs.end }}" \
               --bands "${{ matrix.bands }}" \
               --grid  "${{ matrix.grid }}" \
-              --out-csv "$RESULTS"
+              --out-csv results.csv
           else
-            echo "Dataset missing or empty." >> "$SUMMARY"
+            echo "Dataset missing or empty." >> summary.md
           fi
 
-          # Append metrics (no heredoc, no shell redirection)
+      - name: Append metrics (if present)
+        run: |
           if [ -f backtest_metrics.json ]; then
             python -c "import json; m=json.load(open('backtest_metrics.json')); \
 f=open('summary.md','a'); \
@@ -122,38 +116,34 @@ f.close()"
   collate:
     runs-on: ubuntu-latest
     needs: backtest
-
     steps:
       - name: Download all run artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Set up Python
+      - name: Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install pandas
-        shell: bash
         run: pip install pandas
 
       - name: Rank matrix and create report
-        shell: bash
         run: |
-          set -e
           python -c 'import os,json,glob,pandas as pd; \
 rows=[]; \
-[ rows.append({**(json.load(open(os.path.join(d,"params.json"))) if os.path.exists(os.path.join(d,"params.json")) else {}), \
-               **(json.load(open(os.path.join(d,"backtest_metrics.json"))) if os.path.exists(os.path.join(d,"backtest_metrics.json")) else {}), \
-               "artifact": os.path.basename(d)}) \
-  for d in glob.glob("artifacts/*") ]; \
+[ rows.append({**(json.load(open(os.path.join(d,\"params.json\"))) if os.path.exists(os.path.join(d,\"params.json\")) else {}), \
+               **(json.load(open(os.path.join(d,\"backtest_metrics.json\"))) if os.path.exists(os.path.join(d,\"backtest_metrics.json\")) else {}), \
+               \"artifact\": os.path.basename(d)}) \
+  for d in glob.glob(\"artifacts/*\") ]; \
 df=pd.DataFrame(rows); \
-open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+(df.to_html(index=False) if not df.empty else "<p>No artifacts found</p>")); \
-(df.fillna({"roi":0,"hit_rate":0,"n_bets":0,"max_drawdown":0}) \
- .assign(roi_rank=lambda x: x["roi"].rank(ascending=False,method="min")) \
- .sort_values(["roi","hit_rate"], ascending=[False,False]) \
- .to_csv("matrix_rankings.csv", index=False))'
+open(\"index.html\",\"w\").write(\"<h1>Courtsense Backtest Matrix</h1>\"+(df.to_html(index=False) if not df.empty else \"<p>No artifacts found</p>\")); \
+(df.fillna({\"roi\":0,\"hit_rate\":0,\"n_bets\":0,\"max_drawdown\":0}) \
+ .assign(roi_rank=lambda x: x[\"roi\"].rank(ascending=False,method=\"min\")) \
+ .sort_values([\"roi\",\"hit_rate\"], ascending=[False,False]) \
+ .to_csv(\"matrix_rankings.csv\", index=False))'
 
       - name: Upload matrix report
         uses: actions/upload-artifact@v4
