@@ -4,21 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: "Backtest start date (YYYY-MM-DD)"
+        description: "YYYY-MM-DD"
         required: true
         default: "2024-01-01"
       end_date:
-        description: "Backtest end date (YYYY-MM-DD)"
+        description: "YYYY-MM-DD"
         required: true
         default: "2024-12-31"
-      bands:
-        description: "Odds bands (comma-separated)"
-        required: false
-        default: "1.05,1.25,1.50,1.80,2.20,3.00"
-      grid:
-        description: "Surface grid/config"
-        required: false
-        default: "HARD,CLAY,GRASS,INDOOR"
+  schedule:
+    - cron: "15 6 * * *"   # daily 06:15 UTC
 
 permissions:
   contents: read
@@ -26,6 +20,15 @@ permissions:
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bands:
+          - "1.05,1.25,1.50,1.80,2.20,3.00"
+          - "1.10,1.30,1.55,1.85,2.20,3.00"
+          - "1.15,1.35,1.60,1.90,2.30,3.20"
+        grid: [ "HARD,CLAY,GRASS,INDOOR", "HARD,CLAY" ]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,72 +38,109 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         shell: bash
         run: |
           set -e
+          pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install --upgrade pip
             pip install pandas numpy requests pyyaml beautifulsoup4
           fi
 
-      - name: Ensure dataset exists (safe no-op if present)
+      - name: Build dataset
         shell: bash
         run: |
           set -e
-          mkdir -p data
-          if [ ! -f data/historical_matches.csv ]; then
-            python -c "import pandas as pd; cols=['date','tournament','round','player1','player2','odds1','odds2','result']; pd.DataFrame(columns=cols).to_csv('data/historical_matches.csv', index=False)"
-            echo "Created empty data/historical_matches.csv"
+          mkdir -p data raw
+          if [ -f scripts/build_dataset.py ]; then
+            python scripts/build_dataset.py
+          else
+            python -c "import pandas as pd; pd.DataFrame(columns=['date','tournament','round','player1','player2','odds1','odds2','result']).to_csv('data/historical_matches.csv',index=False)"
           fi
 
-      - name: Backtest (skip gracefully on 0 rows)
+      - name: Backtest (matrix)
         shell: bash
         run: |
           set -e
-          SUMMARY=backtest_summary.md
-          RESULTS=backtest_results.csv
+          SUMMARY="summary.md"
+          RESULTS="results.csv"
+
+          # Save params alongside artifacts so we can collate later
+          python -c "import json; json.dump({'bands': '${{ matrix.bands }}', 'grid': '${{ matrix.grid }}', 'start': '${{ github.event.inputs.start_date || '2024-01-01' }}', 'end': '${{ github.event.inputs.end_date || '2024-12-31' }}'}, open('params.json','w'))"
 
           echo "# TE8 Backtest Summary" > "$SUMMARY"
           echo "" >> "$SUMMARY"
 
           if [ -s data/historical_matches.csv ]; then
-            N=$(python -c "import pandas as pd,sys; print(len(pd.read_csv('data/historical_matches.csv')) if True else 0)")
-            echo "Rows detected: $N"
-            if [ "$N" = "0" ]; then
-              echo "No rows to backtest (0 linked games)." >> "$SUMMARY"
-            else
-              python backtest_te8.py \
-                --input data/historical_matches.csv \
-                --start "${{ github.event.inputs.start_date }}" \
-                --end   "${{ github.event.inputs.end_date }}" \
-                --bands "${{ github.event.inputs.bands }}" \
-                --grid  "${{ github.event.inputs.grid }}" \
-                --out-csv "$RESULTS"
-
-              if [ -f "$RESULTS" ]; then
-                echo "Backtest completed. Results written to $RESULTS." >> "$SUMMARY"
-              else
-                echo "Backtest ran but no results file was produced." >> "$SUMMARY"
-              fi
-            fi
+            python backtest_te8.py \
+              --input data/historical_matches.csv \
+              --start "${{ github.event.inputs.start_date || '2024-01-01' }}" \
+              --end   "${{ github.event.inputs.end_date   || '2024-12-31' }}" \
+              --bands "${{ matrix.bands }}" \
+              --grid  "${{ matrix.grid }}" \
+              --out-csv "$RESULTS"
           else
-            echo "Dataset missing or unreadable: data/historical_matches.csv" >> "$SUMMARY"
+            echo "Dataset missing or empty." >> "$SUMMARY"
           fi
 
-      - name: Upload summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest_summary
-          path: backtest_summary.md
+          # Append metrics if produced by your script (from step 2)
+          if [ -f backtest_metrics.json ]; then
+            python -c "import json; m=json.load(open('backtest_metrics.json')); \
+print(f\"**Bets:** {m.get('n_bets',0)}\\n\\n**Hit-rate:** {m.get('hit_rate',0):.2%}\\n\\n**ROI:** {m.get('roi',0):.2%}\\n\\n**Max DD (units):** {m.get('max_drawdown',0):.2f}\")" >> "$SUMMARY"
+          fi
 
-      - name: Upload results (if any)
-        if: always()
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtest_results
-          path: backtest_results.csv
+          name: "run_${{ matrix.bands }}_${{ matrix.grid }}"
+          path: |
+            summary.md
+            results.csv
+            params.json
+            backtest_metrics.json
           if-no-files-found: ignore
+
+  collate:
+    runs-on: ubuntu-latest
+    needs: backtest
+    steps:
+      - name: Download all run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pandas
+        shell: bash
+        run: pip install pandas
+
+      - name: Rank matrix and create report
+        shell: bash
+        run: |
+          set -e
+          python -c "import os, json, glob, pandas as pd; \
+rows=[]; \
+[rows.append({**(json.load(open(os.path.join(d,'params.json'))) if os.path.exists(os.path.join(d,'params.json')) else {}), \
+              **(json.load(open(os.path.join(d,'backtest_metrics.json'))) if os.path.exists(os.path.join(d,'backtest_metrics.json')) else {}), \
+              'artifact': os.path.basename(d)}) \
+ for d in glob.glob('artifacts/*')]; \
+df=pd.DataFrame(rows); \
+df=df.fillna({'roi':0,'hit_rate':0,'n_bets':0,'max_drawdown':0}); \
+df['roi_rank']=df['roi'].rank(ascending=False,method='min'); \
+df.sort_values(['roi','hit_rate'], ascending=[False,False], inplace=True); \
+df.to_csv('matrix_rankings.csv', index=False); \
+open('index.html','w').write('<h1>Courtsense Backtest Matrix</h1>'+df.to_html(index=False))"
+
+      - name: Upload matrix report
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix_report
+          path: |
+            index.html
+            matrix_rankings.csv
