@@ -57,7 +57,12 @@ jobs:
           if [ -f scripts/build_dataset.py ]; then
             python scripts/build_dataset.py
           else
-            python -c "import pandas as pd; pd.DataFrame(columns=['date','tournament','round','player1','player2','odds1','odds2','result']).to_csv('data/historical_matches.csv',index=False)"
+            python - <<'PY'
+import pandas as pd
+pd.DataFrame(columns=['date','tournament','round','player1','player2','odds1','odds2','result'])\
+  .to_csv('data/historical_matches.csv', index=False)
+print("Created empty data/historical_matches.csv")
+PY
           fi
 
       - name: Backtest (matrix)
@@ -67,8 +72,17 @@ jobs:
           SUMMARY="summary.md"
           RESULTS="results.csv"
 
-          # Save params alongside artifacts so we can collate later
-          python -c "import json; json.dump({'bands': '${{ matrix.bands }}', 'grid': '${{ matrix.grid }}', 'start': '${{ github.event.inputs.start_date || '2024-01-01' }}', 'end': '${{ github.event.inputs.end_date || '2024-12-31' }}'}, open('params.json','w'))"
+          # Save params (heredoc to avoid YAML quoting issues)
+          python - <<'PY'
+import json
+params = {
+  "bands": "${{ matrix.bands }}",
+  "grid": "${{ matrix.grid }}",
+  "start": "${{ github.event.inputs.start_date || '2024-01-01' }}",
+  "end":   "${{ github.event.inputs.end_date   || '2024-12-31' }}"
+}
+json.dump(params, open("params.json","w"))
+PY
 
           echo "# TE8 Backtest Summary" > "$SUMMARY"
           echo "" >> "$SUMMARY"
@@ -85,10 +99,16 @@ jobs:
             echo "Dataset missing or empty." >> "$SUMMARY"
           fi
 
-          # Append metrics if produced by your script (from step 2)
+          # Append metrics (safe heredoc)
           if [ -f backtest_metrics.json ]; then
-            python -c "import json; m=json.load(open('backtest_metrics.json')); \
-print(f\"**Bets:** {m.get('n_bets',0)}\\n\\n**Hit-rate:** {m.get('hit_rate',0):.2%}\\n\\n**ROI:** {m.get('roi',0):.2%}\\n\\n**Max DD (units):** {m.get('max_drawdown',0):.2f}\")" >> "$SUMMARY"
+            python - <<'PY' >> "$SUMMARY"
+import json
+m = json.load(open('backtest_metrics.json'))
+print(f"**Bets:** {m.get('n_bets', 0)}\n")
+print(f"**Hit-rate:** {m.get('hit_rate', 0):.2%}\n")
+print(f"**ROI:** {m.get('roi', 0):.2%}\n")
+print(f"**Max DD (units):** {m.get('max_drawdown', 0):.2f}\n")
+PY
           fi
 
       - name: Upload artifacts
@@ -118,24 +138,34 @@ print(f\"**Bets:** {m.get('n_bets',0)}\\n\\n**Hit-rate:** {m.get('hit_rate',0):.
 
       - name: Install pandas
         shell: bash
-        run: pip install pandas
+        run: |
+          pip install pandas
 
       - name: Rank matrix and create report
         shell: bash
         run: |
           set -e
-          python -c "import os, json, glob, pandas as pd; \
-rows=[]; \
-[rows.append({**(json.load(open(os.path.join(d,'params.json'))) if os.path.exists(os.path.join(d,'params.json')) else {}), \
-              **(json.load(open(os.path.join(d,'backtest_metrics.json'))) if os.path.exists(os.path.join(d,'backtest_metrics.json')) else {}), \
-              'artifact': os.path.basename(d)}) \
- for d in glob.glob('artifacts/*')]; \
-df=pd.DataFrame(rows); \
-df=df.fillna({'roi':0,'hit_rate':0,'n_bets':0,'max_drawdown':0}); \
-df['roi_rank']=df['roi'].rank(ascending=False,method='min'); \
-df.sort_values(['roi','hit_rate'], ascending=[False,False], inplace=True); \
-df.to_csv('matrix_rankings.csv', index=False); \
-open('index.html','w').write('<h1>Courtsense Backtest Matrix</h1>'+df.to_html(index=False))"
+          python - <<'PY'
+import os, json, glob, pandas as pd
+rows=[]
+for d in glob.glob("artifacts/*"):
+    params_path = os.path.join(d,"params.json")
+    metrics_path = os.path.join(d,"backtest_metrics.json")
+    params = json.load(open(params_path)) if os.path.exists(params_path) else {}
+    metrics = json.load(open(metrics_path)) if os.path.exists(metrics_path) else {}
+    rows.append({**params, **metrics, "artifact": os.path.basename(d)})
+
+df=pd.DataFrame(rows)
+if df.empty:
+    open("index.html","w").write("<h1>No artifacts found</h1>")
+    pd.DataFrame().to_csv("matrix_rankings.csv",index=False)
+else:
+    df=df.fillna({'roi':0,'hit_rate':0,'n_bets':0,'max_drawdown':0})
+    df['roi_rank']=df['roi'].rank(ascending=False,method='min')
+    df.sort_values(['roi','hit_rate'], ascending=[False,False], inplace=True)
+    df.to_csv("matrix_rankings.csv", index=False)
+    open("index.html","w").write("<h1>Courtsense Backtest Matrix</h1>"+df.to_html(index=False))
+PY
 
       - name: Upload matrix report
         uses: actions/upload-artifact@v4
