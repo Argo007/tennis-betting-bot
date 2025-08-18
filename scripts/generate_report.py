@@ -1,11 +1,12 @@
 # scripts/generate_report.py
-import json, os, io, base64
+import json, os, io, base64, shutil
 from datetime import datetime
 import pandas as pd
 
 METRICS_PATH = "backtest_metrics.json"
 RESULTS_PATH = "results.csv"
-OUT_HTML = "index.html"
+SITE_DIR = "site"
+OUT_HTML = os.path.join(SITE_DIR, "index.html")
 
 def load_metrics():
     if os.path.exists(METRICS_PATH):
@@ -72,6 +73,8 @@ def infer_extras(df: pd.DataFrame):
     return extras
 
 def main():
+    os.makedirs(SITE_DIR, exist_ok=True)
+
     metrics = load_metrics()
     df = load_results()
     extras = infer_extras(df)
@@ -116,11 +119,18 @@ details summary{{cursor:pointer;margin:12px 0}}
 <div class="section"><h2>Key Metrics</h2>{metrics_table}</div>
 <div class="section"><h2>Equity Curve</h2>{chart_html}</div>
 <div class="section"><h2>Results</h2>{preview_html}</div>
-<p><small>Artifacts include summary.md, results.csv, and backtest_metrics.json (if produced).</small></p>
+<p><small>This page is auto-published by GitHub Actions. Artifacts also include summary.md, results.csv, and backtest_metrics.json.</small></p>
 </body></html>"""
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"Wrote {OUT_HTML}")
+
+    # Copy raw files into site/ for convenience
+    for p in ("summary.md", "results.csv", "backtest_metrics.json"):
+        if os.path.exists(p):
+            shutil.copy2(p, os.path.join(SITE_DIR, p))
+
+    print(f"Wrote {OUT_HTML} and copied any available artifacts into {SITE_DIR}/")
 
 if __name__ == "__main__":
     main()
+
