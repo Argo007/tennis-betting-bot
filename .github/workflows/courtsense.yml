@@ -11,13 +11,33 @@ on:
         description: "YYYY-MM-DD"
         required: false
         default: "2024-12-31"
+      bands:
+        description: "Optional bands, e.g. 1.05,1.25,1.50,1.80,2.20,3.00"
+        required: false
+        default: ""
+      surface_grid:
+        description: "Optional surfaces, e.g. HARD,CLAY,GRASS"
+        required: false
+        default: ""
+      smoke_mode:
+        description: "auto | on | off  (fallback demo output)"
+        required: false
+        default: "auto"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
     env:
-      START: ${{ github.event.inputs.start_date }}
-      END:   ${{ github.event.inputs.end_date }}
+      START:      ${{ github.event.inputs.start_date }}
+      END:        ${{ github.event.inputs.end_date }}
+      BANDS:      ${{ github.event.inputs.bands }}
+      SURFACES:   ${{ github.event.inputs.surface_grid }}
+      SMOKE_MODE: ${{ github.event.inputs.smoke_mode }}
 
     steps:
       - name: Checkout
@@ -28,17 +48,35 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Add matplotlib for the equity curve in the report
-          pip install pandas numpy matplotlib
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy matplotlib
+          fi
 
-      - name: Ensure dataset exists
+      - name: Build dataset from raw (if present)
+        run: python scripts/build_from_raw.py
+
+      - name: Ensure dataset exists (safety net)
         run: python scripts/ensure_dataset.py
 
       - name: Run backtest
-        run: python scripts/run_backtest.py --start "$START" --end "$END"
+        run: |
+          python scripts/run_backtest.py \
+            --start "${START}" \
+            --end   "${END}" \
+            --bands "${BANDS}" \
+            --grid  "${SURFACES}"
 
       - name: Append metrics to summary
         run: python scripts/append_metrics.py
@@ -56,3 +94,19 @@ jobs:
             backtest_metrics.json
             index.html
           if-no-files-found: ignore
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+  deploy:
+    needs: backtest
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
