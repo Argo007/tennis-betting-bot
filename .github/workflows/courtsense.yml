@@ -20,7 +20,7 @@ on:
         required: false
         default: ""
       smoke_mode:
-        description: "auto | on | off  (fallback demo output)"
+        description: "auto | on | off (demo fallback)"
         required: false
         default: "auto"
 
@@ -28,6 +28,11 @@ permissions:
   contents: read
   pages: write
   id-token: write
+
+# Required by GitHub Pages to avoid parallel deployments
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
 
 jobs:
   backtest:
@@ -81,10 +86,10 @@ jobs:
       - name: Append metrics to summary
         run: python scripts/append_metrics.py
 
-      - name: Generate HTML report
+      - name: Generate HTML report (to site/)
         run: python scripts/generate_report.py
 
-      - name: Upload artifacts
+      - name: Upload CI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: backtest_outputs
@@ -92,21 +97,21 @@ jobs:
             summary.md
             results.csv
             backtest_metrics.json
-            index.html
+            site/index.html
           if-no-files-found: ignore
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: site
 
   deploy:
     needs: backtest
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
-        id: deploy
+        id: deployment
         uses: actions/deploy-pages@v4
