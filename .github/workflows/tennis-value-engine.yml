@@ -131,6 +131,28 @@ jobs:
           else
             echo "_No summary produced._" >> "$GITHUB_STEP_SUMMARY"
           fi
+          
+      - name: Matrix backtest (TE8 half-Kelly)
+        run: |
+          mkdir -p outputs
+          python scripts/run_matrix_backtest.py \
+            --input data/raw/odds/sample_odds.csv \
+            --outdir outputs \
+            --bands "2.0,2.6|2.6,3.2|3.2,4.0" \
+            --stake-mode kelly \
+            --edge 0.08 \
+            --kelly-scale 0.5 \
+            --bankroll 100
+
+      - name: Upload matrix artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix_backtest_outputs
+          path: |
+            outputs/results.csv
+            outputs/matrix_rankings.csv
+            outputs/backtest_metrics.json
+          if-no-files-found: warn
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
