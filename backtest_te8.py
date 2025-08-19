@@ -1,207 +1,206 @@
 #!/usr/bin/env python3
-import argparse, itertools, re
-from pathlib import Path
+"""
+Simple odds-band backtester for tennis matches.
+
+Input CSV expected columns (min):
+  date, tournament, round, player1, player2, odds1, odds2, result
+Optional:
+  surface  (e.g., HARD/CLAY/GRASS/INDOOR)
+
+Conventions:
+- odds are decimal (European) odds
+- result is "P1" if player1 won, "P2" if player2 won
+- We bet flat 1 unit per selection (configurable)
+
+Outputs:
+- results.csv: per-bet rows with stake/return/won etc
+- backtest_metrics.json: aggregate metrics (n_bets, hit_rate, roi, max_drawdown)
+"""
+
+from __future__ import annotations
+import argparse, json, os
+from datetime import datetime
+from typing import List, Optional
+
 import pandas as pd
+import numpy as np
 
-pd.options.mode.copy_on_write = True
 
-def parse_bands(s):
-    def pair(key):
-        m = re.search(rf"{key}\s*=\s*([^;]+)", s or "", flags=re.I)
-        if not m: return None
-        a,b = m.group(1).split(",")
-        return float(a), float(b)
-    return pair("dog") or (2.2,4.5), pair("fav") or (1.15,2.0)
+def parse_bands(bands_str: str | None, default_low: float, default_high: float) -> tuple[float, float]:
+    """
+    Accepts "low,high" or a longer comma list and uses the min/max.
+    If blank/None, returns defaults.
+    """
+    if not bands_str:
+        return default_low, default_high
+    parts = [p.strip() for p in bands_str.split(",") if p.strip()]
+    try:
+        nums = [float(p) for p in parts]
+        if len(nums) == 1:
+            return min(nums[0], default_low), max(nums[0], default_high)
+        return float(min(nums)), float(max(nums))
+    except Exception:
+        return default_low, default_high
 
-def elo_to_prob(a,b): return 1/(1+10**(-(a-b)/400))
-def kelly(p,o): 
-    if o<=1: return 0.0
-    v=(p*o-1)/(o-1)
-    return max(0.0, v)
 
-def clean_df(df):
-    need = ["date","player","opponent","odds","elo_player","elo_opponent","result"]
-    miss = [c for c in need if c not in df.columns]
-    if miss: raise ValueError(f"Input CSV missing columns: {miss}")
+def max_drawdown(series: pd.Series) -> float:
+    """Max drawdown in units for a cumulative P&L series."""
+    if series.empty:
+        return 0.0
+    roll_max = series.cummax()
+    dd = roll_max - series
+    return float(dd.max())
+
+
+def decide_bet(row: pd.Series, strategy: str, low: float, high: float) -> tuple[str, float]:
+    """
+    Decide which side to bet ("P1"/"P2"/"NONE") and at what odds.
+
+    strategy = "dog" -> bet the higher-odds side if within [low, high]
+             = "fav" -> bet the lower-odds side if within [low, high]
+    """
+    o1 = float(row["odds1"]) if pd.notna(row["odds1"]) else np.nan
+    o2 = float(row["odds2"]) if pd.notna(row["odds2"]) else np.nan
+    if not np.isfinite(o1) or not np.isfinite(o2):
+        return "NONE", np.nan
+
+    if strategy == "fav":
+        # favorite = lower odds
+        if o1 <= o2:
+            side, price = "P1", o1
+        else:
+            side, price = "P2", o2
+    else:
+        # underdog = higher odds
+        if o1 >= o2:
+            side, price = "P1", o1
+        else:
+            side, price = "P2", o2
+
+    if low <= price <= high:
+        return side, float(price)
+    return "NONE", np.nan
+
+
+def run_backtest(
+    df: pd.DataFrame,
+    start: str,
+    end: str,
+    grid: Optional[List[str]],
+    bands: str | None,
+    strategy: str,
+    stake: float,
+) -> tuple[pd.DataFrame, dict]:
+    # normalize columns
+    need_cols = ["date","tournament","round","player1","player2","odds1","odds2","result"]
+    for c in need_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
+
+    # coerce types
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    for c in ("odds","opp_odds","elo_player","elo_opponent","result"):
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["date","odds","elo_player","elo_opponent","result"])
+    df = df.dropna(subset=["date","player1","player2","odds1","odds2","result"])
+    df["odds1"] = pd.to_numeric(df["odds1"], errors="coerce")
+    df["odds2"] = pd.to_numeric(df["odds2"], errors="coerce")
+    df = df.dropna(subset=["odds1","odds2"])
 
-def run_once(df, bands, te8_dog, te8_fav, min_edge, k_cap, max_risk, start, end, bankroll0):
-    dog_band, fav_band = bands
-    w = df[(df["date"]>=start) & (df["date"]<=end)].copy()
-    rows=[]; bankroll=float(bankroll0)
-    for _,r in w.iterrows():
-        p = elo_to_prob(r["elo_player"], r["elo_opponent"])
-        o = float(r["odds"])
-        if o<=1: continue
-        is_dog = o>=2.0
-        ok = (is_dog and (1-p)>=te8_dog) or ((not is_dog) and p>=te8_fav)
-        if not ok: continue
-        if is_dog and not (dog_band[0]<=o<=dog_band[1]): continue
-        if (not is_dog) and not (fav_band[0]<=o<=fav_band[1]): continue
-        edge = p - 1.0/o
-        if edge < min_edge: continue
-        k_full = kelly(p,o)
-        k_used = min(k_full, k_cap, max_risk)
-        stake = bankroll * k_used
-        if stake < 1.0: continue
-        win = int(r["result"])==1
-        pnl = stake*(o-1) if win else -stake
-        bankroll += pnl
-        rows.append({
-            "date": r["date"].date(), "player": r["player"], "opponent": r["opponent"],
-            "odds": round(o,2), "model_prob": round(p,4), "edge": round(edge,4),
-            "stake": round(stake,2), "result": int(win), "pnl": round(pnl,2), "bankroll": round(bankroll,2)
-        })
-    log = pd.DataFrame(rows)
-    picks = len(log)
-    wins = int(log["result"].sum()) if picks else 0
-    roi = (log["pnl"].sum()/log["stake"].sum()) if picks and log["stake"].sum()>0 else 0.0
-    hit = (wins/picks) if picks else 0.0
-    return {"picks":picks,"wins":wins,"roi":roi,"hit":hit,"bankroll":bankroll,"log":log}
+    # filter dates
+    start_dt = pd.to_datetime(start)
+    end_dt   = pd.to_datetime(end)
+    df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)]
 
-def parse_grid(s):
-    if not s: return {}
-    out={}
-    for part in s.split(";"):
-        if "=" not in part: continue
-        k,vals = part.split("=",1)
-        vs=[float(x.strip()) for x in vals.split(",") if x.strip()]
-        if vs: out[k.strip()] = vs
-    return out
+    # filter surfaces (if column present and grid provided)
+    if "surface" in df.columns and grid:
+        grid_upper = [g.strip().upper() for g in grid if g.strip()]
+        df = df[df["surface"].astype(str).str.upper().isin(grid_upper)]
 
-def safe_write_summary(path, text):
-    Path(path).write_text(text)
+    # bands
+    low, high = parse_bands(bands, default_low=1.8, default_high=3.2)
+
+    # decide bets
+    sel_side, sel_odds = [], []
+    for _, r in df.iterrows():
+        side, price = decide_bet(r, strategy=strategy, low=low, high=high)
+        sel_side.append(side)
+        sel_odds.append(price)
+
+    out = df.copy()
+    out["bet_on"] = sel_side
+    out["selection_odds"] = sel_odds
+    out = out[out["bet_on"] != "NONE"].reset_index(drop=True)
+
+    if out.empty:
+        metrics = {"n_bets": 0, "hit_rate": 0.0, "roi": 0.0, "max_drawdown": 0.0}
+        return out, metrics
+
+    # compute stakes/returns
+    out["stake"] = float(stake)
+    # won?
+    out["won"] = ((out["bet_on"] == "P1") & (out["result"].astype(str).str.upper() == "P1")) | \
+                 ((out["bet_on"] == "P2") & (out["result"].astype(str).str.upper() == "P2"))
+    out["won"] = out["won"].astype(int)
+
+    out["return"] = np.where(out["won"] == 1, out["stake"] * out["selection_odds"], 0.0)
+    pnl = (out["return"] - out["stake"]).astype(float)
+    cum_pnl = pnl.cumsum()
+
+    # metrics
+    n_bets = int(len(out))
+    hit_rate = float(out["won"].mean())
+    stake_sum = float(out["stake"].sum())
+    roi = float(cum_pnl.iloc[-1] / stake_sum) if stake_sum else 0.0
+    mdd = max_drawdown(cum_pnl)
+
+    metrics = {
+        "n_bets": n_bets,
+        "hit_rate": hit_rate,
+        "roi": roi,
+        "max_drawdown": mdd,
+        "band_low": low,
+        "band_high": high,
+        "strategy": strategy,
+        "stake_unit": stake,
+    }
+    return out, metrics
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--start", default="2021-01-01")
-    ap.add_argument("--end", default="2025-12-31")
-    ap.add_argument("--bands", default="dog=2.20,4.50;fav=1.15,2.00")
-    ap.add_argument("--te8-dog", type=float, default=0.60)
-    ap.add_argument("--te8-fav", type=float, default=0.50)
-    ap.add_argument("--min-edge", type=float, default=0.03)
-    ap.add_argument("--kelly-cap", type=float, default=0.25)
-    ap.add_argument("--max-risk", type=float, default=0.05)
-    ap.add_argument("--bankroll", type=float, default=1000.0)
-    ap.add_argument("--out-csv", default="backtest_results.csv")
-    ap.add_argument("--summary", default="backtest_summary.md")
-    ap.add_argument("--grid", default="")
+    ap.add_argument("--input", default="data/historical_matches.csv")
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--grid", default="", help="comma list of surfaces, e.g. HARD,CLAY")
+    ap.add_argument("--bands", default="", help="odds band 'low,high' (we’ll use min/max if more provided)")
+    ap.add_argument("--strategy", default="dog", choices=["dog","fav"], help="bet underdog (dog) or favorite (fav)")
+    ap.add_argument("--stake", type=float, default=1.0, help="flat stake size per bet")
+    ap.add_argument("--out-csv", default="results.csv")
     args = ap.parse_args()
 
-    p = Path(args.input)
-    if not p.exists() or p.stat().st_size==0:
-        safe_write_summary(args.summary, f"# TE8 Backtest Summary\n\nNo dataset at `{args.input}` (file missing or empty).\n")
-        Path(args.out_csv).write_text("")
-        print("No dataset — exiting cleanly.")
-        return
+    if not os.path.exists(args.input):
+        raise SystemExit(f"Input not found: {args.input}")
 
-    try:
-        raw = pd.read_csv(p)
-    except Exception as e:
-        safe_write_summary(args.summary, f"# TE8 Backtest Summary\n\nFailed to read `{args.input}`: {e}\n")
-        Path(args.out_csv).write_text("")
-        print("Read error — exiting cleanly.")
-        return
+    df = pd.read_csv(args.input)
+    grid = [g for g in args.grid.split(",")] if args.grid else None
 
-    if raw.empty:
-        safe_write_summary(args.summary, "# TE8 Backtest Summary\n\nInput has headers but **0 rows**.\n")
-        Path(args.out_csv).write_text("")
-        print("0 rows — exiting cleanly.")
-        return
+    results, metrics = run_backtest(
+        df=df,
+        start=args.start,
+        end=args.end,
+        grid=grid,
+        bands=args.bands,
+        strategy=args.strategy,
+        stake=args.stake,
+    )
 
-    try:
-        df = clean_df(raw)
-    except Exception as e:
-        safe_write_summary(args.summary, f"# TE8 Backtest Summary\n\nInvalid dataset: {e}\n")
-        Path(args.out_csv).write_text("")
-        print("Invalid dataset — exiting cleanly.")
-        return
+    # write outputs
+    results.to_csv(args.out_csv, index=False)
+    with open("backtest_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
 
-    start = pd.to_datetime(args.start); end = pd.to_datetime(args.end)
-    bands = parse_bands(args.bands)
+    # small console summary
+    print(f"Bets: {metrics['n_bets']}, hit-rate: {metrics['hit_rate']:.2%}, ROI: {metrics['roi']:.2%}, MDD: {metrics['max_drawdown']:.2f}")
 
-    grid = parse_grid(args.grid)
-    if grid:
-        keys = sorted(grid.keys())
-        combos = list(itertools.product(*[grid[k] for k in keys]))
-        rows=[]; best=None; best_res=None
-        for combo in combos:
-            kv=dict(zip(keys,combo))
-            res=run_once(df,bands, kv.get("te8_dog",args.te8_dog), kv.get("te8_fav",args.te8_fav),
-                         kv.get("min_edge",args.min_edge), kv.get("kelly_cap",args.kelly_cap),
-                         kv.get("max_risk",args.max_risk), start,end,args.bankroll)
-            rows.append({**kv,"picks":res["picks"],"wins":res["wins"],
-                         "hit":round(res["hit"],4),"roi":round(res["roi"],4),
-                         "bankroll_end":round(res["bankroll"],2)})
-            if best_res is None or res["roi"]>best_res["roi"]:
-                best, best_res = kv, res
-        pd.DataFrame(rows).sort_values(["roi","hit","picks"], ascending=[False,False,False]).to_csv("grid_results.csv", index=False)
-        (best_res["log"] if best_res["log"] is not None else pd.DataFrame()).to_csv(args.out_csv, index=False)
-        md=[ "# TE8 Backtest Summary (Grid)",
-             f"- Window: **{args.start} → {args.end}**",
-             f"- Tested combos: **{len(rows)}**",
-             f"- Best: **{best}**",
-             f"- Picks: **{best_res['picks']}**, Wins: **{best_res['wins']}**, Hit: **{best_res['hit']*100:.2f}%**",
-             f"- ROI: **{best_res['roi']*100:.2f}%**, Ending bankroll: **€{best_res['bankroll']:,.2f}** (start €{args.bankroll:,.2f})" ]
-        safe_write_summary(args.summary, "\n".join(md))
-        print("Grid backtest complete.")
-        return
-
-    # single run
-    res=run_once(df,bands,args.te8_dog,args.te8_fav,args.min_edge,args.kelly_cap,args.max_risk,start,end,args.bankroll)
-    res["log"].to_csv(args.out_csv, index=False)
-    md=[ "# TE8 Backtest Summary",
-         f"- Window: **{args.start} → {args.end}**",
-         f"- Picks: **{res['picks']}**, Wins: **{res['wins']}**, Hit: **{res['hit']*100:.2f}%**",
-         f"- ROI: **{res['roi']*100:.2f}%**",
-         f"- Ending bankroll: **€{res['bankroll']:,.2f}** (start €{args.bankroll:,.2f})" ]
-    safe_write_summary(args.summary, "\n".join(md))
-    print("Backtest complete.")
 
 if __name__ == "__main__":
     main()
-
-# scripts/build_dataset.py
-import os, glob, pandas as pd
-
-RAW_DIR = "raw"
-OUT = "data/historical_matches.csv"
-os.makedirs("data", exist_ok=True)
-
-frames = []
-for f in sorted(glob.glob(f"{RAW_DIR}/*.csv")):
-    try:
-        df = pd.read_csv(f)
-        # normalize columns to the schema we use downstream
-        rename = {
-            'Date':'date','Tournament':'tournament','Round':'round',
-            'Player1':'player1','Player2':'player2',
-            'Odds1':'odds1','Odds2':'odds2','Result':'result'
-        }
-        # be forgiving with cases
-        df.columns = [c.strip() for c in df.columns]
-        for k in list(rename):
-            if k not in df.columns and k.lower() in [c.lower() for c in df.columns]:
-                # map by lower-case match
-                src = [c for c in df.columns if c.lower()==k.lower()][0]
-                rename[src] = rename.pop(k)
-        df = df.rename(columns=rename)
-        keep = ["date","tournament","round","player1","player2","odds1","odds2","result"]
-        df = df[[c for c in keep if c in df.columns]]
-        frames.append(df)
-    except Exception as e:
-        print(f"Skip {f}: {e}")
-
-out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-    columns=["date","tournament","round","player1","player2","odds1","odds2","result"]
-)
-# light cleaning
-out = out.dropna(subset=["player1","player2"]).reset_index(drop=True)
-out.to_csv(OUT, index=False)
-print(f"Wrote {OUT} with {len(out)} rows")
-
