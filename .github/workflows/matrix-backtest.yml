@@ -50,7 +50,7 @@ jobs:
       - name: Run matrix backtest (with simple fallback)
         shell: bash
         run: |
-          set -x
+          set -e
           mkdir -p outputs
 
           INPUT="${{ github.event.inputs.input_csv }}"
@@ -62,29 +62,30 @@ jobs:
           FLAT_STAKE="${{ github.event.inputs.flat_stake }}"
           BANKROLL="${{ github.event.inputs.bankroll }}"
 
-          # Try with your CSV first
-          python scripts/run_matrix_backtest.py \
-            --input "$INPUT" \
-            --outdir outputs \
-            --bands "$BANDS" \
-            --stake-mode "$STAKE_MODE" \
-            --edge "$EDGE" \
-            --kelly-scale "$KELLY_SCALE" \
-            --flat-stake "$FLAT_STAKE" \
-            --bankroll "$BANKROLL"
-          RC=$?
+          # Try with the provided CSV first
+          if ! python scripts/run_matrix_backtest.py \
+              --input "$INPUT" \
+              --outdir outputs \
+              --bands "$BANDS" \
+              --stake-mode "$STAKE_MODE" \
+              --edge "$EDGE" \
+              --kelly-scale "$KELLY_SCALE" \
+              --flat-stake "$FLAT_STAKE" \
+              --bankroll "$BANKROLL"; then
 
-          if [ $RC -ne 0 ]; then
             echo "Primary run failed (likely missing columns). Using a tiny synthetic dataset."
-            cat > outputs/synthetic_backtest.csv <<'CSV'
-odds,p,result
-2.10,0.55,1
-2.40,0.45,0
-2.80,0.40,1
-3.20,0.35,0
-2.30,0.48,1
-3.50,0.32,0
-CSV
+
+            # No heredocs; just printf lines into a CSV
+            printf '%s\n' \
+              'odds,p,result' \
+              '2.10,0.55,1' \
+              '2.40,0.45,0' \
+              '2.80,0.40,1' \
+              '3.20,0.35,0' \
+              '2.30,0.48,1' \
+              '3.50,0.32,0' \
+              > outputs/synthetic_backtest.csv
+
             python scripts/run_matrix_backtest.py \
               --input outputs/synthetic_backtest.csv \
               --outdir outputs \
@@ -103,9 +104,9 @@ CSV
             {
               echo "## Matrix Backtest — Best by ROI"
               echo
-              CFG=$(grep -Eo '"config_id": *"[^"]+"' outputs/backtest_metrics.json | head -1 | sed 's/.*: *"//; s/"$//')
-              BAND=$(grep -Eo '"label": *"[^"]+"' outputs/backtest_metrics.json     | head -1 | sed 's/.*: *"//; s/"$//')
-              ROI=$(grep -Eo '"roi": *-?[0-9.]+([eE]-?[0-9]+)?' outputs/backtest_metrics.json | head -1 | sed 's/.*: *//')
+              CFG=$(grep -Eo '"config_id":[^"]*"[^"]*"' outputs/backtest_metrics.json | head -1 | sed 's/.*:"//; s/"$//')
+              BAND=$(grep -Eo '"label":[^"]*"[^"]*"' outputs/backtest_metrics.json     | head -1 | sed 's/.*:"//; s/"$//')
+              ROI=$(grep -Eo '"roi":[ ]*-?[0-9.]+([eE]-?[0-9]+)?' outputs/backtest_metrics.json | head -1 | sed 's/.*://')
               echo "- **Config**: \`$CFG\`"
               echo "- **Band**: $BAND"
               echo "- **ROI**: ${ROI:-n/a}"
