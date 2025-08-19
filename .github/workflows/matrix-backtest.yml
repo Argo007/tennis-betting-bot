@@ -1,0 +1,117 @@
+name: Matrix Backtest (Kelly + TE8)
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_csv:
+        description: "Historical bets CSV (odds, prob, result)"
+        required: true
+        default: "data/raw/odds/sample_odds.csv"
+      bands:
+        description: "Odds bands e.g. 2.0,2.6|2.6,3.2|3.2,4.0"
+        required: true
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+      stake_mode:
+        description: "kelly or flat"
+        required: false
+        default: "kelly"
+      edge:
+        description: "True edge booster (0.08 = TE8)"
+        required: false
+        default: "0.08"
+      kelly_scale:
+        description: "Kelly safety scaler (0.5 = half-Kelly)"
+        required: false
+        default: "0.5"
+      flat_stake:
+        description: "Units per bet if flat staking"
+        required: false
+        default: "1"
+      bankroll:
+        description: "Starting bankroll (units)"
+        required: false
+        default: "100"
+
+  push:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/matrix-backtest.yml"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (none required, but keep pip up-to-date)
+        run: |
+          python -V
+          python -c "import sys; print('site:', sys.path)"
+          python -m pip install -U pip
+
+      - name: Ensure outputs dir
+        run: mkdir -p outputs
+
+      - name: Pick input CSV (fallback-friendly)
+        shell: bash
+        run: |
+          CAND="${{ github.event.inputs.input_csv }}"
+          if [ -z "$CAND" ]; then CAND="data/raw/odds/sample_odds.csv"; fi
+          if [ ! -f "$CAND" ]; then
+            echo "❌ Input CSV not found: $CAND"; ls -la
+            exit 1
+          fi
+          echo "BACKTEST_INPUT=$CAND" >> $GITHUB_ENV
+          echo "Using input: $CAND"
+
+      - name: Run matrix backtest
+        run: |
+          python scripts/run_matrix_backtest.py \
+            --input "$BACKTEST_INPUT" \
+            --outdir outputs \
+            --bands "${{ github.event.inputs.bands }}" \
+            --stake-mode "${{ github.event.inputs.stake_mode }}" \
+            --edge "${{ github.event.inputs.edge }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --flat-stake "${{ github.event.inputs.flat_stake }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}"
+
+      - name: Job summary (top config by ROI)
+        shell: bash
+        run: |
+          python - << 'PY'
+import json, pathlib
+p = pathlib.Path("outputs/backtest_metrics.json")
+j = json.loads(p.read_text())
+best = j.get("best_by_roi") or {}
+def fmt(x): 
+    return "-" if x is None else (f"{x:.4f}" if isinstance(x, float) else str(x))
+lines = []
+lines.append("## Matrix Backtest — Best by ROI")
+lines.append("")
+if best:
+    lines.append(f"- **Config**: `{best.get('config_id','')}`  \n- **Label (band)**: {best.get('label','')}")
+    lines.append(f"- **ROI**: {fmt(best.get('roi'))}")
+    lines.append(f"- **Bets**: {best.get('bets','-')} | **Hit-rate**: {fmt(best.get('hit_rate'))}")
+    lines.append(f"- **Turnover**: {fmt(best.get('turnover'))} | **PnL**: {fmt(best.get('pnl'))}")
+    lines.append(f"- **End bankroll**: {fmt(best.get('end_bankroll'))} | **Max DD**: {fmt(best.get('max_drawdown'))}")
+else:
+    lines.append("_No configs produced bets (likely Kelly=0 across bands)._")
+open("/github/workspace/summary.md","w").write("\n".join(lines))
+PY
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix_backtest_outputs
+          path: |
+            outputs/results.csv
+            outputs/matrix_rankings.csv
+            outputs/backtest_metrics.json
