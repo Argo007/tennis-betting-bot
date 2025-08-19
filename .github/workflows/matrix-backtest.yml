@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       input_csv:
-        description: "Historical bets CSV (odds, prob, result)"
-        required: true
+        description: "Historical bets CSV (needs odds + probability + result)"
+        required: false
         default: "data/raw/odds/sample_odds.csv"
       bands:
         description: "Odds bands e.g. 2.0,2.6|2.6,3.2|3.2,4.0"
@@ -50,10 +50,64 @@ jobs:
       - name: Ensure outputs dir
         run: mkdir -p outputs
 
+      # 1) Validate input CSV; 2) If missing columns, build a tiny synthetic dataset
+      - name: Prepare backtest input (validate or synthesize)
+        shell: bash
+        run: |
+          IN="${{ github.event.inputs.input_csv }}"
+          [ -z "$IN" ] && IN="data/raw/odds/sample_odds.csv"
+          echo "Requested input: $IN"
+
+          python - <<'PY'
+import csv, os, sys, json, random, pathlib
+IN = os.environ.get("IN")
+ok = False
+hdr = []
+if os.path.isfile(IN):
+    try:
+        with open(IN, newline='', encoding='utf-8') as f:
+            r = csv.DictReader(f)
+            hdr = r.fieldnames or []
+            need_odds = {'odds','price','decimal_odds'}
+            need_prob = {'p','prob','model_prob','p_model','probability','pred_prob','win_prob','p_hat','p_pred'}
+            need_res  = {'result','won','outcome','is_win','y','label','win_flag','outcome_str'}
+            has_odds = any(c in (hdr or []) for c in need_odds)
+            has_prob = any(c in (hdr or []) for c in need_prob)
+            has_res  = any(c in (hdr or []) for c in need_res)
+            ok = has_odds and has_prob and has_res
+    except Exception as e:
+        pass
+
+if ok:
+    out = IN
+else:
+    # make a tiny synthetic dataset so the workflow still runs
+    out = "outputs/synthetic_backtest.csv"
+    rows = []
+    random.seed(7)
+    # 60 bets across 3 odds bands with a noisy true p ~ 1/odds ± edge
+    for band in [(2.0,2.6),(2.6,3.2),(3.2,4.0)]:
+        for _ in range(20):
+            o = random.uniform(*band)
+            p = max(0.01, min(0.99, 1.0/o * (1.0 + random.uniform(-0.05, 0.10))))
+            win = 1 if random.random() < p else 0
+            rows.append({'odds': f"{o:.3f}", 'p': f"{p:.4f}", 'result': win})
+    with open(out, "w", newline='', encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=['odds','p','result'])
+        w.writeheader(); w.writerows(rows)
+
+print(out)
+open(os.environ['GITHUB_ENV'],'a').write(f"BACKTEST_INPUT={out}\n")
+open(os.environ['GITHUB_STEP_SUMMARY'],'a').write(
+    f"**Backtest input**: `{out}`  \n"
+    f"_Header detected_: {hdr if hdr else 'n/a (synthetic used)'}\n"
+)
+PY
+
       - name: Run matrix backtest
         run: |
           python scripts/run_matrix_backtest.py \
-            --input "${{ github.event.inputs.input_csv }}" \
+            --input "$BACKTEST_INPUT" \
             --outdir outputs \
             --bands "${{ github.event.inputs.bands }}" \
             --stake-mode "${{ github.event.inputs.stake_mode }}" \
@@ -66,26 +120,25 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import json, pathlib
-          p = pathlib.Path("outputs/backtest_metrics.json")
-          j = json.loads(p.read_text())
-          best = j.get("best_by_roi") or {}
-          def fmt(x):
-              return "-" if x is None else (f"{x:.4f}" if isinstance(x, float) else str(x))
-          lines = []
-          lines.append("## Matrix Backtest — Best by ROI")
-          lines.append("")
-          if best:
-              lines.append(f"- **Config**: `{best.get('config_id','')}`")
-              lines.append(f"- **Band**: {best.get('label','')}")
-              lines.append(f"- **ROI**: {fmt(best.get('roi'))}")
-              lines.append(f"- **Bets**: {best.get('bets','-')} | **Hit-rate**: {fmt(best.get('hit_rate'))}")
-              lines.append(f"- **Turnover**: {fmt(best.get('turnover'))} | **PnL**: {fmt(best.get('pnl'))}")
-              lines.append(f"- **End bankroll**: {fmt(best.get('end_bankroll'))} | **Max DD**: {fmt(best.get('max_drawdown'))}")
-          else:
-              lines.append("_No configs produced bets (likely Kelly=0 across bands)._")
-          open("summary.md","w").write("\n".join(lines))
-          PY
+import json, pathlib
+p = pathlib.Path("outputs/backtest_metrics.json")
+j = json.loads(p.read_text())
+best = j.get("best_by_roi") or {}
+def fmt(x): return "-" if x is None else (f"{x:.4f}" if isinstance(x, float) else str(x))
+lines = []
+lines.append("## Matrix Backtest — Best by ROI")
+lines.append("")
+if best:
+    lines.append(f"- **Config**: `{best.get('config_id','')}`")
+    lines.append(f"- **Band**: {best.get('label','')}")
+    lines.append(f"- **ROI**: {fmt(best.get('roi'))}")
+    lines.append(f"- **Bets**: {best.get('bets','-')} | **Hit-rate**: {fmt(best.get('hit_rate'))}")
+    lines.append(f"- **Turnover**: {fmt(best.get('turnover'))} | **PnL**: {fmt(best.get('pnl'))}")
+    lines.append(f"- **End bankroll**: {fmt(best.get('end_bankroll'))} | **Max DD**: {fmt(best.get('max_drawdown'))}")
+else:
+    lines.append("_No configs produced bets (likely Kelly=0 across bands)._")
+open("summary.md","w").write("\n".join(lines))
+PY
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
