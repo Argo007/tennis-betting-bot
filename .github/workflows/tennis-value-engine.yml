@@ -10,17 +10,17 @@ on:
       gamma:
         description: "Fav/longshot stretch (1=no change)"
         required: false
-        default: "1.05"
+        default: "1.08"
       min_edge:
         description: "Min (p_model - 1/odds) to accept a pick"
         required: false
-        default: "0.02"
+        default: "0.00"
       edge:
         description: "True Edge booster (0.08 = TE8)"
         required: false
         default: "0.08"
       kelly_scale:
-        description: "Kelly safety scaler"
+        description: "Kelly safety scaler (0.5 = half-Kelly)"
         required: false
         default: "0.5"
       bankroll:
@@ -32,7 +32,7 @@ on:
         required: false
         default: "80"
       bands:
-        description: "Odds bands for backtest (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
+        description: "Backtest bands (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
 
@@ -54,9 +54,7 @@ jobs:
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Ensure outputs directory
-        run: mkdir -p outputs
+          mkdir -p outputs
 
       - name: Run daily pipeline (prob → engine → backtest → summaries)
         shell: bash
@@ -76,7 +74,7 @@ jobs:
         shell: bash
         run: |
           echo "## Tennis Value — Daily Picks" >> "$GITHUB_STEP_SUMMARY"
-          [ -f outputs/engine_summary.md ] && cat outputs/engine_summary.md >> "$GITHUB_STEP_SUMMARY" || echo "No engine_summary.md" >> "$GITHUB_STEP_SUMMARY"
+          [ -f outputs/engine_summary.md ]   && cat outputs/engine_summary.md   >> "$GITHUB_STEP_SUMMARY" || echo "No engine_summary.md"   >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           [ -f outputs/pipeline_summary.md ] && cat outputs/pipeline_summary.md >> "$GITHUB_STEP_SUMMARY" || echo "No pipeline_summary.md" >> "$GITHUB_STEP_SUMMARY"
 
