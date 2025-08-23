@@ -2,7 +2,7 @@
 # tennis_value_engine.py
 # Reads candidate tennis matches and outputs sized picks with Kelly.
 # - Supports two-sided odds CSVs like: date,player_a,player_b,odds_a,odds_b
-# - Also supports flat rows with 'price'/'odds' and optional model probability.
+# - Also supports flat rows with 'odds'/'price' and optional model probability.
 # - Falls back to p = 1/odds when model probs are missing.
 # - Default min-edge = 0 so the above fallback still emits picks.
 
@@ -11,6 +11,7 @@ import argparse, csv, os, sys
 from typing import List, Dict, Optional
 from bet_math import KellyConfig, infer_prob, infer_odds, stake_amount
 
+# ---------- utils ----------
 def _read_csv(path: str) -> List[Dict]:
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
@@ -19,15 +20,15 @@ def _write_csv(path: str, rows: List[Dict]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if not rows:
         # Write an empty but valid CSV with a placeholder header
-        with open(path, "w", newline='', encoding='utf-8') as f:
+        with open(path, "w", newline='', encoding="utf-8") as f:
             f.write("note\nempty\n")
         return
     keys = sorted({k for r in rows for k in r.keys()})
-    with open(path, "w", newline='', encoding='utf-8') as f:
+    with open(path, "w", newline='', encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=keys)
         wr.writeheader(); wr.writerows(rows)
 
-def _flt(x: Optional[str], default: float = 0.0) -> float:
+def _flt(x, default: float = 0.0) -> float:
     try:
         return float(x) if x not in (None, "") else default
     except Exception:
@@ -43,18 +44,19 @@ def expand_two_sided_rows(rows: List[Dict]) -> List[Dict]:
     """
     out: List[Dict] = []
     for r in rows:
-        cols = {k.lower(): k for k in r.keys()}  # map lowercase -> original
-        has_two_sided = all(k in cols for k in ("player_a","player_b","odds_a","odds_b"))
-        if not has_two_sided:
-            # Pass through original row; later logic can still size if it has 'odds'/'price'.
+        # Lowercase map of columns -> original case
+        lc = {k.lower(): k for k in r.keys()}
+        has = all(k in lc for k in ("player_a","player_b","odds_a","odds_b"))
+        if not has:
+            # Pass through; later logic can still size if it has 'odds'/'price'
             out.append(r)
             continue
 
-        oa = _flt(r[cols["odds_a"]], 0.0)
-        ob = _flt(r[cols["odds_b"]], 0.0)
-        pa = r[cols["player_a"]]
-        pb = r[cols["player_b"]]
-        dt = r.get(cols.get("date","date"), r.get("date",""))
+        dt = r.get(lc.get("date","date"), r.get("date",""))
+        pa = r[lc["player_a"]]
+        pb = r[lc["player_b"]]
+        oa = _flt(r[lc["odds_a"]], 0.0)
+        ob = _flt(r[lc["odds_b"]], 0.0)
 
         if oa > 1.0:
             out.append({
@@ -62,7 +64,7 @@ def expand_two_sided_rows(rows: List[Dict]) -> List[Dict]:
                 "player": pa,
                 "opponent": pb,
                 "side": "A",
-                "price": oa,          # normalized odds column used downstream
+                "price": oa,   # normalized odds column used downstream
             })
         if ob > 1.0:
             out.append({
@@ -74,18 +76,23 @@ def expand_two_sided_rows(rows: List[Dict]) -> List[Dict]:
             })
     return out
 
+# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(description="Tennis value engine with Kelly sizing.")
     # I/O
     ap.add_argument("--input", "-i",
         default="data/raw/odds/sample_odds.csv",
-        help="Input CSV: either two-sided odds (date,player_a,player_b,odds_a,odds_b) or flat rows with 'odds'/'price'.")
+        help="Input CSV: two-sided odds (date,player_a,player_b,odds_a,odds_b) or flat rows with 'odds'/'price'.")
     ap.add_argument("--out-picks", default="value_picks_pro.csv", help="Primary picks output (repo root).")
     ap.add_argument("--out-final", default="outputs/picks_final.csv", help="Secondary copy for artifacts.")
     ap.add_argument("--summary", default="outputs/engine_summary.md", help="Markdown run summary.")
 
+    # Legacy/compatibility args (ignored but accepted so workflows don’t break)
+    ap.add_argument("--elo-atp", dest="elo_atp", default="", help="(ignored) kept for workflow compatibility")
+    ap.add_argument("--elo-wta", dest="elo_wta", default="", help="(ignored) kept for workflow compatibility")
+
     # Selection
-    ap.add_argument("--min-edge", type=float, default=0.00,  # IMPORTANT: 0.00 since we fall back to p=1/odds
+    ap.add_argument("--min-edge", type=float, default=0.00,
         help="Minimum (p_model - 1/odds) to accept a pick. With p=1/odds fallback, set to 0.00.")
     ap.add_argument("--max-picks", type=int, default=40, help="Cap number of picks (highest edge first).")
 
@@ -119,7 +126,7 @@ def main():
         print("[engine] no rows", file=sys.stderr)
         return
 
-    # Normalize: expand two-sided format into flat candidates with a 'price' column.
+    # Normalize: expand two-sided into flat candidates with a 'price' column.
     rows = expand_two_sided_rows(raw_rows)
     if not rows:
         rows = raw_rows[:]  # fallback to original if nothing expanded
@@ -145,21 +152,20 @@ def main():
             price = _flt(r["price"])
         else:
             try:
-                # try infer_odds on arbitrary inputs
                 price = infer_odds(r) or 0.0
             except Exception:
                 price = _flt(r.get("odds") or r.get("decimal_odds"), 0.0)
         if price <= 1.0:
             continue
 
-        # Model probability (preferred) → fallback to market implied
+        # Model probability preferred → fallback to 1/odds (so we emit picks)
         p_model: Optional[float] = None
         try:
             p_model = infer_prob(r)
         except Exception:
             p_model = None
         if p_model is None:
-            p_model = _clamp01(1.0 / price)  # fallback so we always emit rows
+            p_model = _clamp01(1.0 / price)
 
         breakeven = 1.0 / price
         edge_model = p_model - breakeven
