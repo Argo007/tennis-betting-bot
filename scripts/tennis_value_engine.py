@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 # tennis_value_engine.py
-# Reads candidate tennis matches and outputs sized picks with Kelly.
-# - Supports two-sided odds CSVs like: date,player_a,player_b,odds_a,odds_b
-# - Also supports flat rows with 'odds'/'price' and optional model probability.
-# - Falls back to p = 1/odds when model probs are missing.
-# - Default min-edge = 0 so the above fallback still emits picks.
+# Value engine with Kelly sizing + auto min-edge override when no model probs exist.
 
 from __future__ import annotations
 import argparse, csv, os, sys
 from typing import List, Dict, Optional
 from bet_math import KellyConfig, infer_prob, infer_odds, stake_amount
 
-# ---------- utils ----------
+# ---------- small utils ----------
 def _read_csv(path: str) -> List[Dict]:
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
@@ -19,7 +15,6 @@ def _read_csv(path: str) -> List[Dict]:
 def _write_csv(path: str, rows: List[Dict]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if not rows:
-        # Write an empty but valid CSV with a placeholder header
         with open(path, "w", newline='', encoding="utf-8") as f:
             f.write("note\nempty\n")
         return
@@ -44,11 +39,9 @@ def expand_two_sided_rows(rows: List[Dict]) -> List[Dict]:
     """
     out: List[Dict] = []
     for r in rows:
-        # Lowercase map of columns -> original case
         lc = {k.lower(): k for k in r.keys()}
         has = all(k in lc for k in ("player_a","player_b","odds_a","odds_b"))
         if not has:
-            # Pass through; later logic can still size if it has 'odds'/'price'
             out.append(r)
             continue
 
@@ -59,46 +52,33 @@ def expand_two_sided_rows(rows: List[Dict]) -> List[Dict]:
         ob = _flt(r[lc["odds_b"]], 0.0)
 
         if oa > 1.0:
-            out.append({
-                "date": dt,
-                "player": pa,
-                "opponent": pb,
-                "side": "A",
-                "price": oa,   # normalized odds column used downstream
-            })
+            out.append({"date": dt, "player": pa, "opponent": pb, "side": "A", "price": oa})
         if ob > 1.0:
-            out.append({
-                "date": dt,
-                "player": pb,
-                "opponent": pa,
-                "side": "B",
-                "price": ob,
-            })
+            out.append({"date": dt, "player": pb, "opponent": pa, "side": "B", "price": ob})
     return out
 
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(description="Tennis value engine with Kelly sizing.")
     # I/O
-    ap.add_argument("--input", "-i",
-        default="data/raw/odds/sample_odds.csv",
-        help="Input CSV: two-sided odds (date,player_a,player_b,odds_a,odds_b) or flat rows with 'odds'/'price'.")
+    ap.add_argument("--input", "-i", default="data/raw/odds/sample_odds.csv",
+                    help="Two-sided odds (date,player_a,player_b,odds_a,odds_b) or flat rows with 'odds'/'price'.")
     ap.add_argument("--out-picks", default="value_picks_pro.csv", help="Primary picks output (repo root).")
     ap.add_argument("--out-final", default="outputs/picks_final.csv", help="Secondary copy for artifacts.")
     ap.add_argument("--summary", default="outputs/engine_summary.md", help="Markdown run summary.")
 
-    # Legacy/compatibility args (ignored but accepted so workflows don’t break)
+    # Legacy/compat (accepted, ignored)
     ap.add_argument("--elo-atp", dest="elo_atp", default="", help="(ignored) kept for workflow compatibility")
     ap.add_argument("--elo-wta", dest="elo_wta", default="", help="(ignored) kept for workflow compatibility")
 
     # Selection
-    ap.add_argument("--min-edge", type=float, default=0.00,
-        help="Minimum (p_model - 1/odds) to accept a pick. With p=1/odds fallback, set to 0.00.")
+    ap.add_argument("--min-edge", type=float, default=0.03,
+                    help="Minimum (p_model - 1/odds) to accept a pick (may be auto-overridden to 0.00).")
     ap.add_argument("--max-picks", type=int, default=40, help="Cap number of picks (highest edge first).")
 
     # Kelly knobs
     ap.add_argument("--stake-mode", choices=["kelly","flat"], default="kelly")
-    ap.add_argument("--edge", type=float, default=0.08, help="True-edge booster (TE). p_used = clamp(p_model*(1+edge)).")
+    ap.add_argument("--edge", type=float, default=0.08, help="True-edge booster (TE). p_used = clamp(p*(1+edge)).")
     ap.add_argument("--kelly-scale", type=float, default=0.5, help="Safety scaler (0.5=half Kelly).")
     ap.add_argument("--flat-stake", type=float, default=1.0, help="Units per bet when stake-mode=flat.")
     ap.add_argument("--bankroll", type=float, default=1000.0, help="Bankroll used to size stakes.")
@@ -126,10 +106,20 @@ def main():
         print("[engine] no rows", file=sys.stderr)
         return
 
-    # Normalize: expand two-sided into flat candidates with a 'price' column.
+    # Check header for any probability-like column
+    fields_lower = {c.lower() for c in (raw_rows[0].keys() if raw_rows else [])}
+    prob_keys = {"p","prob","model_prob","p_model","probability","pred_prob","win_prob","p_hat"}
+    header_has_probs = any(k in fields_lower for k in prob_keys)
+
+    # Expand two-sided rows if present
     rows = expand_two_sided_rows(raw_rows)
     if not rows:
-        rows = raw_rows[:]  # fallback to original if nothing expanded
+        rows = raw_rows[:]  # fallback
+
+    # Decide effective min-edge:
+    # If no model prob columns in header, override to 0.00 so p=1/odds fallback can pass.
+    effective_min_edge = 0.00 if not header_has_probs else args.min_edge
+    auto_note = "(auto-overridden to 0.00 due to no model probabilities)" if not header_has_probs else ""
 
     # Kelly config
     kcfg = KellyConfig(
@@ -174,7 +164,7 @@ def main():
         row["breakeven"] = round(breakeven, 6)
         row["edge_model"] = round(edge_model, 6)
 
-        if edge_model < args.min_edge:
+        if edge_model < effective_min_edge:
             continue
 
         # Kelly sizing
@@ -211,14 +201,15 @@ def main():
         f.write(
             "# Tennis Value — Daily Picks\n\n"
             f"- Picks: **{len(picks)}**  \n"
-            f"- Min edge: **{args.min_edge:.3f}**  \n"
+            f"- Min edge: **{effective_min_edge:.3f}** {auto_note}  \n"
             f"- Kelly: mode=**{args.stake_mode}**, TE=**{args.edge}**, scale=**{args.kelly_scale}**, cap=**{args.kelly_cap}**  \n"
             f"- Bankroll: **{args.bankroll:.2f}**  \n"
             f"- Total stake: **{total_stake:.4f}**  \n"
             f"- Avg odds: **{avg_odds:.3f}** | Avg edge: **{avg_edge:.3f}**  \n"
         )
 
-    print(f"[engine] wrote {args.out_picks} and {args.out_final}; picks={len(picks)}")
+    print(f"[engine] wrote {args.out_picks} and {args.out_final}; picks={len(picks)}; "
+          f"effective_min_edge={effective_min_edge} {'(auto-0.00)' if not header_has_probs else ''}")
 
 if __name__ == "__main__":
     main()
