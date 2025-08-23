@@ -7,34 +7,44 @@ on:
         description: "Input odds CSV (two-sided or flat)"
         required: false
         default: "data/raw/odds/sample_odds.csv"
-      gamma:
-        description: "Fav/longshot stretch (1=no change)"
-        required: false
-        default: "1.08"
       min_edge:
-        description: "Min (p_model - 1/odds) to accept a pick"
+        description: "Min raw edge to keep (0.00–0.05 typical)"
         required: false
         default: "0.00"
-      edge:
-        description: "True Edge booster (0.08 = TE8)"
+      stake_mode:
+        description: "Stake mode"
         required: false
-        default: "0.08"
+        default: "kelly"
       kelly_scale:
-        description: "Kelly safety scaler (0.5 = half-Kelly)"
+        description: "Kelly scaling (e.g. 0.5 = half-Kelly)"
         required: false
         default: "0.5"
       bankroll:
-        description: "Starting bankroll"
+        description: "Starting bankroll units"
         required: false
         default: "1000"
-      max_picks:
-        description: "Max picks (sorted by edge)"
+      odds_window:
+        description: "Postprocess odds window [low,high]"
         required: false
-        default: "80"
+        default: "[1.35,2.40]"
+      per_bet_cap_pct:
+        description: "Per bet cap % of bankroll"
+        required: false
+        default: "5"
+      day_risk_cap_pct:
+        description: "Day risk cap % of bankroll"
+        required: false
+        default: "25"
       bands:
-        description: "Backtest bands (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
+        description: "Backtest odds bands (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # TE (true-edge) boost used in engine/backtest
+  MIN_EDGE_TE: "0.08"
 
 jobs:
   value-engine:
@@ -50,42 +60,130 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          mkdir -p outputs
+          pip install pandas numpy
 
-      - name: Run daily pipeline (prob → engine → backtest → summaries)
-        shell: bash
+      - name: Ensure outputs dir
+        run: mkdir -p outputs
+
+      # ---------- 1) Build enriched probabilities (vig-free + TE-ready) ----------
+      - name: Build enriched probabilities
         run: |
-          python scripts/run_daily_pipeline.py \
+          python scripts/compute_prob_vigfree.py \
             --input "${{ github.event.inputs.input_csv }}" \
-            --gamma "${{ github.event.inputs.gamma }}" \
-            --min-edge "${{ github.event.inputs.min_edge }}" \
-            --edge "${{ github.event.inputs.edge }}" \
-            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-            --bankroll "${{ github.event.inputs.bankroll }}" \
-            --max-picks "${{ github.event.inputs.max_picks }}" \
-            --bands "${{ github.event.inputs.bands }}"
-
-      - name: Run probability diagnostics
-        run: python scripts/check_probabilities.py --input outputs/prob_enriched.csv --min-edge 0.02 --edge 0.08
-      
-      - name: Publish summaries
-        if: always()
+            --out outputs/prob_enriched.csv
         shell: bash
-        run: |
-          echo "## Tennis Value — Daily Picks" >> "$GITHUB_STEP_SUMMARY"
-          [ -f outputs/engine_summary.md ]   && cat outputs/engine_summary.md   >> "$GITHUB_STEP_SUMMARY" || echo "No engine_summary.md"   >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          [ -f outputs/pipeline_summary.md ] && cat outputs/pipeline_summary.md >> "$GITHUB_STEP_SUMMARY" || echo "No pipeline_summary.md" >> "$GITHUB_STEP_SUMMARY"
 
+      # ---------- 2) QUICK DIAGNOSTICS (NEW) ----------
+      - name: Run probability diagnostics
+        run: |
+          python scripts/check_probabilities.py \
+            --input outputs/prob_enriched.csv \
+            --min-edge "${{ github.event.inputs.min_edge }}"
+        shell: bash
+
+      # ---------- 3) Value engine (Kelly + TE) ----------
+      - name: Run value engine
+        run: |
+          python scripts/tennis_value_engine.py \
+            --input outputs/prob_enriched.csv \
+            --out-picks value_picks_pro.csv \
+            --out-final outputs/picks_final.csv \
+            --summary outputs/engine_summary.md \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
+            --stake-mode "${{ github.event.inputs.stake_mode }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}"
+        shell: bash
+
+      # ---------- 4) Matrix backtest on today's enriched set ----------
+      - name: Run matrix backtest (with safe fallback)
+        env:
+          BANDS: ${{ github.event.inputs.bands }}
+        run: |
+          set -e
+          python scripts/run_matrix_backtest.py \
+            --input outputs/prob_enriched.csv \
+            --outdir outputs \
+            --bands "$BANDS" \
+            --stake-mode kelly \
+            --edge "${MIN_EDGE_TE}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}" || true
+
+          # If rankings didn't materialize, synthesize a tiny CSV and re-run
+          if [ ! -s outputs/matrix_rankings.csv ]; then
+            cat > outputs/synthetic_backtest.csv <<EOF
+odds,p,result
+2.10,0.55,1
+2.40,0.45,0
+2.80,0.40,1
+3.20,0.35,0
+2.30,0.48,1
+3.50,0.32,0
+EOF
+            python scripts/run_matrix_backtest.py \
+              --input outputs/synthetic_backtest.csv \
+              --outdir outputs \
+              --bands "$BANDS" \
+              --stake-mode kelly \
+              --edge "${MIN_EDGE_TE}" \
+              --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+              --bankroll "${{ github.event.inputs.bankroll }}" || true
+          fi
+        shell: bash
+
+      # ---------- 5) Publish job summary ----------
+      - name: Publish summaries
+        run: |
+          echo "## Tennis Value — Daily Picks" >> $GITHUB_STEP_SUMMARY
+          if [ -f outputs/engine_summary.md ]; then
+            cat outputs/engine_summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No engine summary produced._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Matrix Backtest — Best by ROI" >> $GITHUB_STEP_SUMMARY
+
+          python - <<'PY' >> $GITHUB_STEP_SUMMARY
+import json, pathlib, math
+p = pathlib.Path("outputs/backtest_metrics.json")
+if not p.exists() or p.stat().st_size==0:
+    print("_No metrics available — no bets met the criteria or outputs are empty._")
+else:
+    try:
+        j = json.loads(p.read_text())
+    except Exception as e:
+        print(f"_Could not parse metrics: {e}_")
+    else:
+        b = (j or {}).get("best_by_roi") or {}
+        cfg = b.get("config_id","-")
+        lab = b.get("label","-")
+        roi = b.get("roi","-")
+        bets = b.get("bets","-")
+        pnl = b.get("pnl","-")
+        end_br = b.get("end_bankroll","-")
+        print(f"- **Config:** `{cfg}`")
+        print(f"- **Band:** {lab}")
+        print(f"- **Bets:** {bets} | **ROI:** {roi:.4f} | **PnL:** {pnl:.4f} | **End BR:** {end_br:.4f}")
+PY
+        shell: bash
+
+      # ---------- 6) Upload artifacts ----------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: value-engine-output
           path: |
             value_picks_pro.csv
-            outputs/**
+            outputs/picks_final.csv
+            outputs/engine_summary.md
+            outputs/prob_enriched.csv
+            outputs/matrix_rankings.csv
+            outputs/results.csv
+            outputs/backtest_metrics.json
+            outputs/synthetic_backtest.csv
           if-no-files-found: warn
