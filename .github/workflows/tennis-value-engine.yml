@@ -41,9 +41,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Run probability diagnostics
-        run: python scripts/check_probabilities.py --input outputs/prob_enriched.csv --min-edge 0.02 --edge 0.08
-
       - name: Check out repo
         uses: actions/checkout@v4
 
@@ -72,6 +69,9 @@ jobs:
             --max-picks "${{ github.event.inputs.max_picks }}" \
             --bands "${{ github.event.inputs.bands }}"
 
+      - name: Run probability diagnostics
+        run: python scripts/check_probabilities.py --input outputs/prob_enriched.csv --min-edge 0.02 --edge 0.08
+      
       - name: Publish summaries
         if: always()
         shell: bash
