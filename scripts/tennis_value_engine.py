@@ -1,102 +1,186 @@
 #!/usr/bin/env python3
-"""
-Daily decision engine: read candidate picks (value_picks_pro.csv),
-fallback to Elo if model_conf missing, filter by edge, cap Kelly,
-output final list.
+# tennis_value_engine.py
+# Drop-in engine that:
+# 1) reads a candidates CSV,
+# 2) filters by min edge,
+# 3) sizes picks with Kelly (TE edge booster, safety scaler, caps),
+# 4) writes value_picks_pro.csv (root) + outputs/picks_with_stakes.csv,
+# 5) emits outputs/engine_summary.md
 
-Outputs:
-  - outputs/picks_final.csv
-  - outputs/engine_summary.md
-"""
-import argparse
-from pathlib import Path
-import pandas as pd
+from __future__ import annotations
+import argparse, csv, os, math, sys
+from typing import List, Dict, Optional
+from bet_math import KellyConfig, infer_prob, infer_odds, stake_amount
 
-def elo_map(path):
-    if not Path(path).exists(): return {}
-    df = pd.read_csv(path)
-    return {str(r["player"]).lower(): float(r["elo"]) for _,r in df.iterrows()}
+def clamp01(x: float) -> float:
+    return 0.0 if x < 0 else 1.0 if x > 1 else x
 
-def elo_prob(player, opponent, elo_atp, elo_wta):
-    M = {**elo_atp, **elo_wta}
-    a = M.get(str(player).lower(), 1500.0)
-    b = M.get(str(opponent).lower(), 1500.0)
-    return 1.0/(1.0+10**(-(a-b)/400.0))
+def f2(x: float) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
-def kelly(p, o):
-    return max(0.0, (p*o-1)/(o-1)) if o>1 else 0.0
+def read_rows(path: str) -> List[Dict]:
+    with open(path, newline='', encoding='utf-8') as f:
+        rdr = csv.DictReader(f)
+        return list(rdr)
+
+def write_csv(path: str, rows: List[Dict]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not rows:
+        # write empty with a minimal header
+        with open(path, "w", newline='', encoding="utf-8") as f:
+            f.write("note\nempty\n")
+        return
+    keys = sorted({k for r in rows for k in r.keys()})
+    with open(path, "w", newline='', encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=keys)
+        wr.writeheader()
+        wr.writerows(rows)
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="value_picks_pro.csv")
-    ap.add_argument("--elo-atp", default="data/atp_elo.csv")
-    ap.add_argument("--elo-wta", default="data/wta_elo.csv")
-    ap.add_argument("--min-edge", type=float, default=0.03)
-    ap.add_argument("--kelly-cap", type=float, default=0.20)
-    ap.add_argument("--max-risk", type=float, default=0.05)
-    ap.add_argument("--bankroll", type=float, default=1000.0)
-    ap.add_argument("--max-picks", type=int, default=20)
+    ap = argparse.ArgumentParser(description="Value engine with Kelly sizing (TE booster + caps).")
+    # I/O
+    ap.add_argument("--input", "-i",
+                    default="data/raw/odds/sample_odds.csv",
+                    help="Candidates CSV with at least odds/price and (preferably) model prob + result for offline QA.")
+    ap.add_argument("--out-picks",
+                    default="value_picks_pro.csv",
+                    help="Main picks CSV to write at repo root.")
+    ap.add_argument("--out-final",
+                    default="outputs/picks_final.csv",
+                    help="Secondary copy with the same rows (for workflows/artifacts).")
+    ap.add_argument("--summary",
+                    default="outputs/engine_summary.md",
+                    help="Markdown summary path.")
+
+    # Legacy/compat placeholders (accepted so existing workflows don’t break)
+    ap.add_argument("--elo-atp", default="", help="(optional, accepted for compatibility)")
+    ap.add_argument("--elo-wta", default="", help="(optional, accepted for compatibility)")
+
+    # Selection knobs
+    ap.add_argument("--min-edge", type=float, default=0.05,
+                    help="Minimum (model_p - 1/odds) to accept a pick.")
+    ap.add_argument("--max-picks", type=int, default=20,
+                    help="Max number of picks to output (highest edge first).")
+
+    # Kelly & risk knobs
+    ap.add_argument("--stake-mode", choices=["kelly", "flat"], default="kelly")
+    ap.add_argument("--edge", type=float, default=0.08, help="True-edge booster multiplier for p: p'=clamp(p*(1+edge)).")
+    ap.add_argument("--kelly-scale", type=float, default=0.5, help="Kelly safety scaler (0.5 = half-Kelly).")
+    ap.add_argument("--flat-stake", type=float, default=1.0, help="Units when stake-mode=flat.")
+    ap.add_argument("--bankroll", type=float, default=100.0, help="Bankroll used to size stakes.")
+    ap.add_argument("--kelly-cap", type=float, default=0.20,
+                    help="Cap on scaled Kelly fraction per bet (e.g., 0.20 = max 20% BR).")
+    ap.add_argument("--max-risk", type=float, default=0.25,
+                    help="Hard cap on stake as a fraction of bankroll (safety valve).")
+
     args = ap.parse_args()
 
-    Path("outputs").mkdir(parents=True, exist_ok=True)
-    df = pd.read_csv(args.input) if Path(args.input).exists() else pd.DataFrame(columns=["date","player","opponent","odds"])
+    # Load candidates
+    if not os.path.isfile(args.input):
+        print(f"[engine] input not found: {args.input}", file=sys.stderr)
+        write_csv(args.out_picks, [])
+        write_csv(args.out_final, [])
+        os.makedirs(os.path.dirname(args.summary) or ".", exist_ok=True)
+        with open(args.summary, "w", encoding="utf-8") as f:
+            f.write(f"# Engine Summary\n\nInput missing: `{args.input}`.\n")
+        return
 
-    elo_atp = elo_map(args.elo_atp)
-    elo_wta = elo_map(args.elo_wta)
+    cand = read_rows(args.input)
+    if not cand:
+        write_csv(args.out_picks, [])
+        write_csv(args.out_final, [])
+        os.makedirs(os.path.dirname(args.summary) or ".", exist_ok=True)
+        with open(args.summary, "w", encoding="utf-8") as f:
+            f.write(f"# Engine Summary\n\nNo rows in `{args.input}`.\n")
+        return
 
-    out=[]
-    bankroll = float(args.bankroll)
-    for _,r in df.iterrows():
-        o = float(r.get("odds", 0))
-        if o <= 1.0: continue
+    # Build Kelly config
+    kcfg = KellyConfig(
+        stake_mode=args.stake_mode,
+        edge=args.edge,
+        kelly_scale=args.kelly_scale,
+        flat_stake=args.flat_stake,
+        bankroll_init=args.bankroll
+    )
 
-        p = r.get("model_conf", None)
+    # Compute edge + stakes
+    rows: List[Dict] = []
+    bankroll = kcfg.bankroll_init
+
+    for r in cand:
+        row = dict(r)
+
+        # odds
         try:
-            p = float(p)
+            price = infer_odds(r) or 0.0
         except Exception:
-            p = None
-        if not (p and 0.0 < p < 1.0):
-            p = elo_prob(r.get("player",""), r.get("opponent",""), elo_atp, elo_wta)
+            price = f2(r.get("price") or r.get("odds") or r.get("decimal_odds") or 0.0)
+        if price <= 1.0:
+            continue  # invalid odds
 
-        implied = 1.0/o
-        edge = p - implied
-        if edge < args.min_edge: 
+        # model prob (preferred) → fallback to market implied
+        p_model = infer_prob(r)
+        if p_model is None:
+            p_model = clamp01(1.0 / price)
+
+        # intrinsic edge vs market
+        breakeven = 1.0 / price
+        model_edge = p_model - breakeven
+        row["price"] = price
+        row["p_model"] = round(p_model, 6)
+        row["breakeven"] = round(breakeven, 6)
+        row["edge_model"] = round(model_edge, 6)
+
+        if model_edge < args.min_edge:
             continue
 
-        k_full = kelly(p, o)
-        k_used = min(k_full, args.kelly_cap, args.max_risk)
-        stake = bankroll * k_used
-        if stake < 1.0: 
-            continue
+        # Kelly sizing (with TE booster inside stake_amount)
+        stake, p_used, f_raw = stake_amount(kcfg, bankroll, p_model, price)
 
-        out.append({
-            "date": r.get("date",""),
-            "player": r.get("player",""),
-            "opponent": r.get("opponent",""),
-            "odds": round(o,2),
-            "model_prob": round(p,4),
-            "edge": round(edge,4),
-            "kelly_used": round(k_used,4),
-            "stake": round(stake,2),
-        })
+        # Apply caps on scaled Kelly fraction (stake / bankroll)
+        frac = (stake / bankroll) if bankroll > 0 else 0.0
+        cap_frac = min(max(args.kelly_cap, 0.0), max(args.max_risk, 0.0))
+        if frac > cap_frac:
+            stake = bankroll * cap_frac
+            frac = cap_frac
 
-    picks = pd.DataFrame(out)
-    if not picks.empty:
-        picks.sort_values(["date","edge","odds"], ascending=[True, False, True], inplace=True)
-        picks = picks.head(args.max_picks)
-    picks.to_csv("outputs/picks_final.csv", index=False)
+        row["stake_units"] = round(stake, 6)
+        row["stake_frac_br"] = round(frac, 6)
+        row["kelly_f_raw"] = round(f_raw, 6)
+        row["p_used"] = round(p_used, 6)
 
-    md=[]
-    md.append("# Engine summary")
-    md.append(f"- Min edge: **{args.min_edge:.2%}**")
-    md.append(f"- Kelly cap: **{args.kelly_cap:.2%}**, Max risk: **{args.max_risk:.2%}**")
-    md.append(f"- Max picks shown: **{args.max_picks}**")
-    md.append(f"- Output rows: **{len(picks)}**")
-    try:
-        md.append("\n## Picks\n\n"+picks.head(25).to_markdown(index=False))
-    except Exception:
-        md.append("\n## Picks (CSV)\n\n"+picks.head(25).to_csv(index=False))
-    Path("outputs/engine_summary.md").write_text("\n".join(md))
+        rows.append(row)
+
+    # Sort by edge desc and clip to max picks
+    rows.sort(key=lambda x: x.get("edge_model", 0.0), reverse=True)
+    if args.max_picks and args.max_picks > 0:
+        rows = rows[: args.max_picks]
+
+    # Write outputs
+    write_csv(args.out_picks, rows)
+    write_csv(args.out_final, rows)
+
+    # Summary
+    os.makedirs(os.path.dirname(args.summary) or ".", exist_ok=True)
+    total_stake = sum(f2(r.get("stake_units")) for r in rows)
+    avg_price = (sum(f2(r.get("price")) for r in rows) / len(rows)) if rows else 0.0
+    avg_edge = (sum(f2(r.get("edge_model")) for r in rows) / len(rows)) if rows else 0.0
+
+    with open(args.summary, "w", encoding="utf-8") as f:
+        f.write(
+            "# Tennis Value — Daily Picks\n\n"
+            f"- Picks: **{len(rows)}**  \n"
+            f"- Min edge: **{args.min_edge:.3f}**  \n"
+            f"- Kelly: mode=**{args.stake_mode}**, TE=**{args.edge}**, scale=**{args.kelly_scale}**, cap=**{args.kelly_cap}**  \n"
+            f"- Bankroll: **{args.bankroll:.2f}**  \n"
+            f"- Total stake: **{total_stake:.4f}**  \n"
+            f"- Avg odds: **{avg_price:.3f}** | Avg edge: **{avg_edge:.3f}**  \n"
+        )
+
+    print(f"[engine] wrote {args.out_picks} and {args.out_final}; summary -> {args.summary}")
 
 if __name__ == "__main__":
     main()
