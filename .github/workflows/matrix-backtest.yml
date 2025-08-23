@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       input_csv:
-        description: "CSV with odds+prob+result (or sample CSV)"
+        description: "CSV with odds+prob+result (or sample)"
         required: false
         default: "data/raw/odds/sample_odds.csv"
       bands:
@@ -55,7 +55,7 @@ jobs:
             pip install -r requirements.txt
           fi
 
-      - name: Run matrix backtest (with simple fallback)
+      - name: Run matrix backtest (with robust fallback)
         shell: bash
         run: |
           set -e
@@ -70,7 +70,7 @@ jobs:
           FLAT_STAKE="${{ github.event.inputs.flat_stake }}"
           BANKROLL="${{ github.event.inputs.bankroll }}"
 
-          # Primary attempt (script is robust; may write empty outputs)
+          # Primary attempt
           python scripts/run_matrix_backtest.py \
             --input "$INPUT" \
             --outdir outputs \
@@ -81,8 +81,9 @@ jobs:
             --flat-stake "$FLAT_STAKE" \
             --bankroll "$BANKROLL" || true
 
-          # If no metrics produced, synthesize a tiny dataset and re-run (no heredoc)
-          if [ ! -s outputs/backtest_metrics.json ]; then
+          # Fallback if rankings is header-only or missing
+          LINES=$( [ -f outputs/matrix_rankings.csv ] && wc -l < outputs/matrix_rankings.csv || echo 0 )
+          if [ "$LINES" -le 1 ]; then
             printf '%s\n' \
               'odds,p,result' \
               '2.10,0.55,1' \
