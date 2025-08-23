@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       input_csv:
-        description: "CSV with odds + probability + result (or your sample CSV)"
+        description: "CSV with odds + probability + result (or sample)"
         required: false
         default: "data/raw/odds/sample_odds.csv"
       bands:
@@ -35,6 +35,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -62,7 +63,7 @@ jobs:
           FLAT_STAKE="${{ github.event.inputs.flat_stake }}"
           BANKROLL="${{ github.event.inputs.bankroll }}"
 
-          # First attempt (script itself is robust; writes empty outputs if needed)
+          # Primary attempt (robust script; may write empty outputs)
           python scripts/run_matrix_backtest.py \
             --input "$INPUT" \
             --outdir outputs \
@@ -73,7 +74,7 @@ jobs:
             --flat-stake "$FLAT_STAKE" \
             --bankroll "$BANKROLL" || true
 
-          # If metrics missing/empty, create a tiny synthetic CSV and re-run
+          # If no metrics produced, synthesize a tiny dataset and re-run (no heredoc)
           if [ ! -s outputs/backtest_metrics.json ]; then
             printf '%s\n' \
               'odds,p,result' \
@@ -96,34 +97,10 @@ jobs:
               --bankroll "$BANKROLL" || true
           fi
 
-      - name: Quick summary (robust)
+      - name: Quick summary (separate script, robust)
         shell: bash
         run: |
-          # write summary.md with a heredoc; the quoting is important
-          python - <<'PY' > summary.md
-import json, pathlib
-
-p = pathlib.Path("outputs/backtest_metrics.json")
-if not p.exists() or p.stat().st_size == 0:
-    print("No metrics json found.")
-else:
-    try:
-        j = json.loads(p.read_text())
-    except Exception as e:
-        print(f"Could not parse metrics: {e}")
-    else:
-        b = (j or {}).get("best_by_roi") or {}
-        def fmt(x):
-            try:
-                return f"{float(x):.4f}"
-            except Exception:
-                return "-" if x is None else str(x)
-        print("## Matrix Backtest — Best by ROI")
-        print(f"- **Config**: `{b.get('config_id','')}`")
-        print(f"- **Band**: {b.get('label','')}")
-        print(f"- **ROI**: {fmt(b.get('roi'))}")
-PY
-          # Always succeed and append to the job summary
+          python scripts/quick_summary.py > summary.md
           cat summary.md >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload artifacts
