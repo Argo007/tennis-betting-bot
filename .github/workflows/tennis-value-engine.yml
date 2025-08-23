@@ -1,158 +1,200 @@
 name: Tennis Value Engine (Daily Picks)
 
 on:
-  schedule:
-    - cron: "0 7 * * *"      # daily 07:00 UTC
   workflow_dispatch:
     inputs:
-      region:
-        description: "Feed region (picks_pro)"
+      # -------- probability enrichment (vig-free) --------
+      input_csv:
+        description: "Input odds CSV (two-sided or flat)"
         required: false
-        default: "EU"
-      lookahead_h:
-        description: "Odds freshness window (hours)"
+        default: "data/raw/odds/sample_odds.csv"
+      gamma:
+        description: "Fav/longshot stretch (1=no change)"
         required: false
-        default: "6"
-      kelly:
-        description: "Kelly fraction sent to picks_pro (if used)"
-        required: false
-        default: "1.0"
-      # Engine controls
+        default: "1.05"
+
+      # -------- engine knobs --------
       min_edge:
-        description: "Minimum edge (e.g., 0.03 = 3%)"
+        description: "Min (p_model - 1/odds) to accept a pick"
         required: false
-        default: "0.03"
+        default: "0.02"
+      stake_mode:
+        description: "Stake mode"
+        required: false
+        default: "kelly"
+      edge:
+        description: "True Edge booster (0.08 = TE8)"
+        required: false
+        default: "0.08"
+      kelly_scale:
+        description: "Kelly safety scaler"
+        required: false
+        default: "0.5"
       kelly_cap:
-        description: "Kelly cap (fraction of full Kelly)"
+        description: "Cap stake as fraction of bankroll"
         required: false
         default: "0.20"
-      max_risk:
-        description: "Max bankroll fraction per bet"
+      flat_stake:
+        description: "Units per bet if flat staking"
         required: false
-        default: "0.05"
+        default: "1"
       bankroll:
-        description: "Bankroll (€)"
+        description: "Starting bankroll"
         required: false
         default: "1000"
       max_picks:
-        description: "Top N to output"
+        description: "Maximum picks to output (sorted by edge)"
         required: false
-        default: "20"
+        default: "80"
+      elo_atp:
+        description: "Path to ATP Elo CSV (optional)"
+        required: false
+        default: ""
+      elo_wta:
+        description: "Path to WTA Elo CSV (optional)"
+        required: false
+        default: ""
+
+      # -------- backtest matrix (optional but handy) --------
+      bands:
+        description: "Odds bands (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
+        required: false
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+
+      # Publish summary to the job page
       publish_md:
-        description: "Publish markdown to job log?"
-        required: true
-        type: choice
+        description: "Append summaries to job page"
+        required: false
         default: "yes"
-        options: ["yes","no"]
-
-permissions:
-  contents: read
-
-env:
-  TZ: Europe/Amsterdam
-  REGION:      ${{ github.event.inputs.region      || 'EU' }}
-  LOOKAHEAD_H: ${{ github.event.inputs.lookahead_h || '6'  }}
-  KELLY:       ${{ github.event.inputs.kelly       || '1.0' }}
-  MIN_EDGE:    ${{ github.event.inputs.min_edge    || '0.03' }}
-  KELLY_CAP:   ${{ github.event.inputs.kelly_cap   || '0.20' }}
-  MAX_RISK:    ${{ github.event.inputs.max_risk    || '0.05' }}
-  BANKROLL:    ${{ github.event.inputs.bankroll    || '1000' }}
-  MAX_PICKS:   ${{ github.event.inputs.max_picks   || '20'  }}
-  PUBLISH_MD:  ${{ github.event.inputs.publish_md  || 'yes' }}
 
 jobs:
   value-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Check out repo
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Upgrade pip + deps
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy requests pyyaml tabulate openpyxl matplotlib unidecode rapidfuzz
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Locate scripts (root or scripts/)
-        id: locate
+        id: where
         shell: bash
         run: |
-          set -e
-          P1=$(git ls-files 'tennis_value_picks_pro.py' 'scripts/tennis_value_picks_pro.py' | head -n1 || true)
-          P2=$(git ls-files 'tennis_value_engine.py'    'scripts/tennis_value_engine.py'    | head -n1 || true)
-          echo "picks_pro_path=$P1" >> $GITHUB_OUTPUT
-          echo "engine_path=$P2"    >> $GITHUB_OUTPUT
-          echo "Found picks_pro at: ${P1:-<missing>}"
-          echo "Found engine    at: ${P2:-<missing>}"
-          if [ -z "$P1" ]; then echo "::error ::tennis_value_picks_pro.py missing (root or scripts/)"; exit 1; fi
-          if [ -z "$P2" ]; then echo "::error ::tennis_value_engine.py missing (root or scripts/)"; exit 1; fi
-          mkdir -p outputs
+          if [ -f scripts/tennis_value_engine.py ]; then
+            echo "scripts_path=scripts" >> "$GITHUB_OUTPUT"
+          else
+            echo "scripts_path=." >> "$GITHUB_OUTPUT"
+          fi
+          echo "Using scripts at ${{ steps.where.outputs.scripts_path }}"
 
-      - name: Run picks_pro (build candidates)
+      - name: Ensure outputs dir
+        shell: bash
+        run: mkdir -p outputs
+
+      # -------- Build p_model from two-sided odds (vig-free + stretch) --------
+      - name: Enrich probabilities (vig-free + stretch)
         shell: bash
         run: |
-          set -euo pipefail
-          echo "Running ${{ steps.locate.outputs.picks_pro_path }}…" | tee outputs/engine_run.log
-          python "${{ steps.locate.outputs.picks_pro_path }}" \
-            --region "${REGION}" \
-            --lookahead-h "${LOOKAHEAD_H}" \
-            --kelly "${KELLY}" \
-            --out value_picks_pro.csv 2>&1 | tee -a outputs/engine_run.log
-          test -f value_picks_pro.csv || echo "date,player,opponent,odds,model_conf,book_count" > value_picks_pro.csv
+          S="${{ steps.where.outputs.scripts_path }}"
+          IN="${{ github.event.inputs.input_csv }}"
+          python "$S/compute_prob_vigfree.py" \
+            --input "${IN:-data/raw/odds/sample_odds.csv}" \
+            --out outputs/prob_enriched.csv \
+            --gamma "${{ github.event.inputs.gamma }}"
 
+      # -------- Decision engine (Kelly + TE) --------
       - name: Run decision engine
         shell: bash
         run: |
           set -euo pipefail
-          echo "Running ${{ steps.locate.outputs.engine_path }}…" | tee -a outputs/engine_run.log
-          python "${{ steps.locate.outputs.engine_path }}" \
-            --input value_picks_pro.csv \
-            --elo-atp data/atp_elo.csv \
-            --elo-wta data/wta_elo.csv \
-            --min-edge "${MIN_EDGE}" \
-            --kelly-cap "${KELLY_CAP}" \
-            --max-risk "${MAX_RISK}" \
-            --bankroll "${BANKROLL}" \
-            --max-picks "${MAX_PICKS}" 2>&1 | tee -a outputs/engine_run.log
+          S="${{ steps.where.outputs.scripts_path }}"
+          python "$S/tennis_value_engine.py" \
+            --input outputs/prob_enriched.csv \
+            --out-picks value_picks_pro.csv \
+            --out-final outputs/picks_final.csv \
+            --summary outputs/engine_summary.md \
+            --stake-mode "${{ github.event.inputs.stake_mode }}" \
+            --edge "${{ github.event.inputs.edge }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --kelly-cap "${{ github.event.inputs.kelly_cap }}" \
+            --flat-stake "${{ github.event.inputs.flat_stake }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}" \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
+            --max-picks "${{ github.event.inputs.max_picks }}" \
+            ${ELO_ATP:+--elo-atp "$ELO_ATP"} \
+            ${ELO_WTA:+--elo-wta "$ELO_WTA"}
+        env:
+          ELO_ATP: ${{ github.event.inputs.elo_atp }}
+          ELO_WTA: ${{ github.event.inputs.elo_wta }}
 
-      - name: Publish summary
-        if: ${{ env.PUBLISH_MD == 'yes' }}
+      - name: Publish engine summary
+        if: ${{ github.event.inputs.publish_md == 'yes' }}
+        shell: bash
         run: |
           echo "## Tennis Value — Daily Picks" >> "$GITHUB_STEP_SUMMARY"
           if [ -f outputs/engine_summary.md ]; then
             cat outputs/engine_summary.md >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "_No summary produced._" >> "$GITHUB_STEP_SUMMARY"
+            echo "No engine_summary.md produced." >> "$GITHUB_STEP_SUMMARY"
           fi
-          
-      - name: Matrix backtest (TE8 half-Kelly)
+
+      # -------- Optional: quick matrix backtest on synthetic set if nothing to test --------
+      - name: Run matrix backtest (robust)
+        shell: bash
         run: |
-          mkdir -p outputs
-          python scripts/run_matrix_backtest.py \
-            --input data/raw/odds/sample_odds.csv \
+          S="${{ steps.where.outputs.scripts_path }}"
+          BANDS="${{ github.event.inputs.bands }}"
+          # Try to backtest the enriched (requires odds + p + result). If not available, synthesize.
+          # First, attempt real backtest (will likely no-op if 'result' missing).
+          python "$S/run_matrix_backtest.py" \
+            --input outputs/prob_enriched.csv \
             --outdir outputs \
-            --bands "2.0,2.6|2.6,3.2|3.2,4.0" \
+            --bands "$BANDS" \
             --stake-mode kelly \
             --edge 0.08 \
             --kelly-scale 0.5 \
-            --bankroll 100
+            --bankroll 100 || true
 
-      - name: Upload matrix artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: matrix_backtest_outputs
-          path: |
-            outputs/results.csv
-            outputs/matrix_rankings.csv
-            outputs/backtest_metrics.json
-          if-no-files-found: warn
+          LINES=$( [ -f outputs/matrix_rankings.csv ] && wc -l < outputs/matrix_rankings.csv || echo 0 )
+          if [ "$LINES" -le 1 ]; then
+            printf '%s\n' \
+              'odds,p,result' \
+              '2.10,0.55,1' \
+              '2.40,0.45,0' \
+              '2.80,0.40,1' \
+              '3.20,0.35,0' \
+              '2.30,0.48,1' \
+              '3.50,0.32,0' \
+              > outputs/synthetic_backtest.csv
+
+            python "$S/run_matrix_backtest.py" \
+              --input outputs/synthetic_backtest.csv \
+              --outdir outputs \
+              --bands "$BANDS" \
+              --stake-mode kelly \
+              --edge 0.08 \
+              --kelly-scale 0.5 \
+              --bankroll 100 || true
+          fi
+
+      - name: Backtest summary (best by ROI)
+        if: ${{ github.event.inputs.publish_md == 'yes' }}
+        shell: bash
+        run: |
+          S="${{ steps.where.outputs.scripts_path }}"
+          python "$S/quick_summary.py" > summary.md || true
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -161,6 +203,9 @@ jobs:
           path: |
             value_picks_pro.csv
             outputs/picks_final.csv
-            outputs/*.md
-            outputs/*.log
+            outputs/engine_summary.md
+            outputs/prob_enriched.csv
+            outputs/results.csv
+            outputs/matrix_rankings.csv
+            outputs/backtest_metrics.json
           if-no-files-found: warn
