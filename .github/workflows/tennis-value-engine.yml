@@ -3,7 +3,6 @@ name: Tennis Value Engine (Daily Picks)
 on:
   workflow_dispatch:
     inputs:
-      # -------- probability enrichment (vig-free) --------
       input_csv:
         description: "Input odds CSV (two-sided or flat)"
         required: false
@@ -12,16 +11,10 @@ on:
         description: "Fav/longshot stretch (1=no change)"
         required: false
         default: "1.05"
-
-      # -------- engine knobs --------
       min_edge:
         description: "Min (p_model - 1/odds) to accept a pick"
         required: false
         default: "0.02"
-      stake_mode:
-        description: "Stake mode"
-        required: false
-        default: "kelly"
       edge:
         description: "True Edge booster (0.08 = TE8)"
         required: false
@@ -30,42 +23,18 @@ on:
         description: "Kelly safety scaler"
         required: false
         default: "0.5"
-      kelly_cap:
-        description: "Cap stake as fraction of bankroll"
-        required: false
-        default: "0.20"
-      flat_stake:
-        description: "Units per bet if flat staking"
-        required: false
-        default: "1"
       bankroll:
         description: "Starting bankroll"
         required: false
         default: "1000"
       max_picks:
-        description: "Maximum picks to output (sorted by edge)"
+        description: "Max picks (sorted by edge)"
         required: false
         default: "80"
-      elo_atp:
-        description: "Path to ATP Elo CSV (optional)"
-        required: false
-        default: ""
-      elo_wta:
-        description: "Path to WTA Elo CSV (optional)"
-        required: false
-        default: ""
-
-      # -------- backtest matrix (optional but handy) --------
       bands:
-        description: "Odds bands (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
+        description: "Odds bands for backtest (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
-
-      # Publish summary to the job page
-      publish_md:
-        description: "Append summaries to job page"
-        required: false
-        default: "yes"
 
 jobs:
   value-engine:
@@ -98,10 +67,9 @@ jobs:
           echo "Using scripts at ${{ steps.where.outputs.scripts_path }}"
 
       - name: Ensure outputs dir
-        shell: bash
         run: mkdir -p outputs
 
-      # -------- Build p_model from two-sided odds (vig-free + stretch) --------
+      # 1) Build model probabilities from odds (vig-free + small stretch)
       - name: Enrich probabilities (vig-free + stretch)
         shell: bash
         run: |
@@ -112,7 +80,7 @@ jobs:
             --out outputs/prob_enriched.csv \
             --gamma "${{ github.event.inputs.gamma }}"
 
-      # -------- Decision engine (Kelly + TE) --------
+      # 2) Run decision engine (Kelly + TE)
       - name: Run decision engine
         shell: bash
         run: |
@@ -123,22 +91,15 @@ jobs:
             --out-picks value_picks_pro.csv \
             --out-final outputs/picks_final.csv \
             --summary outputs/engine_summary.md \
-            --stake-mode "${{ github.event.inputs.stake_mode }}" \
+            --stake-mode kelly \
             --edge "${{ github.event.inputs.edge }}" \
             --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-            --kelly-cap "${{ github.event.inputs.kelly_cap }}" \
-            --flat-stake "${{ github.event.inputs.flat_stake }}" \
+            --kelly-cap 0.20 \
             --bankroll "${{ github.event.inputs.bankroll }}" \
             --min-edge "${{ github.event.inputs.min_edge }}" \
-            --max-picks "${{ github.event.inputs.max_picks }}" \
-            ${ELO_ATP:+--elo-atp "$ELO_ATP"} \
-            ${ELO_WTA:+--elo-wta "$ELO_WTA"}
-        env:
-          ELO_ATP: ${{ github.event.inputs.elo_atp }}
-          ELO_WTA: ${{ github.event.inputs.elo_wta }}
+            --max-picks "${{ github.event.inputs.max_picks }}"
 
       - name: Publish engine summary
-        if: ${{ github.event.inputs.publish_md == 'yes' }}
         shell: bash
         run: |
           echo "## Tennis Value — Daily Picks" >> "$GITHUB_STEP_SUMMARY"
@@ -148,14 +109,14 @@ jobs:
             echo "No engine_summary.md produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # -------- Optional: quick matrix backtest on synthetic set if nothing to test --------
+      # 3) Matrix backtest (robust: synth fallback if no 'result' column)
       - name: Run matrix backtest (robust)
         shell: bash
         run: |
           S="${{ steps.where.outputs.scripts_path }}"
           BANDS="${{ github.event.inputs.bands }}"
-          # Try to backtest the enriched (requires odds + p + result). If not available, synthesize.
-          # First, attempt real backtest (will likely no-op if 'result' missing).
+
+          # Try backtest on enriched file (likely lacks 'result' -> no-op).
           python "$S/run_matrix_backtest.py" \
             --input outputs/prob_enriched.csv \
             --outdir outputs \
@@ -167,16 +128,15 @@ jobs:
 
           LINES=$( [ -f outputs/matrix_rankings.csv ] && wc -l < outputs/matrix_rankings.csv || echo 0 )
           if [ "$LINES" -le 1 ]; then
-            printf '%s\n' \
-              'odds,p,result' \
-              '2.10,0.55,1' \
-              '2.40,0.45,0' \
-              '2.80,0.40,1' \
-              '3.20,0.35,0' \
-              '2.30,0.48,1' \
-              '3.50,0.32,0' \
-              > outputs/synthetic_backtest.csv
-
+            cat > outputs/synthetic_backtest.csv <<'CSV'
+odds,p,result
+2.10,0.55,1
+2.40,0.45,0
+2.80,0.40,1
+3.20,0.35,0
+2.30,0.48,1
+3.50,0.32,0
+CSV
             python "$S/run_matrix_backtest.py" \
               --input outputs/synthetic_backtest.csv \
               --outdir outputs \
@@ -188,7 +148,6 @@ jobs:
           fi
 
       - name: Backtest summary (best by ROI)
-        if: ${{ github.event.inputs.publish_md == 'yes' }}
         shell: bash
         run: |
           S="${{ steps.where.outputs.scripts_path }}"
