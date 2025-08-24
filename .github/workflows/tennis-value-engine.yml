@@ -71,7 +71,7 @@ jobs:
             --input "$INPUT_CSV" \
             --out outputs/prob_enriched.csv
 
-          # 2) run the value engine (may output 0 picks and that’s ok)
+          # 2) run the value engine
           python scripts/tennis_value_engine.py \
             --input outputs/prob_enriched.csv \
             --out-final outputs/picks_final.csv \
@@ -121,12 +121,15 @@ jobs:
 
       - name: Debug dump (what exists?)
         if: always()
+        shell: bash
         run: |
-          echo "::group::ls -l outputs"
-          ls -l outputs || true
+          set +e
+          echo "::group::ls -la outputs"
+          ls -la outputs || true
           echo "::endgroup::"
           echo "::group::head files"
-          for f in outputs/*.csv outputs/*.json outputs/*.md 2>/dev/null; do
+          shopt -s nullglob || true
+          for f in outputs/*.{csv,json,md}; do
             echo "---- $f ----"
             head -n 5 "$f" || true
           done
@@ -140,7 +143,7 @@ jobs:
             --matrix-metrics outputs/backtest_metrics.json \
             --matrix-rankings outputs/matrix_rankings.csv \
             --matrix-results outputs/results.csv \
-            --out outputs/pipeline_summary.md
+            --out outputs/pipeline_summary.md || true
 
       - name: Publish summaries to job log
         if: always()
