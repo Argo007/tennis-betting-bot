@@ -4,27 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       input_csv:
-        description: "Input odds CSV"
+        description: Input odds CSV
         required: false
-        default: "data/raw/odds/sample_odds.csv"
+        default: data/raw/odds/sample_odds.csv
       min_edge_te:
-        description: "TE (model tilt) target edge"
+        description: TE (model tilt) target edge
         required: false
         default: "0.08"
       kelly_scale:
-        description: "Kelly scale (0..1)"
+        description: Kelly scale (0..1)
         required: false
         default: "0.5"
       bankroll:
-        description: "Initial bankroll for backtest"
+        description: Initial bankroll for backtest
         required: false
         default: "1000"
       bands:
-        description: "Odds bands"
+        description: Odds bands
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
       run_prob_diag:
-        description: "Print probability diagnostics first"
+        description: Print probability diagnostics step
         required: false
         default: "false"
 
@@ -60,17 +60,18 @@ jobs:
         if: env.RUN_PROB_DIAG == 'true'
         run: |
           python scripts/compute_prob_vigfree.py --input "$INPUT_CSV" --out outputs/prob_enriched.csv
-          python scripts/check_probabilities.py --input outputs/prob_enriched.csv --min-edge 0.02 --te "${MIN_EDGE_TE}" \
-            | tee outputs/diag_prob.md
+          python scripts/check_probabilities.py --input outputs/prob_enriched.csv --min-edge 0.02 --te "${MIN_EDGE_TE}" | tee outputs/diag_prob.md
 
-      - name: Run daily pipeline (prob → engine → backtest)
+      - name: Run daily pipeline (prob → engine → backtest) with hard fallback
         run: |
           set -euo pipefail
 
+          # 1) enrich odds with vig-free probabilities
           python scripts/compute_prob_vigfree.py \
             --input "$INPUT_CSV" \
             --out outputs/prob_enriched.csv
 
+          # 2) run the value engine (may output 0 picks and that’s ok)
           python scripts/tennis_value_engine.py \
             --input outputs/prob_enriched.csv \
             --out-final outputs/picks_final.csv \
@@ -82,6 +83,8 @@ jobs:
             --edge "${MIN_EDGE_TE}" \
             --bankroll "${BANKROLL}"
 
+          # 3) try REAL matrix backtest on enriched file
+          set +e
           python scripts/run_matrix_backtest.py \
             --input outputs/prob_enriched.csv \
             --outdir outputs \
@@ -89,22 +92,45 @@ jobs:
             --stake-mode kelly \
             --edge "${MIN_EDGE_TE}" \
             --kelly-scale "${KELLY_SCALE}" \
+            --bankroll "${BANKROLL}"
+          RC_REAL=$?
+          set -e
+
+          # 4) ALWAYS produce SYNTHETIC backtest as a safety net
+          printf "odds,p,result\n" > outputs/synthetic_backtest.csv
+          printf "2.10,0.55,1\n2.40,0.45,0\n2.80,0.40,1\n2.00,0.35,0\n3.20,0.35,0\n2.30,0.48,1\n3.50,0.32,0\n" >> outputs/synthetic_backtest.csv
+
+          python scripts/run_matrix_backtest.py \
+            --input outputs/synthetic_backtest.csv \
+            --outdir outputs/synth \
+            --bands "${BANDS}" \
+            --stake-mode kelly \
+            --edge "${MIN_EDGE_TE}" \
+            --kelly-scale "${KELLY_SCALE}" \
             --bankroll "${BANKROLL}" || true
 
-          if [ ! -s outputs/matrix_rankings.csv ]; then
-            echo "No matrix rankings produced; falling back to synthetic backtest csv."
-            printf "odds,p,result\n" > outputs/synthetic_backtest.csv
-            printf "2.10,0.55,1\n2.40,0.45,0\n2.80,0.40,1\n2.00,0.35,0\n3.20,0.35,0\n2.30,0.48,1\n3.50,0.32,0\n" >> outputs/synthetic_backtest.csv
-
-            python scripts/run_matrix_backtest.py \
-              --input outputs/synthetic_backtest.csv \
-              --outdir outputs \
-              --bands "${BANDS}" \
-              --stake-mode kelly \
-              --edge "${MIN_EDGE_TE}" \
-              --kelly-scale "${KELLY_SCALE}" \
-              --bankroll "${BANKROLL}" || true
+          # 5) Prefer REAL outputs if present; otherwise copy SYNTH into outputs/
+          if [ -s outputs/backtest_metrics.json ] && [ -s outputs/matrix_rankings.csv ]; then
+            echo "Using REAL backtest outputs."
+          else
+            echo "REAL backtest missing; using SYNTHETIC outputs."
+            cp -f outputs/synth/backtest_metrics.json outputs/backtest_metrics.json 2>/dev/null || true
+            cp -f outputs/synth/matrix_rankings.csv outputs/matrix_rankings.csv 2>/dev/null || true
+            cp -f outputs/synth/results.csv outputs/results.csv 2>/dev/null || true
           fi
+
+      - name: Debug dump (what exists?)
+        if: always()
+        run: |
+          echo "::group::ls -l outputs"
+          ls -l outputs || true
+          echo "::endgroup::"
+          echo "::group::head files"
+          for f in outputs/*.csv outputs/*.json outputs/*.md 2>/dev/null; do
+            echo "---- $f ----"
+            head -n 5 "$f" || true
+          done
+          echo "::endgroup::"
 
       - name: Build combined pipeline summary (always)
         if: always()
@@ -136,4 +162,3 @@ jobs:
             outputs/*.csv
             outputs/*.json
           if-no-files-found: warn
-
