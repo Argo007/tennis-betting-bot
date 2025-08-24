@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       input_csv:
-        description: "Input odds CSV (two-sided or flat)"
+        description: "Input odds CSV"
         required: false
         default: "data/raw/odds/sample_odds.csv"
       min_edge_te:
-        description: "TE (model tilt) target edge for sizing/backtest"
+        description: "TE (model tilt) target edge"
         required: false
         default: "0.08"
       kelly_scale:
@@ -20,7 +20,7 @@ on:
         required: false
         default: "1000"
       bands:
-        description: "Odds bands (pipe-separated, e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
+        description: "Odds bands"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
       run_prob_diag:
@@ -59,7 +59,6 @@ jobs:
       - name: Run probability diagnostics (optional)
         if: env.RUN_PROB_DIAG == 'true'
         run: |
-          set -e
           python scripts/compute_prob_vigfree.py --input "$INPUT_CSV" --out outputs/prob_enriched.csv
           python scripts/check_probabilities.py --input outputs/prob_enriched.csv --min-edge 0.02 --te "${MIN_EDGE_TE}" \
             | tee outputs/diag_prob.md
@@ -68,12 +67,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Compute model probabilities (vig free)
           python scripts/compute_prob_vigfree.py \
             --input "$INPUT_CSV" \
             --out outputs/prob_enriched.csv
 
-          # 2) Decision engine (produces picks + engine_summary.md)
           python scripts/tennis_value_engine.py \
             --input outputs/prob_enriched.csv \
             --out-final outputs/picks_final.csv \
@@ -85,7 +82,6 @@ jobs:
             --edge "${MIN_EDGE_TE}" \
             --bankroll "${BANKROLL}"
 
-          # 3) Matrix backtest (first attempt)
           python scripts/run_matrix_backtest.py \
             --input outputs/prob_enriched.csv \
             --outdir outputs \
@@ -95,17 +91,10 @@ jobs:
             --kelly-scale "${KELLY_SCALE}" \
             --bankroll "${BANKROLL}" || true
 
-          # 4) Fallback: if no rankings, create a tiny synthetic CSV and re-run
           if [ ! -s outputs/matrix_rankings.csv ]; then
             echo "No matrix rankings produced; falling back to synthetic backtest csv."
             printf "odds,p,result\n" > outputs/synthetic_backtest.csv
-            printf "2.10,0.55,1\n" >> outputs/synthetic_backtest.csv
-            printf "2.40,0.45,0\n" >> outputs/synthetic_backtest.csv
-            printf "2.80,0.40,1\n" >> outputs/synthetic_backtest.csv
-            printf "2.00,0.35,0\n" >> outputs/synthetic_backtest.csv
-            printf "3.20,0.35,0\n" >> outputs/synthetic_backtest.csv
-            printf "2.30,0.48,1\n" >> outputs/synthetic_backtest.csv
-            printf "3.50,0.32,0\n" >> outputs/synthetic_backtest.csv
+            printf "2.10,0.55,1\n2.40,0.45,0\n2.80,0.40,1\n2.00,0.35,0\n3.20,0.35,0\n2.30,0.48,1\n3.50,0.32,0\n" >> outputs/synthetic_backtest.csv
 
             python scripts/run_matrix_backtest.py \
               --input outputs/synthetic_backtest.csv \
@@ -117,40 +106,15 @@ jobs:
               --bankroll "${BANKROLL}" || true
           fi
 
-      - name: Build pipeline summary (always create the file)
+      - name: Build combined pipeline summary (always)
         if: always()
         run: |
-          # Start new summary file
-          echo "# Pipeline Summary" > outputs/pipeline_summary.md
-          echo >> outputs/pipeline_summary.md
-
-          if [ -s outputs/engine_summary.md ]; then
-            cat outputs/engine_summary.md >> outputs/pipeline_summary.md
-          else
-            echo "_No engine summary produced._" >> outputs/pipeline_summary.md
-          fi
-
-          echo >> outputs/pipeline_summary.md
-          echo "## Matrix Backtest — Best by ROI" >> outputs/pipeline_summary.md
-
-          if [ -s outputs/backtest_metrics.json ]; then
-            python - <<'PY' >> outputs/pipeline_summary.md
-import json, pathlib
-p = pathlib.Path("outputs/backtest_metrics.json")
-j = json.loads(p.read_text()) if p.exists() and p.stat().st_size > 0 else {}
-b = (j or {}).get("best_by_roi") or {}
-def f(x):
-    return "-" if x is None else (f"{x:.4f}" if isinstance(x,(int,float)) else str(x))
-if b:
-    print(f"- **Config:** {f(b.get('config_id'))}")
-    print(f"- **Band:** {f(b.get('label'))}")
-    print(f"- **Bets:** {f(b.get('bets'))} | **ROI:** {f(b.get('roi'))} | **PnL:** {f(b.get('pnl'))} | **End BR:** {f(b.get('end_bankroll'))}")
-else:
-    print("_No metrics available — no bets met the criteria or outputs were empty._")
-PY
-          else
-            echo "_No backtest metrics file found._" >> outputs/pipeline_summary.md
-          fi
+          python scripts/merge_report.py \
+            --engine-md outputs/engine_summary.md \
+            --matrix-metrics outputs/backtest_metrics.json \
+            --matrix-rankings outputs/matrix_rankings.csv \
+            --matrix-results outputs/results.csv \
+            --out outputs/pipeline_summary.md
 
       - name: Publish summaries to job log
         if: always()
@@ -172,3 +136,4 @@ PY
             outputs/*.csv
             outputs/*.json
           if-no-files-found: warn
+
