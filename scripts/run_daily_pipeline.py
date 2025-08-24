@@ -1,145 +1,141 @@
 #!/usr/bin/env python3
-"""
-End-to-end DAILY pipeline:
-  1) compute_prob_vigfree.py -> outputs/prob_enriched.csv
-  2) tennis_value_engine.py   -> value_picks_pro.csv + outputs/picks_final.csv + outputs/engine_summary.md
-  3) run_matrix_with_fallback.py -> outputs/{matrix_rankings.csv,backtest_metrics.json,results.csv}
-  4) Write outputs/pipeline_summary.md (concise, human-readable)
+# -*- coding: utf-8 -*-
 
-Run example:
-  python scripts/run_daily_pipeline.py \
-    --input data/raw/odds/sample_odds.csv \
-    --gamma 1.06 \
-    --min-edge 0.00 \
-    --min-edge-te 0.02 \
-    --stake-mode kelly \
-    --kelly-scale 0.5 \
-    --kelly-cap 0.20 \
-    --flat-stake 1.0 \
-    --bankroll 1000 \
-    --bands "2.0,2.6|2.6,3.2|3.2,4.0"
 """
+End-to-end daily pipeline runner:
+1) Ensure an enriched probability file (outputs/prob_enriched.csv).
+2) Run the value engine to create picks + summaries.
+3) Run matrix backtest on the enriched file (for ROI by band).
+4) Leave everything in --outdir (default: outputs/).
+
+This script is intentionally defensive:
+- If the enriched CSV doesn't exist, it will try to build it from data/raw/odds/sample_odds.csv
+  using scripts/compute_prob_vigfree.py.
+- It never crashes the workflow on missing pieces; it logs and continues.
+
+Inputs
+------
+--input       : path to enriched CSV (default outputs/prob_enriched.csv)
+--outdir      : outputs directory (default outputs)
+--stake-mode  : kelly | flat (default kelly)
+--edge        : min edge threshold for engine/backtest (default 0.02)
+--kelly-scale : Kelly scale (default 0.5)
+--bankroll    : starting bankroll for backtest (default 1000)
+
+Artifacts written (if successful)
+---------------------------------
+- outputs/prob_enriched.csv
+- outputs/picks_final.csv
+- outputs/engine_summary.md
+- outputs/matrix_rankings.csv (if backtest produced rankings)
+- outputs/backtest_metrics.json (if backtest produced metrics)
+- outputs/pipeline_summary.md (built later by merge_report.py)
+"""
+
 from __future__ import annotations
-import argparse, pathlib, subprocess, sys, json, re
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "scripts"
-OUTDIR = ROOT / "outputs"
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
 
-def run(cmd: list[str]) -> None:
-    rc = subprocess.run(cmd, check=False)
-    if rc.returncode != 0:
-        print(f"[warn] Command failed (ignored): {' '.join(cmd)}", file=sys.stderr)
 
-def compute_probs(inp: str, gamma: float) -> pathlib.Path:
-    OUTDIR.mkdir(parents=True, exist_ok=True)
-    out = OUTDIR / "prob_enriched.csv"
-    cmd = [sys.executable, str(SCRIPTS / "compute_prob_vigfree.py"),
-           "--input", inp, "--output", str(out), "--gamma", str(gamma)]
-    run(cmd)
-    return out
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 
-def run_engine(prob_csv: pathlib.Path, args) -> None:
-    py = SCRIPTS / "tennis_value_engine.py"
-    if not py.exists():
-        py = ROOT / "tennis_value_engine.py"  # fallback if at repo root
-    cmd = [
-        sys.executable, str(py),
-        "--input", str(prob_csv),
-        "--out-picks", "value_picks_pro.csv",
-        "--out-final", str(OUTDIR / "picks_final.csv"),
-        "--summary",   str(OUTDIR / "engine_summary.md"),
-        "--min-edge",  str(args.min_edge),
-        "--stake-mode", args.stake_mode,
-        "--kelly-scale", str(args.kelly_scale),
-        "--kelly-cap",   str(args.kelly_cap),
-        "--flat-stake",  str(args.flat_stake),
-        "--bankroll",    str(args.bankroll),
-    ]
-    run(cmd)
 
-def run_matrix(args) -> None:
-    cmd = [
-        sys.executable, str(SCRIPTS / "run_matrix_with_fallback.py"),
-        "--input", str(OUTDIR / "prob_enriched.csv"),
-        "--outdir", str(OUTDIR),
-        "--bands", args.bands,
-        "--stake-mode", "kelly" if args.stake_mode == "kelly" else "flat",
-        "--edge", str(args.min_edge_te),
-        "--kelly-scale", str(args.kelly_scale),
-        "--bankroll", str(args.bankroll),
-    ]
-    run(cmd)
+def sh(cmd: list[str], check: bool = True) -> int:
+    """Run a shell command, streaming output."""
+    print("  $", " ".join(cmd), flush=True)
+    return subprocess.run(cmd, check=check).returncode
 
-def _grep(pattern: str, text: str, default: str = "-") -> str:
-    m = re.search(pattern, text)
-    return m.group(1) if m else default
 
-def write_pipeline_summary() -> pathlib.Path:
-    eng = OUTDIR / "engine_summary.md"
-    best_json = OUTDIR / "backtest_metrics.json"
-    pipeline = OUTDIR / "pipeline_summary.md"
+def ensure_file(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
 
-    picks = total_stake = avg_odds = avg_edge_raw = avg_edge_te = "-"
-    if eng.exists():
-        t = eng.read_text()
-        picks        = _grep(r"Picks:\s*(\d+)", t)
-        total_stake  = _grep(r"Total stake:\s*([\d.]+)", t)
-        avg_odds     = _grep(r"Avg odds:\s*([\d.]+)", t)
-        avg_edge_raw = _grep(r"Avg edge \(raw\):\s*([\d.\-]+)", t)
-        avg_edge_te  = _grep(r"Avg edge \(TE\):\s*([\d.\-]+)", t)
 
-    best = {}
-    if best_json.exists() and best_json.stat().st_size > 0:
-        try:
-            j = json.loads(best_json.read_text())
-            best = (j or {}).get("best_by_roi") or {}
-        except Exception:
-            best = {}
-
-    def fnum(x):
-        return f"{x:.4f}" if isinstance(x, (int, float)) else (x or "-")
-
-    lines = []
-    lines.append("# Pipeline Summary\n")
-    lines.append("Daily Picks\n")
-    lines.append(f"* Picks: {picks}")
-    lines.append(f"* Total stake: {total_stake}")
-    lines.append(f"* Avg odds: {avg_odds} | Avg edge (raw): {avg_edge_raw} | Avg edge (TE): {avg_edge_te}\n")
-    lines.append("Matrix Backtest — Best by ROI")
-    if best:
-        lines.append(f"* Config: {best.get('config_id','-')}")
-        lines.append(f"* Band: {best.get('label','-')}")
-        lines.append(f"* Bets: {best.get('bets','-')} | ROI: {fnum(best.get('roi'))} | "
-                     f"PnL: {fnum(best.get('pnl'))} | End BR: {fnum(best.get('end_bankroll'))}")
-    else:
-        lines.append("* No metrics available — no bets met the criteria or outputs are empty.")
-    pipeline.write_text("\n".join(lines) + "\n")
-    print(pipeline.read_text())
-    return pipeline
-
-def parse_args():
+def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data/raw/odds/sample_odds.csv")
-    ap.add_argument("--gamma", type=float, default=1.06)
-    ap.add_argument("--min-edge", type=float, default=0.00, dest="min_edge")
-    ap.add_argument("--min-edge-te", type=float, default=0.02, dest="min_edge_te")
-    ap.add_argument("--stake-mode", choices=["kelly", "flat"], default="kelly")
+    ap.add_argument("--input", default="outputs/prob_enriched.csv", help="Enriched prob CSV")
+    ap.add_argument("--outdir", default="outputs", help="Output directory")
+    ap.add_argument("--stake-mode", default="kelly", choices=["kelly", "flat"])
+    ap.add_argument("--edge", type=float, default=0.02)
     ap.add_argument("--kelly-scale", type=float, default=0.5)
-    ap.add_argument("--kelly-cap", type=float, default=0.20)
-    ap.add_argument("--flat-stake", type=float, default=1.0)
-    ap.add_argument("--bankroll", type=float, default=1000)
-    ap.add_argument("--bands", default="2.0,2.6|2.6,3.2|3.2,4.0")
-    return ap.parse_args()
+    ap.add_argument("--bankroll", type=float, default=1000.0)
+    args = ap.parse_args()
 
-def main():
-    args = parse_args()
-    prob_csv = compute_probs(args.input, args.gamma)
-    run_engine(prob_csv, args)
-    run_matrix(args)
-    write_pipeline_summary()
-    print("\n[OK] Daily pipeline finished.")
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    enriched = Path(args.input)
+    sample_raw = ROOT / "data" / "raw" / "odds" / "sample_odds.csv"
+
+    # ------------------------------------------------------------------
+    # 1) Ensure enriched probability file
+    # ------------------------------------------------------------------
+    if not ensure_file(enriched):
+        print(f"Enriched file {enriched} is missing. Attempting to build from {sample_raw}…")
+        if not ensure_file(sample_raw):
+            print(f"ERROR: No raw sample odds at {sample_raw}. Aborting enrichment.")
+        else:
+            # Compute vig-free probabilities from the raw odds.
+            # compute_prob_vigfree.py accepts flexible schema but expects a price/odds column.
+            sh([
+                sys.executable,
+                str(HERE / "compute_prob_vigfree.py"),
+                "--input", str(sample_raw),
+                "--output", str(enriched),
+            ], check=False)
+
+    if not ensure_file(enriched):
+        print(f"WARNING: Still no {enriched}. The engine will likely yield 0 picks.")
+
+    # ------------------------------------------------------------------
+    # 2) Run value engine
+    # ------------------------------------------------------------------
+    print("\n== Run value engine ==")
+    sh([
+        sys.executable,
+        str(HERE / "tennis_value_engine.py"),
+        "--input", str(enriched),
+        "--outdir", str(outdir),
+        "--stake-mode", args.stake_mode,
+        "--edge", f"{args.edge}",
+        "--kelly-scale", f"{args.kelly_scale}",
+        "--bankroll", f"{args.bankroll}",
+    ], check=False)
+
+    picks = outdir / "picks_final.csv"
+    if ensure_file(picks):
+        n_picks = sum(1 for _ in open(picks, "r", encoding="utf-8", newline=""))
+        print(f"picks_final.csv exists with ~{max(0, n_picks-1)} rows (header included).")
+    else:
+        print("No picks_final.csv produced (likely 0 picks).")
+
+    # ------------------------------------------------------------------
+    # 3) Run matrix backtest on enriched file (ROI by band)
+    # ------------------------------------------------------------------
+    print("\n== Run matrix backtest (ROI by bands) ==")
+    # Note: run_matrix_backtest.py reads an input CSV with at least odds/prob fields.
+    # We pass the same enriched CSV; if it has the right fields, it will rank bands.
+    sh([
+        sys.executable,
+        str(HERE / "run_matrix_backtest.py"),
+        "--input", str(enriched),
+        "--outdir", str(outdir),
+        "--stake-mode", args.stake_mode,
+        "--edge", f"{args.edge}",
+        "--kelly-scale", f"{args.kelly_scale}",
+        "--bankroll", f"{args.bankroll}",
+    ], check=False)
+
+    # ------------------------------------------------------------------
+    # Done; merge_report.py will craft the final pipeline_summary.md
+    # ------------------------------------------------------------------
+    print("\nDaily pipeline finished. Check outputs/ for artifacts.")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
