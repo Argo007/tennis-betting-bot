@@ -1,0 +1,54 @@
+name: Tennis Engine DEBUG
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    env:
+      OUTDIR: results
+      SYNTHETIC: synthetic_picks.csv
+      MIN_EDGE: "0.08"
+      KELLY_SCALE: "1.0"
+      BANKROLL: "1000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+
+      - name: "Fallback: force synthetic backtest when no picks"
+        shell: bash
+        run: |
+          mkdir -p "${OUTDIR}"
+          # Simulate missing picks_final.csv
+          echo "No picks found. Running synthetic backtest..."
+          # Write CSV without heredoc (avoids YAML/editor quirks)
+          printf '%s\n' \
+            'odds,p,result' \
+            '2.10,0.55,1' \
+            '2.40,0.45,0' \
+            '2.80,0.40,1' \
+            '2.00,0.35,0' \
+            '3.20,0.35,0' \
+            '2.30,0.48,1' \
+            '3.50,0.32,0' \
+            > "${SYNTHETIC}"
+
+          # Dummy command instead of your real backtest (keeps debug fast)
+          wc -l "${SYNTHETIC}" | tee "${OUTDIR}/debug_wc.txt"
+
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug_artifacts
+          path: ${{ env.OUTDIR }}
