@@ -1,134 +1,124 @@
 #!/usr/bin/env python3
-"""
-compute_prob_vigfree.py
+# scripts/compute_prob_vigfree.py
+import argparse, sys
+from pathlib import Path
+import pandas as pd
+import numpy as np
 
-Convert two-sided odds (date,player_a,player_b,odds_a,odds_b)
-into flat rows with a model probability p_model per side.
+# -------- helpers
+CANDIDATES = {
+    "price": ["price", "odds", "decimal_odds", "o"],
+    "player": ["player", "selection", "team", "runner", "home"],
+    "opponent": ["opponent", "oppo", "away"],
+    "tour": ["tour", "league", "comp"],
+    "market": ["market", "mk", "bet_type"],
+    "date": ["date", "match_date", "event_date", "dt"],
+}
 
-Steps:
-- implied probs: p_imp = 1/odds
-- remove bookmaker overround: p_fair_i = p_imp_i / (p_imp_A + p_imp_B)
-- optional favorite/longshot stretch in logit space: gamma (>1 boosts favs, <1 compresses to 0.5)
-- output flat rows with columns: date, player, opponent, price, p_model
+def first_col(df, names, required=False):
+    for n in names:
+        if n in df.columns:
+            return n
+        # tolerant: case-insensitive
+        for c in df.columns:
+            if c.lower() == n.lower():
+                return c
+    if required:
+        raise ValueError(f"Missing required column; looked for any of: {names}")
+    return None
 
-If input is already flat (has 'player' + 'opponent' + 'price'), rows are passed through;
-if a 'p_model' column exists, it’s preserved (we don’t overwrite).
+def implied_prob_from_decimals(dec):
+    dec = np.asarray(dec, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = 1.0 / dec
+    return np.clip(p, 0.0, 1.0)
 
-This is a pragmatic baseline so the engine has non-zero edges
-even before you plug in real Elo/model probabilities.
-"""
+def remove_vig_pair(p_a, p_b):
+    """
+    Very simple no-frills de-vig on two-sided markets:
+    Normalize so p_a + p_b = 1 (if both present).
+    """
+    s = p_a + p_b
+    ok = (s > 0)
+    p_a_out = np.where(ok, p_a / s, p_a)
+    p_b_out = np.where(ok, p_b / s, p_b)
+    return p_a_out, p_b_out
 
-from __future__ import annotations
-import argparse, csv, math, os, sys
-from typing import Dict, List
-
-def _flt(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def logit(p: float) -> float:
-    p = min(max(p, 1e-9), 1 - 1e-9)
-    return math.log(p / (1 - p))
-
-def sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
-
-def read_csv(path: str) -> List[Dict]:
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-def write_csv(path: str, rows: List[Dict]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    if not rows:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            f.write("note\nempty\n")
-        return
-    keys = sorted({k for r in rows for k in r.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        wr = csv.DictWriter(f, fieldnames=keys)
-        wr.writeheader()
-        wr.writerows(rows)
-
-def from_two_sided(row: Dict, gamma: float) -> List[Dict]:
-    lc = {k.lower(): k for k in row.keys()}
-    need = all(k in lc for k in ("player_a", "player_b", "odds_a", "odds_b"))
-    if not need:
-        return []
-
-    date = row.get(lc.get("date", "date"), row.get("date", ""))
-    pa, pb = row[lc["player_a"]], row[lc["player_b"]]
-    oa, ob = _flt(row[lc["odds_a"]], 0.0), _flt(row[lc["odds_b"]], 0.0)
-    if oa <= 1.0 or ob <= 1.0:
-        return []
-
-    # implied + vig removal
-    p_imp_a, p_imp_b = 1.0 / oa, 1.0 / ob
-    s = p_imp_a + p_imp_b
-    if s <= 0:
-        return []
-
-    p_fair_a = p_imp_a / s
-    p_fair_b = p_imp_b / s
-
-    # favorite/longshot stretch (logit space)
-    if gamma != 1.0:
-        p_fair_a = sigmoid(gamma * logit(p_fair_a))
-        p_fair_b = 1.0 - p_fair_a  # keep symmetry
-
-    ra = {
-        "date": date,
-        "player": pa,
-        "opponent": pb,
-        "price": oa,
-        "p_model": round(p_fair_a, 6),
-        "source_p": "vigfree_gamma",
-    }
-    rb = {
-        "date": date,
-        "player": pb,
-        "opponent": pa,
-        "price": ob,
-        "p_model": round(p_fair_b, 6),
-        "source_p": "vigfree_gamma",
-    }
-    return [ra, rb]
-
-def pass_through(row: Dict) -> Dict:
-    # If already flat with player/opponent/price, keep as-is.
-    # If p_model missing, leave it blank; the engine may fill via Elo.
-    return dict(row)
-
+# -------- main
 def main():
-    ap = argparse.ArgumentParser(description="Compute p_model from two-sided odds (vig-free + stretch).")
-    ap.add_argument("--input", "-i", required=True, help="CSV with two-sided odds OR flat rows.")
-    ap.add_argument("--out", "-o", required=True, help="Output flat CSV with p_model.")
-    ap.add_argument("--gamma", type=float, default=1.05, help="Favorite/longshot stretch (1=no change).")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
-    rows = read_csv(args.input)
-    if not rows:
-        write_csv(args.out, [])
-        print("[prob] no input rows; wrote empty output")
-        return
+    inp = Path(args.input)
+    outp = Path(args.output)
+    outp.parent.mkdir(parents=True, exist_ok=True)
 
-    out: List[Dict] = []
-    for r in rows:
-        lc = {k.lower(): k for k in r.keys()}
-        is_two_sided = all(k in lc for k in ("player_a", "player_b", "odds_a", "odds_b"))
-        is_flat = all(k in lc for k in ("player", "opponent")) and ("price" in lc or "odds" in lc or "decimal_odds" in lc)
+    if not inp.exists() or inp.stat().st_size == 0:
+        raise SystemExit(f"Input not found or empty: {inp}")
 
-        if is_two_sided:
-            out.extend(from_two_sided(r, gamma=args.gamma))
-        elif is_flat:
-            out.append(pass_through(r))
-        else:
-            # Unknown shape: skip
-            continue
+    df = pd.read_csv(inp)
+    # Soft standardization of column names
+    price_col   = first_col(df, CANDIDATES["price"], required=True)
+    player_col  = first_col(df, CANDIDATES["player"], required=True)
+    opp_col     = first_col(df, CANDIDATES["opponent"], required=True)
+    tour_col    = first_col(df, CANDIDATES["tour"]) or "tour"
+    market_col  = first_col(df, CANDIDATES["market"]) or "market"
+    date_col    = first_col(df, CANDIDATES["date"]) or "date"
 
-    write_csv(args.out, out)
-    print(f"[prob] wrote {len(out)} rows -> {args.out}")
+    # Rename into canonical names the engine expects
+    rename_map = {
+        price_col: "price",
+        player_col: "player",
+        opp_col: "opponent",
+    }
+    if tour_col in df.columns:   rename_map[tour_col] = "tour"
+    if market_col in df.columns: rename_map[market_col] = "market"
+    if date_col in df.columns:   rename_map[date_col] = "date"
+    df = df.rename(columns=rename_map)
+
+    # Defaults if missing
+    if "tour" not in df.columns: df["tour"] = "WTA/ATP"
+    if "market" not in df.columns: df["market"] = "H2H"
+    if "date" not in df.columns:
+        # try to infer from index or fallback to today-like placeholder
+        df["date"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+
+    # Build pair rows (player/opponent) if any duplicate fixtures exist:
+    # We’ll compute both sides’ implied probs where possible.
+    # For safety, just compute p_model as 1/price for now (single-sided),
+    # then try to de-vig if the reverse price exists.
+    df["p_model"] = implied_prob_from_decimals(df["price"])
+
+    # Optional: attempt pairwise de-vig by (player, opponent, date)
+    key = ["player", "opponent", "date"]
+    rev = df.merge(df[key + ["price","p_model"]], left_on=key,
+                   right_on=[ "opponent","player","date" ],
+                   suffixes=("","_rev"), how="left")
+
+    # where reverse exists, normalize
+    mask = rev["p_model_rev"].notna()
+    a = rev["p_model"].to_numpy()
+    b = rev["p_model_rev"].fillna(0.0).to_numpy()
+    a2, b2 = remove_vig_pair(a, b)
+    rev.loc[mask, "p_model"] = a2[mask]
+
+    # Keep canonical columns
+    keep = ["player","opponent","price","tour","market","date","p_model"]
+    rev[keep].to_csv(outp, index=False)
+
+    # tiny log
+    with open(outp.parent / "diag_prob.md", "w", encoding="utf-8") as f:
+        ok = ((rev["p_model"] >= 0) & (rev["p_model"] <= 1)).mean()
+        f.write(f"rows: {len(rev)}\n")
+        f.write(f"p_model valid [0..1]: {ok:.2%}\n")
+        f.write(f"mean p_model: {rev['p_model'].mean():.3f}\n")
+        f.write(f"sample:\n{rev[keep].head(8).to_markdown(index=False)}\n")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise
