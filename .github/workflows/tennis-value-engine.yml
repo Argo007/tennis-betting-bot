@@ -4,47 +4,43 @@ on:
   workflow_dispatch:
     inputs:
       input_csv:
-        description: "Input odds CSV (two-sided or flat)"
+        description: "Input odds CSV"
         required: false
         default: "data/raw/odds/sample_odds.csv"
+      gamma:
+        description: "Probability stretch gamma (vig-free)"
+        required: false
+        default: "1.06"
       min_edge:
-        description: "Min raw edge to keep (0.00–0.05 typical)"
+        description: "Min edge (raw)"
         required: false
         default: "0.00"
+      min_edge_te:
+        description: "Min edge for TE (used by matrix backtest)"
+        required: false
+        default: "0.02"
       stake_mode:
         description: "Stake mode"
+        type: choice
+        options: [kelly, flat]
         required: false
         default: "kelly"
       kelly_scale:
-        description: "Kelly scaling (e.g. 0.5 = half-Kelly)"
+        description: "Kelly scaling (0–1)"
         required: false
         default: "0.5"
+      kelly_cap:
+        description: "Per-bet Kelly cap (0–1)"
+        required: false
+        default: "0.20"
       bankroll:
-        description: "Starting bankroll units"
+        description: "Bankroll for sizing/backtest"
         required: false
         default: "1000"
-      odds_window:
-        description: "Postprocess odds window [low,high]"
-        required: false
-        default: "[1.35,2.40]"
-      per_bet_cap_pct:
-        description: "Per bet cap % of bankroll"
-        required: false
-        default: "5"
-      day_risk_cap_pct:
-        description: "Day risk cap % of bankroll"
-        required: false
-        default: "25"
       bands:
-        description: "Backtest odds bands (e.g. 2.0,2.6|2.6,3.2|3.2,4.0)"
+        description: "Odds bands for matrix backtest (pipe-separated)"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
-
-env:
-  PYTHONUNBUFFERED: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # TE (true-edge) boost used in engine/backtest
-  MIN_EDGE_TE: "0.08"
 
 jobs:
   value-engine:
@@ -61,129 +57,46 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pandas numpy
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      - name: Ensure outputs dir
-        run: mkdir -p outputs
-
-      # ---------- 1) Build enriched probabilities (vig-free + TE-ready) ----------
-      - name: Build enriched probabilities
-        run: |
-          python scripts/compute_prob_vigfree.py \
-            --input "${{ github.event.inputs.input_csv }}" \
-            --out outputs/prob_enriched.csv
-        shell: bash
-
-      # ---------- 2) QUICK DIAGNOSTICS (NEW) ----------
+      # Optional quick look at prob health (doesn't fail the job)
       - name: Run probability diagnostics
         run: |
           python scripts/check_probabilities.py \
             --input outputs/prob_enriched.csv \
-            --min-edge "${{ github.event.inputs.min_edge }}"
-        shell: bash
+            --min-edge "${{ github.event.inputs.min_edge_te || '0.02' }}" || true
+        continue-on-error: true
 
-      # ---------- 3) Value engine (Kelly + TE) ----------
-      - name: Run value engine
+      - name: Run daily pipeline (prob -> engine -> matrix backtest)
         run: |
-          python scripts/tennis_value_engine.py \
-            --input outputs/prob_enriched.csv \
-            --out-picks value_picks_pro.csv \
-            --out-final outputs/picks_final.csv \
-            --summary outputs/engine_summary.md \
-            --min-edge "${{ github.event.inputs.min_edge }}" \
-            --stake-mode "${{ github.event.inputs.stake_mode }}" \
-            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-            --bankroll "${{ github.event.inputs.bankroll }}"
-        shell: bash
+          python scripts/run_daily_pipeline.py \
+            --input "${{ github.event.inputs.input_csv || 'data/raw/odds/sample_odds.csv' }}" \
+            --gamma "${{ github.event.inputs.gamma || '1.06' }}" \
+            --min-edge "${{ github.event.inputs.min_edge || '0.00' }}" \
+            --min-edge-te "${{ github.event.inputs.min_edge_te || '0.02' }}" \
+            --stake-mode "${{ github.event.inputs.stake_mode || 'kelly' }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale || '0.5' }}" \
+            --kelly-cap "${{ github.event.inputs.kelly_cap || '0.20' }}" \
+            --bankroll "${{ github.event.inputs.bankroll || '1000' }}" \
+            --bands "${{ github.event.inputs.bands || '2.0,2.6|2.6,3.2|3.2,4.0' }}"
 
-      # ---------- 4) Matrix backtest on today's enriched set ----------
-      - name: Run matrix backtest (with safe fallback)
-        env:
-          BANDS: ${{ github.event.inputs.bands }}
-        run: |
-          set -e
-          python scripts/run_matrix_backtest.py \
-            --input outputs/prob_enriched.csv \
-            --outdir outputs \
-            --bands "$BANDS" \
-            --stake-mode kelly \
-            --edge "${MIN_EDGE_TE}" \
-            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-            --bankroll "${{ github.event.inputs.bankroll }}" || true
-
-          # If rankings didn't materialize, synthesize a tiny CSV and re-run
-          if [ ! -s outputs/matrix_rankings.csv ]; then
-            cat > outputs/synthetic_backtest.csv <<EOF
-odds,p,result
-2.10,0.55,1
-2.40,0.45,0
-2.80,0.40,1
-3.20,0.35,0
-2.30,0.48,1
-3.50,0.32,0
-EOF
-            python scripts/run_matrix_backtest.py \
-              --input outputs/synthetic_backtest.csv \
-              --outdir outputs \
-              --bands "$BANDS" \
-              --stake-mode kelly \
-              --edge "${MIN_EDGE_TE}" \
-              --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-              --bankroll "${{ github.event.inputs.bankroll }}" || true
-          fi
-        shell: bash
-
-      # ---------- 5) Publish job summary ----------
       - name: Publish summaries
         run: |
-          echo "## Tennis Value — Daily Picks" >> $GITHUB_STEP_SUMMARY
-          if [ -f outputs/engine_summary.md ]; then
-            cat outputs/engine_summary.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "_No engine summary produced._" >> $GITHUB_STEP_SUMMARY
-          fi
+          for f in outputs/engine_summary.md outputs/pipeline_summary.md; do
+            if [ -s "$f" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Matrix Backtest — Best by ROI" >> $GITHUB_STEP_SUMMARY
-
-          python - <<'PY' >> $GITHUB_STEP_SUMMARY
-import json, pathlib, math
-p = pathlib.Path("outputs/backtest_metrics.json")
-if not p.exists() or p.stat().st_size==0:
-    print("_No metrics available — no bets met the criteria or outputs are empty._")
-else:
-    try:
-        j = json.loads(p.read_text())
-    except Exception as e:
-        print(f"_Could not parse metrics: {e}_")
-    else:
-        b = (j or {}).get("best_by_roi") or {}
-        cfg = b.get("config_id","-")
-        lab = b.get("label","-")
-        roi = b.get("roi","-")
-        bets = b.get("bets","-")
-        pnl = b.get("pnl","-")
-        end_br = b.get("end_bankroll","-")
-        print(f"- **Config:** `{cfg}`")
-        print(f"- **Band:** {lab}")
-        print(f"- **Bets:** {bets} | **ROI:** {roi:.4f} | **PnL:** {pnl:.4f} | **End BR:** {end_br:.4f}")
-PY
-        shell: bash
-
-      # ---------- 6) Upload artifacts ----------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: value-engine-output
           path: |
+            outputs/**
             value_picks_pro.csv
-            outputs/picks_final.csv
-            outputs/engine_summary.md
-            outputs/prob_enriched.csv
-            outputs/matrix_rankings.csv
-            outputs/results.csv
-            outputs/backtest_metrics.json
-            outputs/synthetic_backtest.csv
           if-no-files-found: warn
