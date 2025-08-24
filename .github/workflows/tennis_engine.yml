@@ -1,0 +1,150 @@
+name: Tennis Engine (Backtest + Live)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - backtest
+          - live
+  schedule:
+    - cron: "0 */6 * * *"     # backtest cadence (every 6 hours)
+    - cron: "*/30 * * * *"    # live cadence (every 30 minutes)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tennis-engine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backtest:
+    # Run unless user explicitly chose "live" on manual dispatch
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
+    runs-on: ubuntu-latest
+
+    env:
+      OUTDIR: results
+      SYNTHETIC: synthetic_picks.csv
+      MIN_EDGE: "0.08"
+      KELLY_SCALE: "1.0"
+      BANKROLL: "1000"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure output directory
+        run: mkdir -p "${OUTDIR}"
+
+      - name: Fetch historical tennis data
+        run: |
+          python scripts/fetch_tennis_data.py --outdir "${OUTDIR}"
+
+      - name: Generate value picks (historical)
+        run: |
+          python scripts/tennis_value_picks_pro.py \
+            --input "${OUTDIR}/tennis_data.csv" \
+            --outdir "${OUTDIR}" \
+            --min-edge "${MIN_EDGE}"
+
+      - name: Matrix Kelly backtest
+        run: |
+          # If picks_final.csv exists and is non-empty, backtest it; otherwise we fall back below
+          if [ -s "${OUTDIR}/picks_final.csv" ]; then
+            python scripts/run_matrix_backtest.py \
+              --input "${OUTDIR}/picks_final.csv" \
+              --outdir "${OUTDIR}" \
+              --stake-mode kelly \
+              --edge "${MIN_EDGE}" \
+              --kelly-scale "${KELLY_SCALE}" \
+              --bankroll "${BANKROLL}" || true
+          fi
+
+      - name: Fallback: force synthetic backtest when no picks
+        run: |
+          if [ ! -s "${OUTDIR}/picks_final.csv" ]; then
+            echo "⚠️ No picks found. Running synthetic backtest…"
+            # ensure a tiny synthetic CSV exists (idempotent)
+            if [ ! -s "${SYNTHETIC}" ]; then
+              cat > "${SYNTHETIC}" << 'CSV'
+odds,p,result
+2.10,0.55,1
+2.40,0.45,0
+2.80,0.40,1
+2.00,0.35,0
+3.20,0.35,0
+2.30,0.48,1
+3.50,0.32,0
+CSV
+            fi
+            python scripts/run_matrix_backtest.py \
+              --input "${SYNTHETIC}" \
+              --outdir "${OUTDIR}" \
+              --stake-mode kelly \
+              --edge "${MIN_EDGE}" \
+              --kelly-scale "${KELLY_SCALE}" \
+              --bankroll "${BANKROLL}" || true
+          fi
+
+      - name: Upload backtest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tennis_backtest_${{ github.run_id }}
+          path: ${{ env.OUTDIR }}
+
+  live:
+    # Run unless user explicitly chose "backtest" on manual dispatch
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
+    runs-on: ubuntu-latest
+
+    env:
+      LIVE_OUTDIR: live_results
+      MIN_EDGE: "0.08"
+      KELLY_SCALE: "0.5"   # more conservative for live
+      BANKROLL: "1000"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgr
