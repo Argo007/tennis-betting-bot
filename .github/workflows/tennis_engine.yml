@@ -1,4 +1,4 @@
-name: Tennis Engine (Backtest + Live)
+name: Tennis Engine (Backtest + Live + CLV + Dashboard)
 
 on:
   workflow_dispatch:
@@ -14,23 +14,27 @@ on:
     - cron: "*/30 * * * *"    # live every 30 minutes
 
 permissions:
-  contents: read
+  contents: write   # we auto-commit state/docs
+  actions: read
 
 concurrency:
   group: tennis-engine-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTHON_VERSION: "3.10"
+  MIN_EDGE: "0.08"
+  KELLY_SCALE: "0.5"
+  BANKROLL: "1000"
+  BANDS: "2.0,2.6|2.6,3.2|3.2,4.0"
+  OUTDIR: results
+  LIVE_OUTDIR: live_results
+  STATE_DIR: state
+  DOCS_DIR: docs
+
 jobs:
-  backtest:
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
+  engine:
     runs-on: ubuntu-latest
-    env:
-      OUTDIR: results
-      SYNTHETIC: synthetic_picks.csv
-      MIN_EDGE: "0.08"
-      KELLY_SCALE: "1.0"
-      BANKROLL: "1000"
-      BANDS: "2.0,2.6|2.6,3.2|3.2,4.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +42,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -53,11 +57,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
 
-      - name: Ensure output dir
-        run: mkdir -p "${OUTDIR}"
+      - name: Ensure directories
+        run: |
+          mkdir -p "${OUTDIR}" "${LIVE_OUTDIR}" "${STATE_DIR}" "${DOCS_DIR}"
 
+      # ---------- BACKTEST LANE ----------
       - name: Fetch historical tennis data (robust)
-        shell: bash
+        if: ${{ github.event.inputs.mode != 'live' }}
         run: |
           if [ -f scripts/fetch_tennis_data.py ]; then
             python scripts/fetch_tennis_data.py --outdir "${OUTDIR}" || true
@@ -66,8 +72,8 @@ jobs:
             printf '%s\n' 'match_id,player_a,player_b,odds,p,result,price,p_model' > "${OUTDIR}/tennis_data.csv"
           fi
 
-      - name: Generate value picks (historical, robust)
-        shell: bash
+      - name: Generate value picks (historical)
+        if: ${{ github.event.inputs.mode != 'live' }}
         run: |
           if [ -f scripts/tennis_value_picks_pro.py ]; then
             python scripts/tennis_value_picks_pro.py \
@@ -75,12 +81,11 @@ jobs:
               --outdir "${OUTDIR}" \
               --min-edge "${MIN_EDGE}" || true
           else
-            echo "scripts/tennis_value_picks_pro.py missing → creating empty picks_final.csv"
             printf '%s\n' 'odds,p,result,price,p_model' > "${OUTDIR}/picks_final.csv"
           fi
 
-      - name: Matrix Kelly backtest (only if script and picks exist)
-        shell: bash
+      - name: Matrix Kelly backtest
+        if: ${{ github.event.inputs.mode != 'live' }}
         run: |
           if [ -f scripts/run_matrix_backtest.py ] && [ -s "${OUTDIR}/picks_final.csv" ]; then
             python scripts/run_matrix_backtest.py \
@@ -95,102 +100,29 @@ jobs:
             echo "Skip matrix backtest (missing script or empty picks)."
           fi
 
-      - name: "Fallback: force synthetic backtest when no picks"
-        shell: bash
-        run: |
-          if [ ! -s "${OUTDIR}/picks_final.csv" ]; then
-            echo "No picks found. Running synthetic backtest..."
-            printf '%s\n' \
-              'odds,p,result,price,p_model' \
-              '2.10,0.55,1,2.10,0.55' \
-              '2.40,0.45,0,2.40,0.45' \
-              '2.80,0.40,1,2.80,0.40' \
-              '2.00,0.35,0,2.00,0.35' \
-              '3.20,0.35,0,3.20,0.35' \
-              '2.30,0.48,1,2.30,0.48' \
-              '3.50,0.32,0,3.50,0.32' \
-              > "${SYNTHETIC}"
-            if [ -f scripts/run_matrix_backtest.py ]; then
-              python scripts/run_matrix_backtest.py \
-                --input "${SYNTHETIC}" \
-                --outdir "${OUTDIR}" \
-                --stake-mode kelly \
-                --edge "${MIN_EDGE}" \
-                --kelly-scale "${KELLY_SCALE}" \
-                --bankroll "${BANKROLL}" \
-                --bands "${BANDS}" || true
-            fi
-          fi
-
-      - name: Upload backtest artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: tennis_backtest_${{ github.run_id }}
-          path: ${{ env.OUTDIR }}
-
-      - name: Print backtest summary
-        if: always()
-        run: |
-          test -f "${OUTDIR}/backtest_summary.json" && cat "${OUTDIR}/backtest_summary.json" || echo "No summary file."
-
-  live:
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-    runs-on: ubuntu-latest
-    env:
-      LIVE_OUTDIR: live_results
-      MIN_EDGE: "0.08"
-      KELLY_SCALE: "0.5"
-      BANKROLL: "1000"
-      BANDS: "2.0,2.6|2.6,3.2|3.2,4.0"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-
-      - name: Ensure output dir
-        run: mkdir -p "${LIVE_OUTDIR}"
-
-      - name: Fetch live matches (robust)
-        shell: bash
+      # ---------- LIVE LANE ----------
+      - name: Fetch live matches
+        if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
           if [ -f scripts/fetch_live_matches.py ]; then
             python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv" || true
           else
-            echo "scripts/fetch_live_matches.py missing → creating empty matches CSV"
             printf '%s\n' 'match_id,player_a,player_b,tournament,start_time' > "${LIVE_OUTDIR}/live_matches.csv"
           fi
 
-      - name: Fetch live odds (robust)
-        shell: bash
+      - name: Fetch live odds
+        if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
           if [ -f scripts/fetch_live_odds.py ]; then
             python scripts/fetch_live_odds.py \
               --matches "${LIVE_OUTDIR}/live_matches.csv" \
               --out "${LIVE_OUTDIR}/live_odds.csv" || true
           else
-            echo "scripts/fetch_live_odds.py missing → creating empty odds CSV"
             printf '%s\n' 'match_id,book,market,sel,odds,ts' > "${LIVE_OUTDIR}/live_odds.csv"
           fi
 
-      - name: Generate live value picks (robust)
-        shell: bash
+      - name: Generate live value picks
+        if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
           if [ -f scripts/tennis_value_picks_live.py ]; then
             python scripts/tennis_value_picks_live.py \
@@ -198,28 +130,97 @@ jobs:
               --outdir "${LIVE_OUTDIR}" \
               --min-edge "${MIN_EDGE}" || true
           else
-            echo "scripts/tennis_value_picks_live.py missing → creating empty picks_live.csv"
             printf '%s\n' 'match_id,sel,odds,p,edge,price,p_model' > "${LIVE_OUTDIR}/picks_live.csv"
           fi
 
-      - name: Live Kelly sizing (only if script exists)
-        shell: bash
+      - name: Log live picks (size stakes via Kelly)
+        if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/run_matrix_backtest.py ] && [ -s "${LIVE_OUTDIR}/picks_live.csv" ]; then
-            python scripts/run_matrix_backtest.py \
-              --input "${LIVE_OUTDIR}/picks_live.csv" \
-              --outdir "${LIVE_OUTDIR}" \
-              --stake-mode kelly \
-              --edge "${MIN_EDGE}" \
-              --kelly-scale "${KELLY_SCALE}" \
-              --bankroll "${BANKROLL}" \
-              --bands "${BANDS}" || true
+          if [ -f scripts/log_live_picks.py ] && [ -s "${LIVE_OUTDIR}/picks_live.csv" ]; then
+            python scripts/log_live_picks.py \
+              --picks "${LIVE_OUTDIR}/picks_live.csv" \
+              --state-dir "${STATE_DIR}" \
+              --kelly "${KELLY_SCALE}" || true
           else
-            echo "Skip live backtest (missing script or empty picks)."
+            echo "No live picks to log."
           fi
 
-      - name: Upload live artifacts
+      # ---------- CLV + SETTLEMENT + STATE ----------
+      - name: Produce close odds for CLV
+        if: ${{ github.event.inputs.mode != 'backtest' }}
+        run: |
+          if [ -f scripts/fetch_close_odds.py ]; then
+            python scripts/fetch_close_odds.py \
+              --matches "${LIVE_OUTDIR}/live_matches.csv" \
+              --odds "${LIVE_OUTDIR}/live_odds.csv" \
+              --out "${LIVE_OUTDIR}/close_odds.csv" || true
+          else
+            echo "fetch_close_odds.py missing → skip CLV snapshot."
+          fi
+
+      - name: Settle trades (compute PnL + CLV; update bankroll)
+        if: ${{ github.event.inputs.mode != 'backtest' }}
+        run: |
+          if [ -f scripts/settle_trades.py ] && [ -f "${STATE_DIR}/trade_log.csv" ]; then
+            python scripts/settle_trades.py \
+              --log "${STATE_DIR}/trade_log.csv" \
+              --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
+              --state-dir "${STATE_DIR}" \
+              --assume-random-if-missing || true
+          else
+            echo "No trade_log or settle_trades.py → skipping settlement."
+          fi
+
+      - name: Update persistent bankroll state (from backtest equity if present)
+        if: ${{ github.event.inputs.mode != 'live' }}
+        run: |
+          if [ -f scripts/update_bankroll_state.py ]; then
+            python scripts/update_bankroll_state.py \
+              --equity "${OUTDIR}/equity_curve.csv" \
+              --state-dir "${STATE_DIR}" \
+              --initial "${BANKROLL}" || true
+          fi
+
+      # ---------- DASHBOARD + OPTIONAL NOTIFY ----------
+      - name: Build dashboard
+        run: |
+          if [ -f scripts/make_dashboard.py ]; then
+            python scripts/make_dashboard.py \
+              --state-dir "${STATE_DIR}" \
+              --results "${OUTDIR}" \
+              --live "${LIVE_OUTDIR}" \
+              --out "${DOCS_DIR}" || true
+          fi
+
+      - name: Notify picks (if env present)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -f scripts/notify_picks.py ]; then
+            python scripts/notify_picks.py \
+              --live-outdir "${LIVE_OUTDIR}" \
+              --backtest-outdir "${OUTDIR}" \
+              --min-rows 1 || true
+          fi
+
+      # ---------- COMMIT STATE & DOCS ----------
+      - name: Auto-commit state/results/docs
+        run: |
+          if [ -f scripts/autocommit_state.py ]; then
+            python scripts/autocommit_state.py \
+              --paths "${STATE_DIR}" "${OUTDIR}" "${LIVE_OUTDIR}" "${DOCS_DIR}" \
+              --message "auto: update state+results+docs" || true
+          fi
+
+      # ---------- ARTIFACTS ----------
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tennis_live_${{ github.run_id }}
-          path: ${{ env.LIVE_OUTDIR }}
+          name: engine_${{ github.run_id }}
+          path: |
+            ${{ env.OUTDIR }}
+            ${{ env.LIVE_OUTDIR }}
+            ${{ env.STATE_DIR }}
+            ${{ env.DOCS_DIR }}
