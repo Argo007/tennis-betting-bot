@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Settle trades from state/trade_log.csv using close_odds.csv.
-Computes CLV, PnL, and updates bankroll state/history.
+Settle trades from state/trade_log.csv using live_results/close_odds.csv.
+Computes CLV (log close/entry), PnL, and updates bankroll state/history.
 
 Usage:
   python scripts/settle_trades.py \
@@ -11,7 +11,7 @@ Usage:
     --state-dir state \
     --assume-random-if-missing
 """
-import os, argparse, time, json, random
+import os, argparse, time, json, math, random
 import pandas as pd
 
 ap = argparse.ArgumentParser()
@@ -22,101 +22,117 @@ ap.add_argument("--assume-random-if-missing", action="store_true")
 args = ap.parse_args()
 
 os.makedirs(args.state_dir, exist_ok=True)
-bank_p  = os.path.join(args.state_dir, "bankroll.json")
-hist_p  = os.path.join(args.state_dir, "bankroll_history.csv")
+LOG_P   = args.log
+CLOSE_P = args.close_odds
+BANK_P  = os.path.join(args.state_dir, "bankroll.json")
+HIST_P  = os.path.join(args.state_dir, "bankroll_history.csv")
 
-def load_bankroll():
-    if os.path.isfile(bank_p):
-        try:
-            return float(json.load(open(bank_p))["bankroll"])
-        except Exception:
-            pass
-    return 1000.0
+def load_bankroll(default=1000.0) -> float:
+    try:
+        if os.path.isfile(BANK_P):
+            obj = json.load(open(BANK_P))
+            return float(obj.get("bankroll", default))
+    except Exception:
+        pass
+    return float(default)
 
-def save_bankroll(v):
-    with open(bank_p, "w") as f:
+def save_bankroll(v: float):
+    with open(BANK_P, "w", encoding="utf-8") as f:
         json.dump({"bankroll": float(v)}, f)
 
-def append_hist(ts, bankroll):
+def append_history(ts: int, bankroll: float):
     row = pd.DataFrame([{"ts": int(ts), "bankroll": float(bankroll)}])
-    if os.path.isfile(hist_p):
+    if os.path.isfile(HIST_P):
         try:
-            old = pd.read_csv(hist_p)
-            pd.concat([old, row], ignore_index=True).to_csv(hist_p, index=False)
+            old = pd.read_csv(HIST_P)
+            pd.concat([old, row], ignore_index=True).to_csv(HIST_P, index=False)
             return
         except Exception:
             pass
-    row.to_csv(hist_p, index=False)
+    row.to_csv(HIST_P, index=False)
 
-if not os.path.isfile(args.log):
+if not os.path.isfile(LOG_P):
     print("No trade_log.csv -> nothing to settle.")
     raise SystemExit(0)
 
-log = pd.read_csv(args.log)
+log = pd.read_csv(LOG_P)
 if log.empty:
     print("trade_log.csv empty -> nothing to settle.")
     raise SystemExit(0)
 
-# Load close odds
+# Latest close price per (match_id, sel/selection)
 close_map = {}
-if os.path.isfile(args.close_odds):
+if os.path.isfile(CLOSE_P):
     try:
-        clos = pd.read_csv(args.close_odds)
+        clos = pd.read_csv(CLOSE_P)
+        # normalize column names
+        if "odds" in clos.columns and "close_odds" not in clos.columns:
+            clos = clos.rename(columns={"odds": "close_odds"})
         for _, r in clos.iterrows():
-            close_map[(str(r.get("match_id","")), str(r.get("sel","")))] = float(r.get("close_odds", r.get("odds", 0)))
-    except Exception:
-        pass
+            mid = str(r.get("match_id", ""))
+            sel = str(r.get("sel", r.get("selection", "")))
+            co  = float(r.get("close_odds", float("nan")))
+            if mid and sel and pd.notna(co):
+                close_map[(mid, sel)] = co
+    except Exception as e:
+        print("WARN: could not read close odds:", e)
 
 bankroll = load_bankroll()
-settled_any = False
 now = int(time.time())
+settled_count = 0
+pnl_sum = 0.0
 
-# Work only on OPEN trades
-def compute_pnl(win, odds, stake):
-    return float(stake) * (float(odds) - 1.0) if win else -float(stake)
+def compute_pnl(win: bool, odds: float, stake: float) -> float:
+    odds = float(odds)
+    stake = float(stake)
+    return stake * (odds - 1.0) if win else -stake
 
-for idx, r in log.iterrows():
-    status = str(r.get("status","")).lower()
-    if status == "settled":
-        continue
+# Work over OPEN trades only
+status_s = log.get("status", pd.Series([""] * len(log))).astype(str).str.lower()
+open_idx = status_s == "open"
 
-    mid = str(r.get("match_id",""))
-    sel = str(r.get("selection", r.get("sel","")))
-    odds = float(r.get("odds", 0))
-    p    = float(r.get("p", 0))
-    stake = float(r.get("stake_eur", 0))
+for idx in log.index[open_idx]:
+    r = log.loc[idx]
+    mid = str(r.get("match_id", ""))
+    sel = str(r.get("selection", r.get("sel", "")))
+    odds = float(r.get("odds", 0.0))
+    p    = float(r.get("p", 0.0))
+    stake = float(r.get("stake_eur", 0.0))
 
-    # CLV
-    close_odds = close_map.get((mid, sel), float("nan"))
-    if not pd.notna(close_odds):
-        close_odds = odds  # fallback: flat close
+    # Close odds for CLV
+    close_odds = close_map.get((mid, sel), odds)  # fallback to entry if missing
+    clv = math.log(max(close_odds, 1e-9) / max(odds, 1e-9))
 
-    clv = float(pd.np.log(close_odds / max(odds, 1e-9)))  # log(close/entry)
-
-    # Outcome
+    # Determine outcome
     res = r.get("result", None)
-    if pd.isna(res) or res == "" or str(res).lower() == "nan":
+    win: bool
+    if pd.isna(res) or str(res).strip() == "" or str(res).lower() == "nan":
         if args.assume_random_if_missing:
             win = random.random() < p
         else:
-            # leave open if we can't assume result
+            # leave as open
             continue
     else:
-        win = bool(int(res))
+        try:
+            win = bool(int(res))
+        except Exception:
+            win = bool(res)
 
     pnl = compute_pnl(win, odds, stake)
     bankroll += pnl
+    pnl_sum += pnl
+    settled_count += 1
+
+    # write back
     log.loc[idx, "status"] = "settled"
     log.loc[idx, "close_odds"] = float(close_odds)
     log.loc[idx, "clv"] = float(clv)
     log.loc[idx, "pnl"] = float(pnl)
     log.loc[idx, "settled_ts"] = now
-    settled_any = True
 
 # Persist
-log.to_csv(args.log, index=False)
+log.to_csv(LOG_P, index=False)
 save_bankroll(bankroll)
-append_hist(now, bankroll)
+append_history(now, bankroll)
 
-print(f"Settled={settled_any} | New bankroll €{bankroll:.2f}")
-
+print(f"Settled {settled_count} trades | PnL {pnl_sum:+.2f} | Bankroll €{bankroll:.2f}")
