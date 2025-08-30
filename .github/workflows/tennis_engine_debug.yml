@@ -1,40 +1,35 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Remove synthetic rows (match_id starting with 'SYN') from state/trade_log.csv.
-Idempotent. Prints how many rows were purged.
-"""
-import os
-import argparse
-import pandas as pd
+name: Tennis Engine DEBUG
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--state-dir", default="state")
-ap.add_argument("--log", default=None, help="optional override path to trade_log.csv")
-args = ap.parse_args()
+on:
+  workflow_dispatch:
 
-state_dir = args.state_dir
-log_path = args.log or os.path.join(state_dir, "trade_log.csv")
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    env:
+      STATE_DIR: state
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-if not os.path.isfile(log_path):
-    print("No trade_log.csv; nothing to purge.")
-    raise SystemExit(0)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-try:
-    df = pd.read_csv(log_path)
-except Exception as e:
-    print(f"Could not read {log_path}: {e}")
-    raise SystemExit(0)
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
 
-if df.empty or "match_id" not in df.columns:
-    print("trade_log.csv present but empty or missing match_id.")
-    raise SystemExit(0)
+      - name: Show BEFORE
+        run: |
+          python scripts/debug_show_trade_log.py --state-dir "${STATE_DIR}" --label "BEFORE"
 
-keep = ~df["match_id"].astype(str).str.startswith("SYN")
-n_purged = int((~keep).sum())
+      - name: Purge SYN*
+        run: |
+          python scripts/purge_synthetic.py --state-dir "${STATE_DIR}"
 
-if n_purged > 0:
-    df.loc[keep].to_csv(log_path, index=False)
-    print(f"Purged {n_purged} synthetic rows -> {log_path}")
-else:
-    print("No synthetic rows to purge.")
+      - name: Show AFTER
+        run: |
+          python scripts/debug_show_trade_log.py --state-dir "${STATE_DIR}" --label "AFTER"
