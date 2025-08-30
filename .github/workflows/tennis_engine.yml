@@ -3,42 +3,46 @@ name: Tennis Engine LIVE (Cron + Manual)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: choose what to run
+        type: choice
+        default: live
+        options: [live, all]
       min_edge:
-        description: "Edge threshold (e.g., 0.05)"
-        required: false
+        description: edge threshold
         default: "0.05"
       kelly_scale:
-        description: "Kelly scale (0–1)"
-        required: false
+        description: kelly scale
         default: "0.5"
+      starting_bankroll:
+        description: starting bankroll
+        default: "1000"
       max_frac:
-        description: "Max % bankroll per bet (e.g., 0.05)"
-        required: false
+        description: max % bankroll per bet
         default: "0.05"
       abs_cap:
-        description: "Absolute € cap per bet"
-        required: false
+        description: absolute € cap
         default: "200"
       simulate:
-        description: "Simulate result if missing (true|false)"
-        required: false
+        description: simulate result if missing
         default: "true"
   schedule:
-    - cron: "5,25,45 * * * *"   # every 20 minutes
+    # run every hour at minute 5
+    - cron: "5 * * * *"
 
 jobs:
   engine:
     runs-on: ubuntu-latest
     env:
-      STATE_DIR: state
+      OUTDIR: results
       LIVE_OUTDIR: live_results
-      RESULTS_DIR: results
-      DOCS_DIR: docs
-      KELLY_SCALE: ${{ inputs.kelly_scale || '0.5' }}
-      MIN_EDGE: ${{ inputs.min_edge || '0.05' }}
-      MAX_FRAC:  ${{ inputs.max_frac  || '0.05' }}
-      ABS_CAP:   ${{ inputs.abs_cap   || '200' }}
-      SIM_ASSUME: ${{ inputs.simulate || 'true' }}
+      STATE_DIR: state
+      MIN_EDGE: ${{ inputs.min_edge != '' && inputs.min_edge || '0.05' }}
+      KELLY_SCALE: ${{ inputs.kelly_scale != '' && inputs.kelly_scale || '0.5' }}
+      START_BANKROLL: ${{ inputs.starting_bankroll != '' && inputs.starting_bankroll || '1000' }}
+      MAX_FRAC: ${{ inputs.max_frac != '' && inputs.max_frac || '0.05' }}
+      ABS_CAP: ${{ inputs.abs_cap != '' && inputs.abs_cap || '200' }}
+      SIM_ASSUME: ${{ inputs.simulate != '' && inputs.simulate || 'true' }}
 
     steps:
       - name: Checkout
@@ -53,81 +57,61 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install pandas || true
-          chmod +x scripts/*.py || true
-          mkdir -p "${STATE_DIR}" "${LIVE_OUTDIR}" "${RESULTS_DIR}" "${DOCS_DIR}"
+          pip install pandas requests
 
+      # ---------- LIVE ONLY ----------
       - name: Fetch live odds
+        shell: bash
         run: |
+          mkdir -p "${LIVE_OUTDIR}"
           python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv"
-          python scripts/fetch_live_odds.py \
-            --matches "${LIVE_OUTDIR}/live_matches.csv" \
-            --out "${LIVE_OUTDIR}/live_odds.csv"
+          python scripts/fetch_live_odds.py --matches "${LIVE_OUTDIR}/live_matches.csv" --out "${LIVE_OUTDIR}/live_odds.csv"
 
       - name: Generate live value picks
+        shell: bash
         run: |
-          python scripts/tennis_value_picks_live.py \
-            --odds "${LIVE_OUTDIR}/live_odds.csv" \
-            --outdir "${LIVE_OUTDIR}" \
-            --min-edge "${MIN_EDGE}"
+          python scripts/tennis_value_picks_live.py --odds "${LIVE_OUTDIR}/live_odds.csv" --outdir "${LIVE_OUTDIR}" --min-edge "${MIN_EDGE}"
 
-      # 3) Log live picks — pass explicit true|false for --assume-random-if-missing
+      # (SAFELY) compute MAX_STAKE_EUR once, then log picks
       - name: Log live picks (append to state/trade_log.csv)
         shell: bash
         run: |
           if [ -f "${LIVE_OUTDIR}/picks_live.csv" ]; then
-            MAX_STAKE_EUR=$(python scripts/compute_max_stake.py --state-dir "${STATE_DIR}" --max-frac "${MAX_FRAC}" --fallback 1000)
+            MAX_STAKE_EUR=$(python scripts/compute_max_stake.py --state-dir "${STATE_DIR}" --max-frac "${MAX_FRAC}" --fallback "${ABS_CAP}")
             echo "MAX_STAKE_EUR=${MAX_STAKE_EUR}  SIM_ASSUME=${SIM_ASSUME}"
             python scripts/log_live_picks.py --picks "${LIVE_OUTDIR}/picks_live.csv" --state-dir "${STATE_DIR}" --kelly "${KELLY_SCALE}" --stake-cap "${ABS_CAP}" --max-stake-eur "${MAX_STAKE_EUR}" --assume-random-if-missing "${SIM_ASSUME}"
           else
             echo "No live picks generated."
           fi
 
-
       - name: Snapshot close odds (for CLV)
+        shell: bash
         run: |
-          if [ -f "${LIVE_OUTDIR}/live_odds.csv" ]; then
-            python scripts/fetch_close_odds.py \
-              --odds "${LIVE_OUTDIR}/live_odds.csv" \
-              --out "${LIVE_OUTDIR}/close_odds.csv" \
-              --max-drift 0.08
-          else
-            echo "No live_odds.csv present; skipping close odds snapshot."
-          fi
+          python scripts/fetch_close_odds.py --odds "${LIVE_OUTDIR}/live_odds.csv" --out "${LIVE_OUTDIR}/close_odds.csv" --max-drift 0.08
 
-      # 5) Settlement — also pass explicit true|false for --assume-random-if-missing
+      # ---------- SETTLEMENT ----------
       - name: Settle trades (PnL + CLV; update bankroll)
         shell: bash
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
-            python scripts/settle_trades.py \
-              --log "${STATE_DIR}/trade_log.csv" \
-              --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
-              --state-dir "${STATE_DIR}" \
-              --assume-random-if-missing "${SIM_ASSUME}"
+            python scripts/settle_trades.py --log "${STATE_DIR}/trade_log.csv" --close-odds "${LIVE_OUTDIR}/close_odds.csv" --state-dir "${STATE_DIR}" --assume-random-if-missing "${SIM_ASSUME}"
           else
-            echo "No trade_log.csv yet; nothing to settle."
+            echo "No trade_log.csv; nothing to settle."
           fi
 
+      # ---------- DASHBOARD & SUMMARY ----------
       - name: Build dashboard
+        shell: bash
         run: |
-          python scripts/make_dashboard.py \
-            --state-dir "${STATE_DIR}" \
-            --results "${RESULTS_DIR}" \
-            --live "${LIVE_OUTDIR}" \
-            --out "${DOCS_DIR}"
+          python scripts/make_dashboard.py --state-dir "${STATE_DIR}" --results "${OUTDIR}" --live "${LIVE_OUTDIR}" --out docs
 
       - name: Print clean summary table
+        shell: bash
         run: |
-          python scripts/quick_summary.py \
-            --state-dir "${STATE_DIR}" \
-            --live-dir "${LIVE_OUTDIR}" \
-            --results-dir "${RESULTS_DIR}"
+          python scripts/quick_summary.py --state-dir "${STATE_DIR}" --results "${OUTDIR}" --live "${LIVE_OUTDIR}"
 
+      # ---------- AUTO-COMMIT ----------
       - name: Auto-commit state + docs
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${STATE_DIR}" "${DOCS_DIR}" || true
-          git commit -m "chore(engine): update state+docs [skip ci]" || echo "Nothing to commit."
-          git push || echo "Nothing to push."
+          python scripts/autocommit_state.py --state-dir "${STATE_DIR}" --docs docs
