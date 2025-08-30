@@ -56,14 +56,12 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.10"
-
-  # Folders
+  # Default folders
   OUTDIR: results
   LIVE_OUTDIR: live_results
   STATE_DIR: state
   DOCS_DIR: docs
-
-  # Defaults (overridden by dispatch inputs if provided)
+  # Default knobs (used when schedule triggers; dispatch can override)
   MIN_EDGE: "0.08"
   KELLY_SCALE: "0.5"
   BANKROLL: "1000"
@@ -76,17 +74,6 @@ env:
 jobs:
   engine:
     runs-on: ubuntu-latest
-    env:
-      # Resolve inputs → env (workflow_dispatch inputs are strings)
-      MODE: ${{ github.event.inputs.mode || 'all' }}
-      MIN_EDGE: ${{ github.event.inputs.min_edge || env.MIN_EDGE }}
-      KELLY_SCALE: ${{ github.event.inputs.kelly_scale || env.KELLY_SCALE }}
-      BANKROLL: ${{ github.event.inputs.bankroll || env.BANKROLL }}
-      BANDS: ${{ github.event.inputs.bands || env.BANDS }}
-      STAKE_CAP: ${{ github.event.inputs.stake_cap || env.STAKE_CAP }}
-      MAX_STAKE_EUR: ${{ github.event.inputs.max_stake_eur || env.MAX_STAKE_EUR }}
-      ASSUME_RANDOM: ${{ github.event.inputs.assume_random_if_missing || env.ASSUME_RANDOM }}
-      MIN_ROWS_FOR_ALERT: ${{ github.event.inputs.min_rows_for_alert || env.MIN_ROWS_FOR_ALERT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -114,14 +101,27 @@ jobs:
         run: |
           mkdir -p "${OUTDIR}" "${LIVE_OUTDIR}" "${STATE_DIR}" "${DOCS_DIR}"
 
+      # Resolve workflow-dispatch inputs into env for later steps (cannot do this in job.env)
+      - name: Resolve inputs -> env
+        run: |
+          echo "MODE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || 'all' }}" >> "$GITHUB_ENV"
+          echo "MIN_EDGE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.min_edge || env.MIN_EDGE }}" >> "$GITHUB_ENV"
+          echo "KELLY_SCALE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kelly_scale || env.KELLY_SCALE }}" >> "$GITHUB_ENV"
+          echo "BANKROLL=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bankroll || env.BANKROLL }}" >> "$GITHUB_ENV"
+          echo "BANDS=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bands || env.BANDS }}" >> "$GITHUB_ENV"
+          echo "STAKE_CAP=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.stake_cap || env.STAKE_CAP }}" >> "$GITHUB_ENV"
+          echo "MAX_STAKE_EUR=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_stake_eur || env.MAX_STAKE_EUR }}" >> "$GITHUB_ENV"
+          echo "ASSUME_RANDOM=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assume_random_if_missing || env.ASSUME_RANDOM }}" >> "$GITHUB_ENV"
+          echo "MIN_ROWS_FOR_ALERT=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.min_rows_for_alert || env.MIN_ROWS_FOR_ALERT }}" >> "$GITHUB_ENV"
+
       # ---------- BACKTEST ----------
       - name: Fetch historical tennis data
-        if: ${{ env.MODE != 'live' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
         run: |
           python scripts/fetch_tennis_data.py --outdir "${OUTDIR}" || true
 
       - name: Generate value picks (historical)
-        if: ${{ env.MODE != 'live' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
         run: |
           python scripts/tennis_value_picks_pro.py \
             --input "${OUTDIR}/tennis_data.csv" \
@@ -129,7 +129,7 @@ jobs:
             --min-edge "${MIN_EDGE}" || true
 
       - name: Matrix Kelly backtest
-        if: ${{ env.MODE != 'live' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
         run: |
           if [ -s "${OUTDIR}/picks_final.csv" ]; then
             python scripts/run_matrix_backtest.py \
@@ -146,19 +146,19 @@ jobs:
 
       # ---------- LIVE ----------
       - name: Fetch live matches
-        if: ${{ env.MODE != 'backtest' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv" || true
 
       - name: Fetch live odds
-        if: ${{ env.MODE != 'backtest' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           python scripts/fetch_live_odds.py \
             --matches "${LIVE_OUTDIR}/live_matches.csv" \
             --out "${LIVE_OUTDIR}/live_odds.csv" || true
 
       - name: Generate live value picks
-        if: ${{ env.MODE != 'backtest' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           python scripts/tennis_value_picks_live.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
@@ -166,7 +166,7 @@ jobs:
             --min-edge "${MIN_EDGE}" || true
 
       - name: Log live picks (Kelly-sized)
-        if: ${{ env.MODE != 'backtest' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           if [ -s "${LIVE_OUTDIR}/picks_live.csv" ]; then
             python scripts/log_live_picks.py \
@@ -181,7 +181,7 @@ jobs:
 
       # ---------- CLV + SETTLEMENT + STATE ----------
       - name: Produce close odds for CLV
-        if: ${{ env.MODE != 'backtest' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           python scripts/fetch_close_odds.py \
             --matches "${LIVE_OUTDIR}/live_matches.csv" \
@@ -189,7 +189,7 @@ jobs:
             --out "${LIVE_OUTDIR}/close_odds.csv" || true
 
       - name: Settle trades (compute PnL + CLV; update bankroll)
-        if: ${{ env.MODE != 'backtest' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
             python scripts/settle_trades.py \
@@ -202,7 +202,7 @@ jobs:
           fi
 
       - name: Update persistent bankroll state (from backtest equity if present)
-        if: ${{ env.MODE != 'live' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
         run: |
           python scripts/update_bankroll_state.py \
             --equity "${OUTDIR}/equity_curve.csv" \
