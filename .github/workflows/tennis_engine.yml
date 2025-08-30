@@ -10,11 +10,11 @@ on:
         type: choice
         options: [all, backtest, live]
   schedule:
-    - cron: "0 */6 * * *"     # backtest every 6 hours
-    - cron: "*/30 * * * *"    # live every 30 minutes
+    - cron: "0 */6 * * *"      # backtest lane every 6h
+    - cron: "*/30 * * * *"     # live lane every 30m
 
 permissions:
-  contents: write   # we auto-commit state/docs
+  contents: write   # needed for auto-commit
   actions: read
 
 concurrency:
@@ -23,10 +23,14 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.10"
-  MIN_EDGE: "0.08"
+
+  # --- Tuning knobs ---
+  MIN_EDGE: "0.08"          # temporary: lower to 0.02 if you want more picks
   KELLY_SCALE: "0.5"
   BANKROLL: "1000"
   BANDS: "2.0,2.6|2.6,3.2|3.2,4.0"
+
+  # --- Folders ---
   OUTDIR: results
   LIVE_OUTDIR: live_results
   STATE_DIR: state
@@ -56,38 +60,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
+          # Safety: ensure pandas exists for summary/table
+          pip install pandas || true
 
       - name: Ensure directories
         run: |
           mkdir -p "${OUTDIR}" "${LIVE_OUTDIR}" "${STATE_DIR}" "${DOCS_DIR}"
 
-      # ---------- BACKTEST LANE ----------
-      - name: Fetch historical tennis data (robust)
+      # ---------- BACKTEST ----------
+      - name: Fetch historical tennis data
         if: ${{ github.event.inputs.mode != 'live' }}
         run: |
-          if [ -f scripts/fetch_tennis_data.py ]; then
-            python scripts/fetch_tennis_data.py --outdir "${OUTDIR}" || true
-          else
-            echo "scripts/fetch_tennis_data.py missing → creating stub tennis_data.csv"
-            printf '%s\n' 'match_id,player_a,player_b,odds,p,result,price,p_model' > "${OUTDIR}/tennis_data.csv"
-          fi
+          python scripts/fetch_tennis_data.py --outdir "${OUTDIR}" || true
 
       - name: Generate value picks (historical)
         if: ${{ github.event.inputs.mode != 'live' }}
         run: |
-          if [ -f scripts/tennis_value_picks_pro.py ]; then
-            python scripts/tennis_value_picks_pro.py \
-              --input "${OUTDIR}/tennis_data.csv" \
-              --outdir "${OUTDIR}" \
-              --min-edge "${MIN_EDGE}" || true
-          else
-            printf '%s\n' 'odds,p,result,price,p_model' > "${OUTDIR}/picks_final.csv"
-          fi
+          python scripts/tennis_value_picks_pro.py \
+            --input "${OUTDIR}/tennis_data.csv" \
+            --outdir "${OUTDIR}" \
+            --min-edge "${MIN_EDGE}" || true
 
       - name: Matrix Kelly backtest
         if: ${{ github.event.inputs.mode != 'live' }}
         run: |
-          if [ -f scripts/run_matrix_backtest.py ] && [ -s "${OUTDIR}/picks_final.csv" ]; then
+          if [ -s "${OUTDIR}/picks_final.csv" ]; then
             python scripts/run_matrix_backtest.py \
               --input "${OUTDIR}/picks_final.csv" \
               --outdir "${OUTDIR}" \
@@ -97,46 +94,34 @@ jobs:
               --bankroll "${BANKROLL}" \
               --bands "${BANDS}" || true
           else
-            echo "Skip matrix backtest (missing script or empty picks)."
+            echo "No historical picks; skipping backtest."
           fi
 
-      # ---------- LIVE LANE ----------
+      # ---------- LIVE ----------
       - name: Fetch live matches
         if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/fetch_live_matches.py ]; then
-            python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv" || true
-          else
-            printf '%s\n' 'match_id,player_a,player_b,tournament,start_time' > "${LIVE_OUTDIR}/live_matches.csv"
-          fi
+          python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv" || true
 
       - name: Fetch live odds
         if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/fetch_live_odds.py ]; then
-            python scripts/fetch_live_odds.py \
-              --matches "${LIVE_OUTDIR}/live_matches.csv" \
-              --out "${LIVE_OUTDIR}/live_odds.csv" || true
-          else
-            printf '%s\n' 'match_id,book,market,sel,odds,ts' > "${LIVE_OUTDIR}/live_odds.csv"
-          fi
+          python scripts/fetch_live_odds.py \
+            --matches "${LIVE_OUTDIR}/live_matches.csv" \
+            --out "${LIVE_OUTDIR}/live_odds.csv" || true
 
       - name: Generate live value picks
         if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/tennis_value_picks_live.py ]; then
-            python scripts/tennis_value_picks_live.py \
-              --odds "${LIVE_OUTDIR}/live_odds.csv" \
-              --outdir "${LIVE_OUTDIR}" \
-              --min-edge "${MIN_EDGE}" || true
-          else
-            printf '%s\n' 'match_id,sel,odds,p,edge,price,p_model' > "${LIVE_OUTDIR}/picks_live.csv"
-          fi
+          python scripts/tennis_value_picks_live.py \
+            --odds "${LIVE_OUTDIR}/live_odds.csv" \
+            --outdir "${LIVE_OUTDIR}" \
+            --min-edge "${MIN_EDGE}" || true
 
-      - name: Log live picks (size stakes via Kelly)
+      - name: Log live picks (Kelly-sized)
         if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/log_live_picks.py ] && [ -s "${LIVE_OUTDIR}/picks_live.csv" ]; then
+          if [ -s "${LIVE_OUTDIR}/picks_live.csv" ]; then
             python scripts/log_live_picks.py \
               --picks "${LIVE_OUTDIR}/picks_live.csv" \
               --state-dir "${STATE_DIR}" \
@@ -149,78 +134,64 @@ jobs:
       - name: Produce close odds for CLV
         if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/fetch_close_odds.py ]; then
-            python scripts/fetch_close_odds.py \
-              --matches "${LIVE_OUTDIR}/live_matches.csv" \
-              --odds "${LIVE_OUTDIR}/live_odds.csv" \
-              --out "${LIVE_OUTDIR}/close_odds.csv" || true
-          else
-            echo "fetch_close_odds.py missing → skip CLV snapshot."
-          fi
+          python scripts/fetch_close_odds.py \
+            --matches "${LIVE_OUTDIR}/live_matches.csv" \
+            --odds "${LIVE_OUTDIR}/live_odds.csv" \
+            --out "${LIVE_OUTDIR}/close_odds.csv" || true
 
       - name: Settle trades (compute PnL + CLV; update bankroll)
         if: ${{ github.event.inputs.mode != 'backtest' }}
         run: |
-          if [ -f scripts/settle_trades.py ] && [ -f "${STATE_DIR}/trade_log.csv" ]; then
+          if [ -f "${STATE_DIR}/trade_log.csv" ]; then
             python scripts/settle_trades.py \
               --log "${STATE_DIR}/trade_log.csv" \
               --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
               --state-dir "${STATE_DIR}" \
               --assume-random-if-missing || true
           else
-            echo "No trade_log or settle_trades.py → skipping settlement."
+            echo "No trade_log yet; skipping settlement."
           fi
 
       - name: Update persistent bankroll state (from backtest equity if present)
         if: ${{ github.event.inputs.mode != 'live' }}
         run: |
-          if [ -f scripts/update_bankroll_state.py ]; then
-            python scripts/update_bankroll_state.py \
-              --equity "${OUTDIR}/equity_curve.csv" \
-              --state-dir "${STATE_DIR}" \
-              --initial "${BANKROLL}" || true
-          fi
+          python scripts/update_bankroll_state.py \
+            --equity "${OUTDIR}/equity_curve.csv" \
+            --state-dir "${STATE_DIR}" \
+            --initial "${BANKROLL}" || true
 
-      # ---------- DASHBOARD + OPTIONAL NOTIFY ----------
+      # ---------- DASHBOARD & NOTIFY ----------
       - name: Build dashboard
         run: |
-          if [ -f scripts/make_dashboard.py ]; then
-            python scripts/make_dashboard.py \
-              --state-dir "${STATE_DIR}" \
-              --results "${OUTDIR}" \
-              --live "${LIVE_OUTDIR}" \
-              --out "${DOCS_DIR}" || true
-          fi
+          python scripts/make_dashboard.py \
+            --state-dir "${STATE_DIR}" \
+            --results "${OUTDIR}" \
+            --live "${LIVE_OUTDIR}" \
+            --out "${DOCS_DIR}" || true
 
-      - name: Notify picks (if env present)
+      - name: Notify picks (if secrets exist)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          if [ -f scripts/notify_picks.py ]; then
-            python scripts/notify_picks.py \
-              --live-outdir "${LIVE_OUTDIR}" \
-              --backtest-outdir "${OUTDIR}" \
-              --min-rows 1 || true
-          fi
+          python scripts/notify_picks.py \
+            --live-outdir "${LIVE_OUTDIR}" \
+            --backtest-outdir "${OUTDIR}" \
+            --min-rows 1 || true
 
-      # ---------- COMMIT STATE & DOCS ----------
+      # ---------- COMMIT CHANGES ----------
       - name: Auto-commit state/results/docs
         run: |
-          if [ -f scripts/autocommit_state.py ]; then
-            python scripts/autocommit_state.py \
-              --paths "${STATE_DIR}" "${OUTDIR}" "${LIVE_OUTDIR}" "${DOCS_DIR}" \
-              --message "auto: update state+results+docs" || true
-          fi
+          python scripts/autocommit_state.py \
+            --paths "${STATE_DIR}" "${OUTDIR}" "${LIVE_OUTDIR}" "${DOCS_DIR}" \
+            --message "engine: update state+results+docs" || true
 
-      # ---------- ARTIFACTS ----------
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: engine_${{ github.run_id }}
-          path: |
-            ${{ env.OUTDIR }}
-            ${{ env.LIVE_OUTDIR }}
-            ${{ env.STATE_DIR }}
-            ${{ env.DOCS_DIR }}
+      # ---------- CLEAN JOB SUMMARY (TABLES) ----------
+      - name: Print clean summary table
+        env:
+          OUTDIR: ${{ env.OUTDIR }}
+          LIVE_OUTDIR: ${{ env.LIVE_OUTDIR }}
+          STATE_DIR: ${{ env.STATE_DIR }}
+        run: |
+          python scripts/quick_summary.py
