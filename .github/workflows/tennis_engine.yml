@@ -12,7 +12,7 @@ on:
       min_edge:
         description: "edge threshold"
         required: false
-        default: "0.08"
+        default: "0.05"           # tightened from 0.02/0.08
       kelly_scale:
         description: "kelly scale"
         required: false
@@ -60,7 +60,7 @@ env:
   LIVE_OUTDIR: live_results
   STATE_DIR: state
   DOCS_DIR: docs
-  MIN_EDGE: "0.08"
+  MIN_EDGE: "0.05"       # tightened default
   KELLY_SCALE: "0.5"
   BANKROLL: "1000"
   BANDS: "2.0,2.6|2.6,3.2|3.2,4.0"
@@ -176,14 +176,36 @@ jobs:
             echo "No live picks to log."
           fi
 
-      # ---------- CLV + SETTLEMENT + STATE ----------
-      - name: Fetch close odds snapshot
+      # ---------- CLV + CLEANUP + SETTLEMENT ----------
+      - name: Fetch close odds snapshot (±8% drift)
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           python scripts/fetch_close_odds.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
             --out  "${LIVE_OUTDIR}/close_odds.csv" \
-            --max-drift 0.04
+            --max-drift 0.08
+
+      - name: Purge synthetic trades (SYN*) before settlement
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
+        run: |
+          if [ -f "${STATE_DIR}/trade_log.csv" ]; then
+            python - <<'PY'
+import pandas as pd, os
+p = os.environ["STATE_DIR"] + "/trade_log.csv"
+df = pd.read_csv(p)
+if not df.empty and "match_id" in df.columns:
+    keep = ~df["match_id"].astype(str).str.startswith("SYN")
+    if keep.any() and (~keep).any():
+        df[keep].to_csv(p, index=False)
+        print(f"Purged {(~keep).sum()} synthetic rows -> {p}")
+    else:
+        print("No synthetic rows to purge.")
+else:
+    print("trade_log.csv present but empty or missing match_id.")
+PY
+          else
+            echo "No trade_log.csv; nothing to purge."
+          fi
 
       - name: Settle trades (compute PnL + CLV; update bankroll)
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
