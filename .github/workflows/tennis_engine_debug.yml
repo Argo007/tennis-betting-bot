@@ -1,54 +1,40 @@
-name: Tennis Engine DEBUG
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Remove synthetic rows (match_id starting with 'SYN') from state/trade_log.csv.
+Idempotent. Prints how many rows were purged.
+"""
+import os
+import argparse
+import pandas as pd
 
-on:
-  workflow_dispatch:
+ap = argparse.ArgumentParser()
+ap.add_argument("--state-dir", default="state")
+ap.add_argument("--log", default=None, help="optional override path to trade_log.csv")
+args = ap.parse_args()
 
-jobs:
-  debug:
-    runs-on: ubuntu-latest
-    env:
-      OUTDIR: results
-      SYNTHETIC: synthetic_picks.csv
-      MIN_EDGE: "0.08"
-      KELLY_SCALE: "1.0"
-      BANKROLL: "1000"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+state_dir = args.state_dir
+log_path = args.log or os.path.join(state_dir, "trade_log.csv")
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+if not os.path.isfile(log_path):
+    print("No trade_log.csv; nothing to purge.")
+    raise SystemExit(0)
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+try:
+    df = pd.read_csv(log_path)
+except Exception as e:
+    print(f"Could not read {log_path}: {e}")
+    raise SystemExit(0)
 
-      - name: "Fallback: force synthetic backtest when no picks"
-        shell: bash
-        run: |
-          mkdir -p "${OUTDIR}"
-          # Simulate missing picks_final.csv
-          echo "No picks found. Running synthetic backtest..."
-          # Write CSV without heredoc (avoids YAML/editor quirks)
-          printf '%s\n' \
-            'odds,p,result' \
-            '2.10,0.55,1' \
-            '2.40,0.45,0' \
-            '2.80,0.40,1' \
-            '2.00,0.35,0' \
-            '3.20,0.35,0' \
-            '2.30,0.48,1' \
-            '3.50,0.32,0' \
-            > "${SYNTHETIC}"
+if df.empty or "match_id" not in df.columns:
+    print("trade_log.csv present but empty or missing match_id.")
+    raise SystemExit(0)
 
-          # Dummy command instead of your real backtest (keeps debug fast)
-          wc -l "${SYNTHETIC}" | tee "${OUTDIR}/debug_wc.txt"
+keep = ~df["match_id"].astype(str).str.startswith("SYN")
+n_purged = int((~keep).sum())
 
-      - name: Upload debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug_artifacts
-          path: ${{ env.OUTDIR }}
+if n_purged > 0:
+    df.loc[keep].to_csv(log_path, index=False)
+    print(f"Purged {n_purged} synthetic rows -> {log_path}")
+else:
+    print("No synthetic rows to purge.")
