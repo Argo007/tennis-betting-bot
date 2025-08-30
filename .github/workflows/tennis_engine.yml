@@ -38,7 +38,6 @@ env:
   CLOSE_ODDS_FILE: "close_odds.csv"
   DASHBOARD_HTML: "docs/index.html"
 
-  # Inputs (always strings from workflow_dispatch)
   INPUT_MODE: ${{ github.event.inputs.mode }}
   INPUT_MIN_EDGE: ${{ github.event.inputs.min_edge }}
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
@@ -61,11 +60,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # Always ensure tabulate is present for the summary table
+          pip install --upgrade tabulate
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pandas numpy tabulate
+            pip install pandas numpy
           fi
+          # Belt-and-suspenders: if requirements.txt downgraded it, bump again
+          pip install --upgrade tabulate
 
       - name: Prepare folders
         run: |
@@ -206,4 +209,3 @@ jobs:
             git commit -m "tennis_engine: update state and dashboard [skip ci]"
             git push
           fi
-
