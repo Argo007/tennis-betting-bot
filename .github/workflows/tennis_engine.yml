@@ -103,34 +103,51 @@ jobs:
       - name: Compute MAX_STAKE_EUR
         id: bankroll
         run: |
-          TMP=/tmp/compute_bankroll.py
-          : > "$TMP"
-          echo "import os, json, pathlib" >> "$TMP"
-          echo "state=os.environ['STATE_DIR']; mf=float(os.environ['INPUT_MAX_FRAC'])" >> "$TMP"
-          echo "p=pathlib.Path(state)/'bankroll.json'; br=1000.0" >> "$TMP"
-          echo "if p.is_file():\n  import json as j\n  try: br=float(j.load(open(p)).get('bankroll',br))\n  except: pass" >> "$TMP"
-          echo "ms=round(br*mf,2)" >> "$TMP"
-          echo "open(os.environ['GITHUB_OUTPUT'],'a').write(f'max_stake={ms}\\n')" >> "$TMP"
-          echo "print(f'Bankroll={br} max_frac={mf} MAX_STAKE_EUR={ms}')" >> "$TMP"
-          python "$TMP"; rm -f "$TMP"
+          python - <<'PY'
+          import os, json, pathlib
+          state = os.environ['STATE_DIR']
+          mf = float(os.environ['INPUT_MAX_FRAC'])
+          p = pathlib.Path(state) / 'bankroll.json'
+          br = 1000.0
+          if p.is_file():
+              try:
+                  br = float(json.load(open(p)).get('bankroll', br))
+              except Exception:
+                  pass
+          ms = round(br * mf, 2)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"max_stake={ms}\n")
+          print(f"Bankroll={br} max_frac={mf} MAX_STAKE_EUR={ms}")
+          PY
 
       - name: Log live picks
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
-          TMP=/tmp/log_picks.py
-          : > "$TMP"
-          echo "import os,csv,time,pathlib,sys" >> "$TMP"
-          echo "picks=os.environ['PICKS_FILE']; log=os.environ['TRADE_LOG']; ms=float('${{ steps.bankroll.outputs.max_stake }}')" >> "$TMP"
-          echo "p=pathlib.Path(picks)" >> "$TMP"
-          echo "if (not p.is_file()) or p.stat().st_size==0: sys.exit(0)" >> "$TMP"
-          echo "rows=list(csv.DictReader(open(picks)))" >> "$TMP"
-          echo "if not rows: sys.exit(0)" >> "$TMP"
-          echo "out=[]" >> "$TMP"
-          echo "for r in rows:\n  ts=r.get('ts') or str(int(time.time()))" >> "$TMP"
-          echo "  try: st=min(float(r.get('stake') or ms), ms)\n  except: st=ms" >> "$TMP"
-          echo "  out.append([ts,r.get('match',''),r.get('selection',''),r.get('odds',''),r.get('edge',''),f'{st:.2f}'])" >> "$TMP"
-          echo "w=csv.writer(open(log,'a',newline=''))\nw.writerows(out)\nprint(f'Appended {len(out)} rows to {log}')" >> "$TMP"
-          python "$TMP"; rm -f "$TMP"
+          python - <<'PY'
+          import os, csv, time, pathlib, sys
+          picks = os.environ['PICKS_FILE']
+          log = os.environ['TRADE_LOG']
+          ms = float(os.environ.get('MAX_STAKE','0') or '0')
+          # If MAX_STAKE wasn't exported, read from step output env
+          ms = float(os.environ.get('max_stake', os.environ.get('MAX_STAKE','0')) or '0') or float("${{ steps.bankroll.outputs.max_stake }}")
+          p = pathlib.Path(picks)
+          if (not p.is_file()) or p.stat().st_size == 0:
+              sys.exit(0)
+          rows = list(csv.DictReader(open(picks)))
+          if not rows:
+              sys.exit(0)
+          out = []
+          for r in rows:
+              ts = r.get("ts") or str(int(time.time()))
+              try:
+                  st = min(float(r.get("stake") or ms), ms)
+              except Exception:
+                  st = ms
+              out.append([ts, r.get("match",""), r.get("selection",""), r.get("odds",""), r.get("edge",""), f"{st:.2f}"])
+          w = csv.writer(open(log, "a", newline=""))
+          w.writerows(out)
+          print(f"Appended {len(out)} rows to {log}")
+          PY
 
       - name: Snapshot close odds (CLV)
         run: |
@@ -160,14 +177,20 @@ jobs:
 
       - name: Print summary (last 20 trades)
         run: |
-          TMP=/tmp/print_table.py
-          : > "$TMP"
-          echo "import os,csv,pathlib,sys" >> "$TMP"
-          echo "p=os.environ['TRADE_LOG']; P=pathlib.Path(p)" >> "$TMP"
-          echo "if (not P.is_file()) or P.stat().st_size==0: print('No trades logged.'); sys.exit(0)" >> "$TMP"
-          echo "rows=list(csv.DictReader(open(p)))[-20:]" >> "$TMP"
-          echo "from tabulate import tabulate; print(tabulate(rows, headers='keys', tablefmt='github'))" >> "$TMP"
-          python "$TMP"; rm -f "$TMP"
+          python - <<'PY'
+          import os, csv, pathlib, sys
+          p = os.environ['TRADE_LOG']
+          P = pathlib.Path(p)
+          if (not P.is_file()) or P.stat().st_size == 0:
+              print("No trades logged."); sys.exit(0)
+          rows = list(csv.DictReader(open(p)))[-20:]
+          try:
+              from tabulate import tabulate
+              print(tabulate(rows, headers='keys', tablefmt='github'))
+          except Exception:
+              # simple fallback
+              for r in rows: print(r)
+          PY
 
       - name: Commit & push changes to main
         run: |
@@ -180,4 +203,3 @@ jobs:
             git commit -m "engine: update state+dashboard [skip ci]"
             git push
           fi
-
