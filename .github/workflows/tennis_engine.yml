@@ -1,141 +1,119 @@
-name: Tennis Engine LIVE (Cron + Manual)
+name: Tennis Engine (Backtest + Live + CLV + Dashboard)
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "choose what to run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - backtest
+          - live
       min_edge:
-        description: "Edge threshold (e.g., 0.05)"
+        description: "edge threshold (e.g. 0.05)"
         required: false
         default: "0.05"
       kelly_scale:
-        description: "Kelly scale (e.g., 0.5)"
+        description: "kelly scale"
         required: false
         default: "0.5"
-      max_bankroll_frac:
-        description: "Max % bankroll per bet (e.g., 0.05)"
+      bankroll:
+        description: "starting bankroll"
+        required: false
+        default: "1000"
+      matrix_bands:
+        description: "matrix backtest bands"
+        required: false
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+      max_frac:
+        description: "max % bankroll per bet"
         required: false
         default: "0.05"
-      abs_cap_eur:
-        description: "Absolute € cap per bet (e.g., 200)"
+      abs_cap:
+        description: "absolute € cap"
         required: false
         default: "200"
-      manual_results:
-        description: 'Inline results (e.g., "L002=1,L003=0") — optional'
+      simulate_if_missing:
+        description: "simulate result if missing"
         required: false
-        default: ""
-  # Every 20 minutes from 06:00–23:59 UTC. Adjust as needed.
-  schedule:
-    - cron: "*/20 6-23 * * *"
-
-# prevent overlaps
-concurrency:
-  group: tennis-engine-live
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-
-env:
-  PYTHONUNBUFFERED: "1"
-  STATE_DIR: state
-  LIVE_OUTDIR: live_results
-  RESULTS_FILE: live_results/results.csv
+        default: "true"
+      notify_if_rows:
+        description: "notify if >= rows"
+        required: false
+        default: "1"
 
 jobs:
-  engine:
+  tennis_engine:
     runs-on: ubuntu-latest
+    env:
+      STATE_DIR: state
+      OUTDIR: results
+      LIVE_OUTDIR: live_results
+      SYNTHETIC: synthetic_picks.csv
 
     steps:
+      # 1. Checkout repo
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Set up Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install deps
+      # 3. Install dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ensure dirs
-        run: |
-          mkdir -p "${STATE_DIR}" "${LIVE_OUTDIR}" docs outputs
-
-      - name: Fetch live matches
-        run: |
-          python scripts/fetch_live_matches.py \
-            --out "${LIVE_OUTDIR}/live_matches.csv"
-
-      - name: Fetch live odds
-        run: |
-          python scripts/fetch_live_odds.py \
-            --matches "${LIVE_OUTDIR}/live_matches.csv" \
-            --out "${LIVE_OUTDIR}/live_odds.csv"
-
+      # 4. Generate live value picks
       - name: Generate live value picks
+        if: ${{ github.event.inputs.mode == 'all' || github.event.inputs.mode == 'live' }}
         run: |
           python scripts/tennis_value_picks_live.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
-            --out "${LIVE_OUTDIR}/picks_live.csv" \
-            --min-edge "${{ github.event.inputs.min_edge || '0.05' }}"
+            --outdir "${LIVE_OUTDIR}" \
+            --min-edge ${{ github.event.inputs.min_edge }}
 
+      # 5. Log live picks
       - name: Log live picks (append to state/trade_log.csv)
+        if: ${{ github.event.inputs.mode == 'all' || github.event.inputs.mode == 'live' }}
         run: |
           python scripts/log_live_picks.py \
             --picks "${LIVE_OUTDIR}/picks_live.csv" \
             --state-dir "${STATE_DIR}" \
-            --kelly-scale "${{ github.event.inputs.kelly_scale || '0.5' }}" \
-            --max-frac "${{ github.event.inputs.max_bankroll_frac || '0.05' }}" \
-            --abs-cap "${{ github.event.inputs.abs_cap_eur || '200' }}" \
-            --assume-random-if-missing false
+            --kelly ${{ github.event.inputs.kelly_scale }} \
+            --stake-cap ${{ github.event.inputs.abs_cap }} \
+            --max-stake-eur ${{ github.event.inputs.abs_cap }} \
+            --assume-random-if-missing ${{ github.event.inputs.simulate_if_missing }}
 
+      # 6. Snapshot close odds for CLV
       - name: Snapshot close odds (for CLV)
         run: |
           python scripts/fetch_close_odds.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
             --out "${LIVE_OUTDIR}/close_odds.csv" \
-            --max-drift 0.08 || true
+            --max-drift 0.08
 
-      # REAL RESULTS ONLY (no simulation)
-      - name: Stage results (manual or CSV)
-        run: |
-          python scripts/fetch_results_stub.py \
-            --in "data/results/manual_results.csv" \
-            --manual "${{ github.event.inputs.manual_results }}" \
-            --out "${RESULTS_FILE}" || true
-
-      - name: Settle trades (PnL + CLV; update bankroll) — REAL ONLY
-        env:
-          RESULTS_CSV: ${{ env.RESULTS_FILE }}
+      # 7. Settle trades (PnL + CLV + bankroll update)
+      - name: Settle trades (PnL + CLV; update bankroll)
+        if: ${{ github.event.inputs.mode == 'all' || github.event.inputs.mode == 'live' }}
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
             python scripts/settle_trades.py \
               --log "${STATE_DIR}/trade_log.csv" \
-              --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
-              --state-dir "${STATE_DIR}" \
-              --assume-random-if-missing false || true
+              --out "${STATE_DIR}/settled_trades.csv"
           else
-            echo "No trade_log yet; skipping settlement."
+            echo "No trades to settle."
           fi
 
+      # 8. Build dashboard
       - name: Build dashboard
         run: |
           python scripts/make_dashboard.py \
-            --state-dir "${STATE_DIR}" \
-            --results "results" \
-            --live "${LIVE_OUTDIR}" \
-            --out "docs"
-
-      - name: Print clean summary table
-        run: |
-          python scripts/quick_summary.py \
-            --state-dir "${STATE_DIR}" \
-            --live-dir "${LIVE_OUTDIR}" || true
-
-      - name: Auto-commit state + docs
-        run: |
-          python scripts/autocommit_state.py \
-            --paths "${STATE_DIR},docs,${LIVE_OUTDIR}" \
-            --message "chore(engine live): tick $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+            --state
