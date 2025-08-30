@@ -1,73 +1,44 @@
-name: Tennis Engine (Backtest + Live + CLV + Dashboard)
+name: Tennis Engine LIVE (Cron + Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "choose what to run"
-        required: false
-        default: "all"
-        type: choice
-        options: [all, backtest, live]
       min_edge:
-        description: "edge threshold"
+        description: "Edge threshold (e.g., 0.05)"
         required: false
         default: "0.05"
       kelly_scale:
-        description: "kelly scale"
+        description: "Kelly scale (e.g., 0.5)"
         required: false
         default: "0.5"
-      bankroll:
-        description: "starting bankroll"
-        required: false
-        default: "1000"
-      bands:
-        description: "matrix backtest bands"
-        required: false
-        default: "2.0,2.6|2.6,3.2|3.2,4.0"
-      stake_cap:
-        description: "max % bankroll per bet"
+      max_bankroll_frac:
+        description: "Max % bankroll per bet (e.g., 0.05)"
         required: false
         default: "0.05"
-      max_stake_eur:
-        description: "absolute € cap"
+      abs_cap_eur:
+        description: "Absolute € cap per bet (e.g., 200)"
         required: false
         default: "200"
-      assume_random_if_missing:
-        description: "simulate result if missing"
+      manual_results:
+        description: 'Inline results (e.g., "L002=1,L003=0") — optional'
         required: false
-        default: "true"
-      min_rows_for_alert:
-        description: "notify if >= rows"
-        required: false
-        default: "1"
-
+        default: ""
   schedule:
-    - cron: "0 */6 * * *"
-    - cron: "*/30 * * * *"
+    # every 20 minutes between 06:00–23:59 UTC
+    - cron: "*/20 6-23 * * *"
+
+concurrency:
+  group: tennis-engine-live
+  cancel-in-progress: true
 
 permissions:
   contents: write
-  actions: read
-
-concurrency:
-  group: tennis-engine-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
-  PYTHON_VERSION: "3.10"
-  OUTDIR: results
-  LIVE_OUTDIR: live_results
+  PYTHONUNBUFFERED: "1"
   STATE_DIR: state
-  DOCS_DIR: docs
-  MIN_EDGE: "0.05"
-  KELLY_SCALE: "0.5"
-  BANKROLL: "1000"
-  BANDS: "2.0,2.6|2.6,3.2|3.2,4.0"
-  STAKE_CAP: "0.05"
-  MAX_STAKE_EUR: "200"
-  ASSUME_RANDOM: "true"
-  MIN_ROWS_FOR_ALERT: "1"
+  LIVE_OUTDIR: live_results
+  RESULTS_FILE: live_results/results.csv
 
 jobs:
   engine:
@@ -79,182 +50,90 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: "3.10"
 
       - name: Install deps
-        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install pandas || true
+          pip install -r requirements.txt
 
-      - name: Ensure directories
-        shell: bash
+      - name: Ensure dirs
         run: |
-          mkdir -p "${OUTDIR}" "${LIVE_OUTDIR}" "${STATE_DIR}" "${DOCS_DIR}"
+          mkdir -p "${STATE_DIR}" "${LIVE_OUTDIR}" docs outputs
 
-      - name: Resolve inputs -> env
-        shell: bash
-        run: |
-          echo "MODE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || 'all' }}" >> "$GITHUB_ENV"
-          echo "MIN_EDGE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.min_edge || env.MIN_EDGE }}" >> "$GITHUB_ENV"
-          echo "KELLY_SCALE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kelly_scale || env.KELLY_SCALE }}" >> "$GITHUB_ENV"
-          echo "BANKROLL=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bankroll || env.BANKROLL }}" >> "$GITHUB_ENV"
-          echo "BANDS=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bands || env.BANDS }}" >> "$GITHUB_ENV"
-          echo "STAKE_CAP=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.stake_cap || env.STAKE_CAP }}" >> "$GITHUB_ENV"
-          echo "MAX_STAKE_EUR=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_stake_eur || env.MAX_STAKE_EUR }}" >> "$GITHUB_ENV"
-          echo "ASSUME_RANDOM=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assume_random_if_missing || env.ASSUME_RANDOM }}" >> "$GITHUB_ENV"
-          echo "MIN_ROWS_FOR_ALERT=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.min_rows_for_alert || env.MIN_ROWS_FOR_ALERT }}" >> "$GITHUB_ENV"
-
-      # ---------- BACKTEST ----------
-      - name: Fetch historical tennis data
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
-        shell: bash
-        run: |
-          python scripts/fetch_tennis_data.py --outdir "${OUTDIR}" || true
-
-      - name: Generate value picks (historical)
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
-        shell: bash
-        run: |
-          python scripts/tennis_value_picks_pro.py \
-            --input "${OUTDIR}/tennis_data.csv" \
-            --outdir "${OUTDIR}" \
-            --min-edge "${MIN_EDGE}" || true
-
-      - name: Matrix Kelly backtest
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
-        shell: bash
-        run: |
-          if [ -s "${OUTDIR}/picks_final.csv" ]; then
-            python scripts/run_matrix_backtest.py \
-              --input "${OUTDIR}/picks_final.csv" \
-              --outdir "${OUTDIR}" \
-              --stake-mode kelly \
-              --edge "${MIN_EDGE}" \
-              --kelly-scale "${KELLY_SCALE}" \
-              --bankroll "${BANKROLL}" \
-              --bands "${BANDS}" || true
-          else
-            echo "No historical picks; skipping backtest."
-          fi
-
-      # ---------- LIVE ----------
       - name: Fetch live matches
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
         run: |
-          python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv" || true
+          python scripts/fetch_live_matches.py \
+            --out "${LIVE_OUTDIR}/live_matches.csv"
 
       - name: Fetch live odds
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
         run: |
           python scripts/fetch_live_odds.py \
             --matches "${LIVE_OUTDIR}/live_matches.csv" \
-            --out "${LIVE_OUTDIR}/live_odds.csv" || true
+            --out "${LIVE_OUTDIR}/live_odds.csv"
 
       - name: Generate live value picks
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
         run: |
           python scripts/tennis_value_picks_live.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
-            --outdir "${LIVE_OUTDIR}" \
-            --min-edge "${MIN_EDGE}" || true
+            --out "${LIVE_OUTDIR}/picks_live.csv" \
+            --edge "${{ github.event.inputs.min_edge || '0.05' }}"
 
-      - name: Log live picks (Kelly-sized)
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
+      - name: Log live picks (append to state/trade_log.csv)
         run: |
-          if [ -s "${LIVE_OUTDIR}/picks_live.csv" ]; then
-            python scripts/log_live_picks.py \
-              --picks "${LIVE_OUTDIR}/picks_live.csv" \
-              --state-dir "${STATE_DIR}" \
-              --kelly "${KELLY_SCALE}" \
-              --max-stake-eur "${MAX_STAKE_EUR}" \
-              --stake-cap "${STAKE_CAP}" || true
-          else
-            echo "No live picks to log."
-          fi
+          python scripts/log_live_picks.py \
+            --picks "${LIVE_OUTDIR}/picks_live.csv" \
+            --state-dir "${STATE_DIR}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale || '0.5' }}" \
+            --max-frac "${{ github.event.inputs.max_bankroll_frac || '0.05' }}" \
+            --abs-cap "${{ github.event.inputs.abs_cap_eur || '200' }}" \
+            --assume-random-if-missing false
 
-      # ---------- CLV + CLEANUP + SETTLEMENT ----------
-      - name: Fetch close odds snapshot (±8% drift)
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
+      - name: Snapshot close odds (for CLV)
         run: |
           python scripts/fetch_close_odds.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
-            --out  "${LIVE_OUTDIR}/close_odds.csv" \
-            --max-drift 0.08
+            --out "${LIVE_OUTDIR}/close_odds.csv" \
+            --max-drift 0.08 || true
 
-      - name: Purge synthetic trades (SYN*) before settlement
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
+      # REAL RESULTS ONLY (no simulation)
+      - name: Stage results (manual or CSV)
         run: |
-          python scripts/purge_synthetic.py --state-dir "${STATE_DIR}"
+          python scripts/fetch_results_stub.py \
+            --in "data/results/manual_results.csv" \
+            --manual "${{ github.event.inputs.manual_results }}" \
+            --out "${RESULTS_FILE}" || true
 
-      - name: Settle trades (compute PnL + CLV; update bankroll)
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        shell: bash
+      - name: Settle trades (PnL + CLV; update bankroll) — REAL ONLY
+        env:
+          RESULTS_CSV: ${{ env.RESULTS_FILE }}
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
             python scripts/settle_trades.py \
               --log "${STATE_DIR}/trade_log.csv" \
               --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
               --state-dir "${STATE_DIR}" \
-              --assume-random-if-missing || true
+              --assume-random-if-missing false || true
           else
             echo "No trade_log yet; skipping settlement."
           fi
 
-      - name: Update persistent bankroll state (from backtest equity if present)
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'live' }}
-        shell: bash
-        run: |
-          python scripts/update_bankroll_state.py \
-            --equity "${OUTDIR}/equity_curve.csv" \
-            --state-dir "${STATE_DIR}" \
-            --initial "${BANKROLL}" || true
-
-      # ---------- DASHBOARD & NOTIFY ----------
       - name: Build dashboard
-        shell: bash
         run: |
           python scripts/make_dashboard.py \
             --state-dir "${STATE_DIR}" \
-            --results "${OUTDIR}" \
+            --results "results" \
             --live "${LIVE_OUTDIR}" \
-            --out "${DOCS_DIR}" || true
-
-      - name: Notify picks (if secrets exist)
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        shell: bash
-        run: |
-          python scripts/notify_picks.py \
-            --live-outdir "${LIVE_OUTDIR}" \
-            --backtest-outdir "${OUTDIR}" \
-            --min-rows "${MIN_ROWS_FOR_ALERT}" || true
-
-      - name: Auto-commit state/results/docs
-        shell: bash
-        run: |
-          python scripts/autocommit_state.py \
-            --paths "${STATE_DIR}" "${OUTDIR}" "${LIVE_OUTDIR}" "${DOCS_DIR}" \
-            --message "engine: update state+results+docs" || true
+            --out "docs"
 
       - name: Print clean summary table
-        shell: bash
         run: |
-          python scripts/quick_summary.py
+          python scripts/quick_summary.py \
+            --state-dir "${STATE_DIR}" \
+            --live-dir "${LIVE_OUTDIR}" || true
+
+      - name: Auto-commit state + docs
+        run: |
+          python scripts/autocommit_state.py \
+            --paths "${STATE_DIR},docs,${LIVE_OUTDIR}" \
+            --message "chore(engine live): tick $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
