@@ -1,5 +1,10 @@
 name: Tennis Engine LIVE (Manual Only)
 
+# ✅ give the job the rights it needs
+permissions:
+  contents: write
+  pull-requests: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -51,6 +56,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # token is GITHUB_TOKEN by default; keep creds for PR commit
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -60,14 +69,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Always ensure tabulate is present for the summary table
           pip install --upgrade tabulate
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
             pip install pandas numpy
           fi
-          # Belt-and-suspenders: if requirements.txt downgraded it, bump again
           pip install --upgrade tabulate
 
       - name: Prepare folders
@@ -198,14 +205,33 @@ jobs:
           python "$TMP"
           rm -f "$TMP"
 
-      - name: Auto-commit state + docs
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "tennis_engine: update state and dashboard [skip ci]"
-            git push
-          fi
+      # ------- Save results as artifact no matter what -------
+      - name: Upload state + dashboard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-state-and-dashboard
+          path: |
+            .state/**
+            docs/**
+            picks_live.csv
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ------- Prefer PR over direct push (works with branch protection) -------
+      - name: Create PR with updated state + docs
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "tennis_engine: update state and dashboard [skip ci]"
+          title: "engine: update state and dashboard"
+          body: |
+            Automated update from Tennis Engine workflow.
+            - State: `.state/**`
+            - Dashboard: `docs/index.html`
+            - Picks: `picks_live.csv`
+          branch: bot/engine-state
+          delete-branch: true
+          add-paths: |
+            .state/**
+            docs/**
+            picks_live.csv
