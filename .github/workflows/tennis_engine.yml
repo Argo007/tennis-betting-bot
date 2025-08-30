@@ -24,7 +24,7 @@ on:
         required: false
         default: "true"
   schedule:
-    - cron: "5,25,45 * * * *"  # every 20 min
+    - cron: "5,25,45 * * * *"   # every 20 minutes
 
 jobs:
   engine:
@@ -75,15 +75,20 @@ jobs:
         shell: bash
         run: |
           if [ -f "${LIVE_OUTDIR}/picks_live.csv" ]; then
+            # compute MAX_STAKE_EUR safely
             MAX_STAKE_EUR=$(python scripts/compute_max_stake.py --state-dir "${STATE_DIR}" --max-frac "${MAX_FRAC}" --fallback 1000)
             echo "MAX_STAKE_EUR=${MAX_STAKE_EUR}"
+            FLAG=""
+            if [ "${SIM_ASSUME}" = "true" ]; then
+              FLAG="--assume-random-if-missing"
+            fi
             python scripts/log_live_picks.py \
               --picks "${LIVE_OUTDIR}/picks_live.csv" \
               --state-dir "${STATE_DIR}" \
               --kelly "${KELLY_SCALE}" \
               --stake-cap "${ABS_CAP}" \
               --max-stake-eur "${MAX_STAKE_EUR}" \
-              --assume-random-if-missing ${SIM_ASSUME}
+              ${FLAG}
           else
             echo "No live picks generated."
           fi
@@ -100,13 +105,18 @@ jobs:
           fi
 
       - name: Settle trades (PnL + CLV; update bankroll)
+        shell: bash
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
+            FLAG=""
+            if [ "${SIM_ASSUME}" = "true" ]; then
+              FLAG="--assume-random-if-missing"
+            fi
             python scripts/settle_trades.py \
               --log "${STATE_DIR}/trade_log.csv" \
               --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
               --state-dir "${STATE_DIR}" \
-              --assume-random-if-missing ${SIM_ASSUME}
+              ${FLAG}
           else
             echo "No trade_log.csv yet; nothing to settle."
           fi
