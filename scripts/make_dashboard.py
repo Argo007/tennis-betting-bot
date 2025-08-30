@@ -1,194 +1,149 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import argparse, os, json, pandas as pd
+from datetime import datetime, timezone
 
-"""
-Build a minimal dashboard at docs/index.html showing bankroll history + tables.
-Usage:
-  python scripts/make_dashboard.py --state-dir state --results results --live live_results --out docs
-"""
+def eur(x): 
+    try: return f"€{float(x):,.2f}"
+    except: return x
 
-import argparse
-import os
-import json
-import pandas as pd
-from datetime import datetime
+def pct(x):
+    try: return f"{float(x)*100:.1f}%"
+    except: return x
 
-def _fmt_currency(x):
-    try:
-        return f"€{float(x):.2f}"
-    except Exception:
-        return str(x)
-
-def _fmt_pct(x, digits=1):
-    try:
-        return f"{100*float(x):.{digits}f}%"
-    except Exception:
-        return str(x)
-
-def _safe_read_csv(path, **kwargs):
-    if not os.path.isfile(path):
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path, **kwargs)
+def read_csv(path, **kw):
+    if not os.path.exists(path): return pd.DataFrame()
+    try: 
+        return pd.read_csv(path, **kw)
     except Exception:
         return pd.DataFrame()
 
-def _html_table(df: pd.DataFrame) -> str:
-    if df.empty:
-        return "<p><em>No data</em></p>"
-    # Avoid pandas styles (keeps deps light in Actions logs)
-    return df.to_html(index=False, border=0, justify="center", classes="simple")
+def card(label, value):
+    return f"""<div class="card"><div class="label">{label}</div><div class="value">{value}</div></div>"""
+
+def table_html(df, max_rows=30):
+    if df.empty: 
+        return "<p><i>No data</i></p>"
+    shown = df.head(max_rows).copy()
+    return shown.to_html(index=False, classes="tbl", border=0, justify="center")
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--state-dir", default="state")
-    ap.add_argument("--results", default="results")
-    ap.add_argument("--live", default="live_results")
-    ap.add_argument("--out", default="docs")
+    ap.add_argument("--state-dir", required=True)
+    ap.add_argument("--live-dir", required=True)
+    ap.add_argument("--results-dir", required=True)
+    ap.add_argument("--min-edge", required=True)
+    ap.add_argument("--kelly", required=True)
+    ap.add_argument("--max-frac", required=True)
+    ap.add_argument("--abs-cap", required=True)
     args = ap.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    # state
+    bankroll_json = os.path.join(args.state_dir, "bankroll.json")
+    bankroll = 1000.0
+    settled = 0
+    try:
+        with open(bankroll_json, "r") as f:
+            data = json.load(f)
+            bankroll = float(data.get("bankroll", bankroll))
+            settled = int(data.get("settled_count", 0))
+    except Exception:
+        pass
 
-    # ---- Bankroll history (robust ts parsing; never cast to int) ----
-    hist_path = os.path.join(args.state_dir, "bankroll_history.csv")
-    hist = _safe_read_csv(hist_path)
-    if not hist.empty:
-        # Accept common column names
-        for ts_col in ["ts", "settled_ts", "time", "timestamp"]:
-            if ts_col in hist.columns:
-                hist["ts_parsed"] = pd.to_datetime(hist[ts_col], errors="coerce", utc=True)
-                break
-        else:
-            hist["ts_parsed"] = pd.NaT
+    # derived metrics from trade_log & close_odds if available
+    trades = read_csv(os.path.join(args.state_dir, "trade_log.csv"))
+    # normalise columns
+    for col in ("edge","p","clv"):
+        if col in trades.columns:
+            try: trades[col] = pd.to_numeric(trades[col], errors="coerce")
+            except: pass
+    if "pnl" in trades.columns:
+        try: trades["pnl"] = pd.to_numeric(trades["pnl"], errors="coerce")
+        except: pass
 
-        # Sort and select only the meaningful columns if present
-        hist = hist.sort_values("ts_parsed")
-        for col in ["bankroll", "equity", "pnl", "clv"]:
-            if col in hist.columns:
-                try:
-                    hist[col] = pd.to_numeric(hist[col], errors="coerce")
-                except Exception:
-                    pass
-    else:
-        hist["ts_parsed"] = pd.Series([], dtype="datetime64[ns, UTC]")
+    last24 = trades.tail(25)  # proxy for "recent"
+    avg_clv = last24["clv"].mean() if "clv" in last24.columns and not last24.empty else 0.0
 
-    # KPIs
-    bankroll = 0.0
-    if "bankroll" in hist.columns and not hist["bankroll"].dropna().empty:
-        bankroll = float(hist["bankroll"].dropna().iloc[-1])
-    settled_count = int(hist.shape[0])
-    open_count = 0  # this dashboard doesn't track open tickets separately
-    pnl_last24 = 0.0
-    avg_clv = 0.0
-    if "pnl" in hist.columns and not hist["pnl"].dropna().empty:
-        # last 24h pnl approximation (if we have timestamps)
-        if "ts_parsed" in hist.columns and hist["ts_parsed"].notna().any():
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=24)
-            pnl_last24 = float(hist.loc[hist["ts_parsed"] >= cutoff, "pnl"].sum())
-        else:
-            pnl_last24 = float(hist["pnl"].tail(1).sum())
-    if "clv" in hist.columns and not hist["clv"].dropna().empty:
-        avg_clv = float(hist["clv"].mean())
+    # sections
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    cards = "".join([
+        card("Bankroll", eur(bankroll)),
+        card("Settled (count)", f"{settled}"),
+        card("Open (count)", f"{0}"),
+        card("Avg CLV", f"{avg_clv:.4f}"),
+    ])
 
-    # ---- Recent settled trades table (take last ~10 if present) ----
-    recent_cols = ["ts", "match_id", "selection", "odds", "p", "edge", "stake_eur", "close_odds", "clv", "pnl", "settled_ts"]
-    recent = hist.copy()
-    # Harmonize column names for display
-    if "ts_parsed" in recent.columns:
-        recent["ts"] = recent["ts_parsed"].dt.strftime("%Y-%m-%d %H:%M")
-    # percentage formatting
-    for c in ["p", "edge"]:
-        if c in recent.columns:
-            recent[c] = recent[c].apply(lambda x: _fmt_pct(x, 1))
-    if "clv" in recent.columns:
-        recent["clv"] = recent["clv"].apply(lambda x: f"{float(x):.3f}" if pd.notna(x) else x)
-    if "stake_eur" in recent.columns:
-        recent["stake_eur"] = recent["stake_eur"].apply(_fmt_currency)
-    if "pnl" in recent.columns:
-        recent["pnl"] = recent["pnl"].apply(lambda x: f"{float(x):.3f}" if pd.notna(x) else x)
-    # retain display columns if present
-    recent = recent[[c for c in recent_cols if c in recent.columns]].tail(10)
+    # recent settled trades (if present)
+    cols = [c for c in ["match_id","selection","odds","p","edge","stake_eur","close_odds","clv","pnl","settled_ts"] if c in trades.columns]
+    recent_tbl = table_html(trades[cols].sort_values("settled_ts", ascending=False)) if cols else "<p><i>No data</i></p>"
 
-    # ---- Top live picks table (if any) ----
-    picks_live_path = os.path.join(args.live, "picks_live.csv")
-    live = _safe_read_csv(picks_live_path)
-    if not live.empty:
-        for c in ["p", "edge"]:
-            if c in live.columns:
-                live[c] = live[c].apply(lambda x: _fmt_pct(x, 1))
-        live = live.rename(columns={"selection": "sel"})
-        top_live = live[["match_id", "sel", "odds", "p", "edge"]].head(10) if all(
-            k in live.columns for k in ["match_id", "sel", "odds", "p", "edge"]
-        ) else pd.DataFrame()
-    else:
-        top_live = pd.DataFrame()
+    # live picks table (top)
+    live_picks = read_csv(os.path.join(args.live_dir, "picks_live.csv"))
+    cols_live = [c for c in ["match_id","sel","odds","p","edge"] if c in live_picks.columns]
+    live_tbl = table_html(live_picks[cols_live]) if cols_live else "<p><i>No data</i></p>"
 
-    # ---- Historical picks sample (from results) ----
-    picks_final_path = os.path.join(args.results, "picks_final.csv")
-    hist_picks = _safe_read_csv(picks_final_path)
-    if not hist_picks.empty:
-        for c in ["p", "edge"]:
-            if c in hist_picks.columns:
-                hist_picks[c] = hist_picks[c].apply(lambda x: _fmt_pct(x, 1))
-        historical = hist_picks.head(10)
-        # pick a friendly subset if available
-        wanted = ["match_id", "player_a", "player_b", "odds", "p", "edge"]
-        historical = historical[[c for c in wanted if c in historical.columns]]
-    else:
-        historical = pd.DataFrame()
+    # historical picks (your sample)
+    historical = read_csv(os.path.join(args.results_dir, "picks_final.csv"))
+    cols_hist = [c for c in ["match_id","player_a","player_b","odds","p","edge"] if c in historical.columns]
+    hist_tbl = table_html(historical[cols_hist]) if cols_hist else "<p><i>No data</i></p>"
 
-    # ---- Render HTML ----
-    generated = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    html = f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Tennis Engine — Summary</title>
+    html = f"""
 <style>
- body {{ font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 16px; }}
- h1 {{ margin-bottom: 4px; }}
- .kpis ul {{ list-style: disc; padding-left: 20px; }}
- table.simple {{ border-collapse: collapse; width: 100%; margin: 8px 0 24px; }}
- table.simple th, table.simple td {{ border: 1px solid #ddd; padding: 6px 8px; text-align: right; }}
- table.simple th:first-child, table.simple td:first-child {{ text-align: left; }}
- em {{ color: #777; }}
+  .wrap {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+  h1 {{ margin-bottom: 4px; }}
+  .meta {{ color:#666; margin-bottom: 14px }}
+  .cards {{ display:flex; flex-wrap:wrap; gap:10px; margin:12px 0 20px }}
+  .card {{ background:#0d1117; color:#e6edf3; border:1px solid #30363d; padding:10px 14px; border-radius:10px; min-width:140px }}
+  .card .label {{ font-size:12px; opacity:.8 }}
+  .card .value {{ font-size:18px; font-weight:700 }}
+  h2 {{ margin:18px 0 8px }}
+  .tbl {{ border-collapse: collapse; width: 100%; }}
+  .tbl th, .tbl td {{ padding: 6px 10px; border-bottom: 1px solid #e5e7eb; }}
+  .tbl tr:nth-child(even) {{ background: #f9fafb; }}
+  .section {{ margin-bottom: 22px }}
+  .pill {{ display:inline-block; font-size:12px; border:1px solid #e5e7eb; border-radius:999px; padding:2px 8px; margin-left:6px; color:#374151 }}
 </style>
-</head>
-<body>
+<div class="wrap">
   <h1>Tennis Engine — Summary</h1>
-  <p><em>Generated: {generated}</em></p>
-
-  <h2>Bankroll & KPIs</h2>
-  <div class="kpis">
-    <ul>
-      <li>Bankroll: {_fmt_currency(bankroll)}</li>
-      <li>Settled (count): {settled_count}</li>
-      <li>Open (count): {open_count}</li>
-      <li>PnL (last 24h): {_fmt_currency(pnl_last24)}</li>
-      <li>Avg CLV: {avg_clv:.4f}</li>
-    </ul>
+  <div class="meta">Generated: {now}
+    <span class="pill">min_edge {args.min_edge}</span>
+    <span class="pill">kelly {args.kelly}</span>
+    <span class="pill">max_frac {args.max_frac}</span>
+    <span class="pill">cap €{args.abs_cap}</span>
   </div>
 
-  <h2>Recent Settled Trades</h2>
-  {_html_table(recent)}
+  <div class="cards">{cards}</div>
 
-  <h2>Open Trades</h2>
-  <p><em>No data</em></p>
+  <div class="section">
+    <h2>Recent Settled Trades</h2>
+    {recent_tbl}
+  </div>
 
-  <h2>Top Live Picks</h2>
-  {_html_table(top_live)}
+  <div class="section">
+    <h2>Top Live Picks</h2>
+    {live_tbl}
+  </div>
 
-  <h2>Historical Picks (latest)</h2>
-  {_html_table(historical)}
-
-  <p style="color:#999; font-size:12px;">Job summary generated at run-time</p>
-</body>
-</html>
+  <div class="section">
+    <h2>Historical Picks (latest)</h2>
+    {hist_tbl}
+  </div>
+</div>
 """
-    out_path = os.path.join(args.out, "index.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"[dashboard] wrote {out_path}")
+    # Write to GitHub Actions Job Summary
+    try:
+        from pathlib import Path
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            Path(summary).write_text(html, encoding="utf-8")
+        else:
+            # Local run fallback
+            out = os.path.join(args.results_dir, "dashboard.html")
+            os.makedirs(args.results_dir, exist_ok=True)
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"Wrote {out}")
+    except Exception as e:
+        print("Could not write job summary:", e)
 
 if __name__ == "__main__":
     main()
