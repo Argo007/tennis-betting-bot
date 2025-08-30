@@ -2,7 +2,6 @@ name: Tennis Engine LIVE (Manual Only)
 
 permissions:
   contents: write
-  pull-requests: write
 
 on:
   workflow_dispatch:
@@ -31,12 +30,6 @@ on:
         required: true
         default: "false"
         options: ["false", "true"]
-      use_pr:
-        description: "attempt to open a PR with changes (requires repo setting or PAT)"
-        type: choice
-        required: true
-        default: "false"
-        options: ["false", "true"]
 
 env:
   PYTHON_VERSION: "3.11"
@@ -53,7 +46,6 @@ env:
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
   INPUT_MAX_FRAC: ${{ github.event.inputs.max_frac }}
   INPUT_ASSUME_RANDOM: ${{ github.event.inputs.assume_random_if_missing }}
-  INPUT_USE_PR: ${{ github.event.inputs.use_pr }}
 
 jobs:
   engine:
@@ -65,14 +57,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade tabulate
@@ -88,7 +79,7 @@ jobs:
           mkdir -p "${STATE_DIR}" "${DOCS_DIR}" "${SNAPSHOT_DIR}"
           [ -f "${TRADE_LOG}" ] || echo "ts,match,selection,odds,edge,stake" > "${TRADE_LOG}"
 
-      - name: Generate picks (respects inputs; auto-detects CLI)
+      - name: Generate picks (auto-detect CLI)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
           set -e
@@ -105,60 +96,50 @@ jobs:
             GEN_FAIL=1
           fi
           if [ "$GEN_FAIL" = "1" ]; then
-            echo "::warning::Pick generator failed or missing; creating placeholder ${PICKS_FILE}"
+            echo "::warning::Pick generator missing/failed; creating placeholder ${PICKS_FILE}"
             echo "ts,match,selection,odds,edge,stake" > "${PICKS_FILE}"
           fi
 
-      - name: Compute MAX_STAKE_EUR from bankroll and input max_frac
+      - name: Compute MAX_STAKE_EUR
         id: bankroll
         run: |
           TMP=/tmp/compute_bankroll.py
           : > "$TMP"
           echo "import os, json, pathlib" >> "$TMP"
-          echo "state = os.environ['STATE_DIR']" >> "$TMP"
-          echo "max_frac = float(os.environ['INPUT_MAX_FRAC'])" >> "$TMP"
-          echo "p = pathlib.Path(state) / 'bankroll.json'" >> "$TMP"
-          echo "bankroll = 1000.0" >> "$TMP"
-          echo "if p.is_file():" >> "$TMP"
-          echo "  try: bankroll = float(json.load(open(p)).get('bankroll', bankroll))" >> "$TMP"
-          echo "  except Exception: pass" >> "$TMP"
-          echo "max_stake = round(bankroll * max_frac, 2)" >> "$TMP"
-          echo "open(os.environ['GITHUB_OUTPUT'],'a').write(f'max_stake={max_stake}\\n')" >> "$TMP"
-          echo "print(f'Bankroll={bankroll} max_frac={max_frac} MAX_STAKE_EUR={max_stake}')" >> "$TMP"
-          python "$TMP"
-          rm -f "$TMP"
+          echo "state=os.environ['STATE_DIR']; mf=float(os.environ['INPUT_MAX_FRAC'])" >> "$TMP"
+          echo "p=pathlib.Path(state)/'bankroll.json'; br=1000.0" >> "$TMP"
+          echo "if p.is_file():\n  import json as j\n  try: br=float(j.load(open(p)).get('bankroll',br))\n  except: pass" >> "$TMP"
+          echo "ms=round(br*mf,2)" >> "$TMP"
+          echo "open(os.environ['GITHUB_OUTPUT'],'a').write(f'max_stake={ms}\\n')" >> "$TMP"
+          echo "print(f'Bankroll={br} max_frac={mf} MAX_STAKE_EUR={ms}')" >> "$TMP"
+          python "$TMP"; rm -f "$TMP"
 
-      - name: Log live picks (append to state/trade_log.csv)
+      - name: Log live picks
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
           TMP=/tmp/log_picks.py
           : > "$TMP"
           echo "import os,csv,time,pathlib,sys" >> "$TMP"
-          echo "picks=os.environ['PICKS_FILE']; log=os.environ['TRADE_LOG']; max_stake=float('${{ steps.bankroll.outputs.max_stake }}')" >> "$TMP"
+          echo "picks=os.environ['PICKS_FILE']; log=os.environ['TRADE_LOG']; ms=float('${{ steps.bankroll.outputs.max_stake }}')" >> "$TMP"
           echo "p=pathlib.Path(picks)" >> "$TMP"
           echo "if (not p.is_file()) or p.stat().st_size==0: sys.exit(0)" >> "$TMP"
           echo "rows=list(csv.DictReader(open(picks)))" >> "$TMP"
           echo "if not rows: sys.exit(0)" >> "$TMP"
           echo "out=[]" >> "$TMP"
-          echo "for r in rows:" >> "$TMP"
-          echo "  ts=r.get('ts') or str(int(time.time()))" >> "$TMP"
-          echo "  try: st=min(float(r.get('stake') or max_stake), max_stake)" >> "$TMP"
-          echo "  except: st=max_stake" >> "$TMP"
+          echo "for r in rows:\n  ts=r.get('ts') or str(int(time.time()))" >> "$TMP"
+          echo "  try: st=min(float(r.get('stake') or ms), ms)\n  except: st=ms" >> "$TMP"
           echo "  out.append([ts,r.get('match',''),r.get('selection',''),r.get('odds',''),r.get('edge',''),f'{st:.2f}'])" >> "$TMP"
-          echo "w=csv.writer(open(log,'a',newline=''))" >> "$TMP"
-          echo "w.writerows(out)" >> "$TMP"
-          echo "print(f'Appended {len(out)} rows to {log}')" >> "$TMP"
-          python "$TMP"
-          rm -f "$TMP"
+          echo "w=csv.writer(open(log,'a',newline=''))\nw.writerows(out)\nprint(f'Appended {len(out)} rows to {log}')" >> "$TMP"
+          python "$TMP"; rm -f "$TMP"
 
-      - name: Snapshot close odds (for CLV)
+      - name: Snapshot close odds (CLV)
         run: |
           if [ -f "${CLOSE_ODDS_FILE}" ]; then
             stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
             cp "${CLOSE_ODDS_FILE}" "${SNAPSHOT_DIR}/close_odds_${stamp}.csv"
-            echo "Snapshot: ${SNAPSHOT_DIR}/close_odds_${stamp}.csv"
+            echo "Snapshot saved."
           else
-            echo "No ${CLOSE_ODDS_FILE}; skipping CLV snapshot."
+            echo "No ${CLOSE_ODDS_FILE}; skip."
           fi
 
       - name: Settle trades (PnL + CLV; update bankroll)
@@ -166,7 +147,7 @@ jobs:
           if [ -f "${STATE_DIR}/trade_log.csv" ] && [ -f settle_trades.py ]; then
             python settle_trades.py --log "${STATE_DIR}/trade_log.csv" --state-dir "${STATE_DIR}" --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" --out "${STATE_DIR}/settled_trades.csv"
           else
-            echo "No trade_log or settle_trades.py; skipping real settlement."
+            echo "No trade_log or settle_trades.py; skip settlement."
           fi
 
       - name: Build dashboard
@@ -174,78 +155,29 @@ jobs:
           if [ -f make_dashboard.py ]; then
             python make_dashboard.py --state-dir "${STATE_DIR}" --out "${DASHBOARD_HTML}"
           else
-            echo '<!doctype html><meta charset="utf-8"><title>Tennis Engine</title><h1>Tennis Engine</h1><p>Dashboard generator not found; placeholder page.</p>' > "${DASHBOARD_HTML}"
-            echo "Wrote placeholder dashboard."
+            echo '<!doctype html><meta charset="utf-8"><title>Tennis Engine</title><h1>Tennis Engine</h1><p>Placeholder dashboard.</p>' > "${DASHBOARD_HTML}"
           fi
 
-      - name: Print summary table (last 20 trades)
+      - name: Print summary (last 20 trades)
         run: |
           TMP=/tmp/print_table.py
           : > "$TMP"
           echo "import os,csv,pathlib,sys" >> "$TMP"
-          echo "p=os.environ['TRADE_LOG']" >> "$TMP"
-          echo "P=pathlib.Path(p)" >> "$TMP"
+          echo "p=os.environ['TRADE_LOG']; P=pathlib.Path(p)" >> "$TMP"
           echo "if (not P.is_file()) or P.stat().st_size==0: print('No trades logged.'); sys.exit(0)" >> "$TMP"
-          echo "rows=list(csv.DictReader(open(p)))" >> "$TMP"
-          echo "rows=rows[-20:]" >> "$TMP"
-          echo "from tabulate import tabulate" >> "$TMP"
-          echo "print(tabulate(rows, headers='keys', tablefmt='github'))" >> "$TMP"
-          python "$TMP"
-          rm -f "$TMP"
+          echo "rows=list(csv.DictReader(open(p)))[-20:]" >> "$TMP"
+          echo "from tabulate import tabulate; print(tabulate(rows, headers='keys', tablefmt='github'))" >> "$TMP"
+          python "$TMP"; rm -f "$TMP"
 
-      # ---------- Commit/PR outputs (no artifacts anymore) ----------
-      - name: Detect changes
-        id: diff
+      - name: Commit & push changes to main
         run: |
           git add -A
           if git diff --cached --quiet; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes to commit."
           else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "engine: update state+dashboard [skip ci]"
+            git push
           fi
 
-      - name: Set push token
-        id: tok
-        run: |
-          if [ -n "${{ secrets.ACTIONS_PAT }}" ]; then
-            echo "token=${{ secrets.ACTIONS_PAT }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "token=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Commit changes
-        if: steps.diff.outputs.changed == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "tennis_engine: update state and dashboard [skip ci]"
-
-      - name: Push to bot branch (fallback path)
-        if: steps.diff.outputs.changed == 'true'
-        env:
-          PUSH_TOKEN: ${{ steps.tok.outputs.token }}
-        run: |
-          BR="bot/engine-state-$(date -u +%Y%m%dT%H%M%SZ)"
-          git checkout -b "$BR"
-          git push "https://${PUSH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:"$BR" || echo "::warning::Push blocked by policy."
-
-      - name: Create PR (optional)
-        if: steps.diff.outputs.changed == 'true' && env.INPUT_USE_PR == 'true'
-        uses: peter-evans/create-pull-request@v6
-        continue-on-error: true
-        with:
-          token: ${{ steps.tok.outputs.token }}
-          commit-message: "tennis_engine: update state and dashboard [skip ci]"
-          title: "engine: update state and dashboard"
-          body: |
-            Automated update from Tennis Engine workflow.
-            - State: `.state/**`
-            - Dashboard: `docs/index.html`
-            - Picks: `picks_live.csv`
-          branch: bot/engine-state
-          branch-suffix: short-commit-hash
-          delete-branch: true
-          add-paths: |
-            .state/**
-            docs/**
-            picks_live.csv
