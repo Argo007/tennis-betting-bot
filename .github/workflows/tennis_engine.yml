@@ -153,6 +153,10 @@ jobs:
         shell: bash
         run: |
           python scripts/autocommit_state.py \
-            --paths "${STATE_DIR}" docs \
-            --message "engine: update state + docs"
+             --log "${STATE_DIR}/trade_log.csv" \
+             --paths docs ${STATE_DIR} \
+             --message "Auto-commit: update trade_log + docs" \
+             --user-name "TennisBot" \
+             --user-email "bot@tennis-engine.local"
+
 
