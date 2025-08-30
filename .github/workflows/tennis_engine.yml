@@ -200,25 +200,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         shell: bash
         run: |
-          if [ -f "${STATE_DIR}/trade_log.csv" ]; then
-            python - <<'PY'
-import os
-import pandas as pd
-p = os.environ["STATE_DIR"] + "/trade_log.csv"
-df = pd.read_csv(p)
-if not df.empty and "match_id" in df.columns:
-    keep = ~df["match_id"].astype(str).str.startswith("SYN")
-    if keep.any() and (~keep).any():
-        df[keep].to_csv(p, index=False)
-        print(f"Purged {(~keep).sum()} synthetic rows -> {p}")
-    else:
-        print("No synthetic rows to purge.")
-else:
-    print("trade_log.csv present but empty or missing match_id.")
-PY
-          else
-            echo "No trade_log.csv; nothing to purge."
-          fi
+          python scripts/purge_synthetic.py --state-dir "${STATE_DIR}"
 
       - name: Settle trades (compute PnL + CLV; update bankroll)
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
