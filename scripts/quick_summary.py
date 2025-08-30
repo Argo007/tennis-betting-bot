@@ -1,109 +1,140 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-quick_summary.py
+Print a clean Markdown summary of bankroll, KPIs, recent settled trades,
+and top live picks (with Kelly stakes if available).
 
-Robust summary for the matrix backtest job:
-- Tries outputs/backtest_metrics.json first
-- Falls back to outputs/matrix_rankings.csv if JSON is empty/missing
-- Prints a compact markdown block safe for $GITHUB_STEP_SUMMARY
+If GITHUB_STEP_SUMMARY is set (GitHub Actions), writes there so it renders
+as a nice table on the run page. Otherwise prints to stdout.
+
+Reads (if present):
+  state/bankroll.json
+  state/bankroll_history.csv
+  state/trade_log.csv
+  live_results/picks_live.csv
+  results/picks_final.csv
 """
+import os, json, pandas as pd
+from datetime import datetime, timezone, timedelta
 
-from __future__ import annotations
-import json, csv, pathlib, sys
-from typing import Dict, Optional
+STATE = os.getenv("STATE_DIR", "state")
+LIVE  = os.getenv("LIVE_OUTDIR", "live_results")
+RES   = os.getenv("OUTDIR", "results")
 
-OUTDIR = pathlib.Path("outputs")
-METRICS = OUTDIR / "backtest_metrics.json"
-RANKINGS = OUTDIR / "matrix_rankings.csv"
-
-def fmt(x):
-    if x is None:
-        return "-"
-    if isinstance(x, (int, float)):
-        try:
-            return f"{float(x):.4f}"
-        except Exception:
-            return str(x)
-    return str(x)
-
-def read_best_from_json() -> Optional[Dict]:
-    if not METRICS.exists() or METRICS.stat().st_size == 0:
-        return None
+def read_json(path, default=None):
     try:
-        j = json.loads(METRICS.read_text())
+        with open(path, "r") as f:
+            return json.load(f)
     except Exception:
-        return None
-    best = (j or {}).get("best_by_roi") or None
-    return best
+        return default
 
-def read_top_from_rankings() -> Optional[Dict]:
-    if not RANKINGS.exists() or RANKINGS.stat().st_size == 0:
-        return None
+def read_csv(path, cols=None):
+    if not os.path.isfile(path):
+        return pd.DataFrame(columns=cols or [])
     try:
-        with RANKINGS.open(newline="", encoding="utf-8") as f:
-            rdr = csv.DictReader(f)
-            rows = list(rdr)
-            if not rows:
-                return None
-            # assume already sorted by ROI desc, otherwise sort here:
-            # rows.sort(key=lambda r: float(r.get("roi", 0) or 0), reverse=True)
-            return rows[0]
+        df = pd.read_csv(path)
+        return df if not df.empty else pd.DataFrame(columns=cols or [])
     except Exception:
-        return None
+        return pd.DataFrame(columns=cols or [])
 
-def main():
-    print("## Matrix Backtest — Best by ROI")
+bank = read_json(os.path.join(STATE, "bankroll.json"), {"bankroll": 0})
+hist  = read_csv(os.path.join(STATE, "bankroll_history.csv"))
+log   = read_csv(os.path.join(STATE, "trade_log.csv"))
+livep = read_csv(os.path.join(LIVE, "picks_live.csv"))
+histp = read_csv(os.path.join(RES, "picks_final.csv"))
 
-    best = read_best_from_json()
-    from_csv = False
+# KPIs
+now = datetime.now(tz=timezone.utc)
+day_ago = int((now - timedelta(days=1)).timestamp())
 
-    if best is None:
-        # graceful fallback to rankings.csv
-        r = read_top_from_rankings()
-        if r is None:
-            print("No metrics available — no bets met the criteria or outputs are empty.")
-            sys.exit(0)
-        from_csv = True
-        # normalize keys to match json shape
-        best = {
-            "config_id": r.get("config_id"),
-            "label": r.get("label"),
-            "bets": r.get("bets"),
-            "wins": r.get("wins"),
-            "hit_rate": r.get("hit_rate"),
-            "avg_odds": r.get("avg_odds"),
-            "turnover": r.get("turnover"),
-            "pnl": r.get("pnl"),
-            "roi": r.get("roi"),
-            "end_bankroll": r.get("end_bankroll"),
-            "max_drawdown": r.get("max_drawdown"),
-        }
+pnl_24h = 0.0
+n_open = n_settled = 0
+avg_clv = 0.0
+if not log.empty:
+    if "status" in log.columns:
+        n_open = int((log["status"].str.lower() == "open").sum())
+        n_settled = int((log["status"].str.lower() == "settled").sum())
+    if "settled_ts" in log.columns and "pnl" in log.columns:
+        pnl_24h = float(log.loc[log["settled_ts"].fillna(0).astype(int) >= day_ago, "pnl"].sum())
+    if "clv" in log.columns:
+        clv_vals = log["clv"].dropna()
+        if len(clv_vals):
+            avg_clv = float(clv_vals.mean())
 
-    # headline
-    print(f"- **Config**: `{best.get('config_id', '-')}`")
-    print(f"- **Band**: {best.get('label', '-')}")
+def fmt_money(x): 
+    try: return f"€{float(x):,.2f}"
+    except: return "€0.00"
 
-    # metrics block (only print if present)
-    bets = best.get("bets")
-    roi = best.get("roi")
-    pnl = best.get("pnl")
-    end_br = best.get("end_bankroll")
-    extra = []
+def pct(x):
+    try: return f"{100*float(x):.1f}%"
+    except: return "—"
 
-    if bets is not None:
-        extra.append(f"**Bets**: {fmt(bets)}")
-    if roi is not None:
-        extra.append(f"**ROI**: {fmt(roi)}")
-    if pnl is not None:
-        extra.append(f"**PnL**: {fmt(pnl)}")
-    if end_br is not None:
-        extra.append(f"**End BR**: {fmt(end_br)}")
+def md_table(df, cols, title, max_rows=10):
+    if df.empty:
+        return f"\n### {title}\n_No data_\n"
+    d = df.copy()
+    keep = [c for c in cols if c in d.columns]
+    d = d[keep].head(max_rows)
+    # tidy numbers
+    for col in ("odds","p","edge","stake_eur","pnl","clv"):
+        if col in d.columns:
+            if col in ("p","edge"):
+                d[col] = d[col].astype(float).map(lambda v: f"{100*v:.1f}%")
+            else:
+                d[col] = d[col].astype(float).map(lambda v: f"{v:.3f}" if col!="stake_eur" else fmt_money(v))
+    if "ts" in d.columns:
+        d["ts"] = pd.to_datetime(d["ts"], unit="s", utc=True).dt.strftime("%Y-%m-%d %H:%M")
+    if "settled_ts" in d.columns:
+        d["settled_ts"] = pd.to_datetime(d["settled_ts"], unit="s", utc=True).dt.strftime("%Y-%m-%d %H:%M")
+    # markdown
+    header = " | ".join(keep)
+    sep = " | ".join(["---"]*len(keep))
+    rows = [" | ".join(map(str, r)) for r in d.values.tolist()]
+    return f"\n### {title}\n{header}\n{sep}\n" + "\n".join(rows) + "\n"
 
-    if extra:
-        print("- " + " | ".join(extra))
+# Build summary
+lines = []
+lines.append(f"# Tennis Engine — Summary")
+lines.append(f"_Generated: {now.strftime('%Y-%m-%d %H:%M UTC')}_\n")
+lines.append("## Bankroll & KPIs")
+lines.append(f"- **Bankroll:** {fmt_money(bank.get('bankroll', 0))}")
+lines.append(f"- **Settled (count):** {n_settled}")
+lines.append(f"- **Open (count):** {n_open}")
+lines.append(f"- **PnL (last 24h):** {fmt_money(pnl_24h)}")
+lines.append(f"- **Avg CLV:** {avg_clv:.4f}\n")
 
-    if from_csv:
-        print("_Summary derived from matrix_rankings.csv (JSON was empty)._")
+# Tables
+lines.append(md_table(
+    log[log.get("status","").astype(str).str.lower()=="settled"].sort_values("settled_ts", ascending=False),
+    ["ts","match_id","selection","odds","p","edge","stake_eur","close_odds","clv","pnl","settled_ts"],
+    "Recent Settled Trades",
+    max_rows=12
+))
+lines.append(md_table(
+    log[log.get("status","").astype(str).str.lower()=="open"].sort_values("ts", ascending=False),
+    ["ts","match_id","selection","odds","p","edge","stake_eur","bankroll_snapshot"],
+    "Open Trades",
+    max_rows=12
+))
+lines.append(md_table(
+    livep.sort_values("edge", ascending=False) if "edge" in livep.columns else livep,
+    ["match_id","sel","odds","p","edge"],
+    "Top Live Picks",
+    max_rows=8
+))
+lines.append(md_table(
+    histp.sort_values("edge", ascending=False) if "edge" in histp.columns else histp,
+    ["match_id","player_a","player_b","odds","p","edge"],
+    "Historical Picks (latest)",
+    max_rows=8
+))
 
-if __name__ == "__main__":
-    main()
+markdown = "\n".join(lines)
+
+# Write to job summary if available
+summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+if summary_path:
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(markdown)
+else:
+    print(markdown)
