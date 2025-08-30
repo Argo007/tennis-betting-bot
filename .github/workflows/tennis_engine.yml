@@ -4,41 +4,41 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Choose what to run"
+        description: "choose what to run"
         required: false
         default: "all"
         type: choice
         options: [all, backtest, live]
       min_edge:
-        description: "Edge threshold (e.g., 0.02–0.12)"
+        description: "edge threshold"
         required: false
         default: "0.08"
       kelly_scale:
-        description: "Kelly scale (0.25–1.0 typical)"
+        description: "kelly scale"
         required: false
         default: "0.5"
       bankroll:
-        description: "Starting bankroll (for backtest and snapshots)"
+        description: "starting bankroll"
         required: false
         default: "1000"
       bands:
-        description: "Odds bands for matrix backtest"
+        description: "matrix backtest bands"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
       stake_cap:
-        description: "Max % of bankroll per bet (e.g., 0.05)"
+        description: "max % bankroll per bet"
         required: false
         default: "0.05"
       max_stake_eur:
-        description: "Absolute € cap per bet"
+        description: "absolute € cap"
         required: false
         default: "200"
       assume_random_if_missing:
-        description: "If true, simulate settlement by p when result missing"
+        description: "simulate result if missing"
         required: false
         default: "true"
       min_rows_for_alert:
-        description: "Notify only if >= this many rows"
+        description: "notify if >= rows"
         required: false
         default: "1"
 
@@ -99,7 +99,6 @@ jobs:
         run: |
           mkdir -p "${OUTDIR}" "${LIVE_OUTDIR}" "${STATE_DIR}" "${DOCS_DIR}"
 
-      # Resolve inputs → env for this run
       - name: Resolve inputs -> env
         run: |
           echo "MODE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || 'all' }}" >> "$GITHUB_ENV"
@@ -163,14 +162,6 @@ jobs:
             --outdir "${LIVE_OUTDIR}" \
             --min-edge "${MIN_EDGE}" || true
 
-      # >>>> Fallback to guarantee picks when empty <<<<
-      - name: Fallback — create synthetic live picks when none
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
-        run: |
-          python scripts/fill_with_synthetic_live.py \
-            --outdir "${LIVE_OUTDIR}" \
-            --min-edge "${MIN_EDGE}" || true
-
       - name: Log live picks (Kelly-sized)
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
@@ -186,13 +177,13 @@ jobs:
           fi
 
       # ---------- CLV + SETTLEMENT + STATE ----------
-      - name: Produce close odds for CLV
+      - name: Fetch close odds snapshot
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
         run: |
           python scripts/fetch_close_odds.py \
-            --matches "${LIVE_OUTDIR}/live_matches.csv" \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
-            --out "${LIVE_OUTDIR}/close_odds.csv" || true
+            --out  "${LIVE_OUTDIR}/close_odds.csv" \
+            --max-drift 0.04
 
       - name: Settle trades (compute PnL + CLV; update bankroll)
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
@@ -202,7 +193,7 @@ jobs:
               --log "${STATE_DIR}/trade_log.csv" \
               --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
               --state-dir "${STATE_DIR}" \
-              $([ "${ASSUME_RANDOM}" = "true" ] && echo "--assume-random-if-missing") || true
+              --assume-random-if-missing || true
           else
             echo "No trade_log yet; skipping settlement."
           fi
@@ -235,18 +226,12 @@ jobs:
             --backtest-outdir "${OUTDIR}" \
             --min-rows "${MIN_ROWS_FOR_ALERT}" || true
 
-      # ---------- COMMIT CHANGES ----------
       - name: Auto-commit state/results/docs
         run: |
           python scripts/autocommit_state.py \
             --paths "${STATE_DIR}" "${OUTDIR}" "${LIVE_OUTDIR}" "${DOCS_DIR}" \
             --message "engine: update state+results+docs" || true
 
-      # ---------- CLEAN JOB SUMMARY ----------
       - name: Print clean summary table
-        env:
-          OUTDIR: ${{ env.OUTDIR }}
-          LIVE_OUTDIR: ${{ env.LIVE_OUTDIR }}
-          STATE_DIR: ${{ env.STATE_DIR }}
         run: |
           python scripts/quick_summary.py
