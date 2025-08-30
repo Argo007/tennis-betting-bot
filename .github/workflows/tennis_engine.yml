@@ -77,17 +77,12 @@ jobs:
         run: |
           if [ -f "${LIVE_OUTDIR}/picks_live.csv" ]; then
             MAX_STAKE_EUR=$(python scripts/compute_max_stake.py --state-dir "${STATE_DIR}" --max-frac "${MAX_FRAC}" --fallback 1000)
-            echo "MAX_STAKE_EUR=${MAX_STAKE_EUR}"
-            python scripts/log_live_picks.py \
-              --picks "${LIVE_OUTDIR}/picks_live.csv" \
-              --state-dir "${STATE_DIR}" \
-              --kelly "${KELLY_SCALE}" \
-              --stake-cap "${ABS_CAP}" \
-              --max-stake-eur "${MAX_STAKE_EUR}" \
-              --assume-random-if-missing "${SIM_ASSUME}"
+            echo "MAX_STAKE_EUR=${MAX_STAKE_EUR}  SIM_ASSUME=${SIM_ASSUME}"
+            python scripts/log_live_picks.py --picks "${LIVE_OUTDIR}/picks_live.csv" --state-dir "${STATE_DIR}" --kelly "${KELLY_SCALE}" --stake-cap "${ABS_CAP}" --max-stake-eur "${MAX_STAKE_EUR}" --assume-random-if-missing "${SIM_ASSUME}"
           else
             echo "No live picks generated."
           fi
+
 
       - name: Snapshot close odds (for CLV)
         run: |
