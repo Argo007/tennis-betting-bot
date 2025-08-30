@@ -1,5 +1,7 @@
 match_id,selection,close_odds
-SYN001,Player A,2.492
-SYN001,Player B,1.588
-SYN002,Player C,3.001
-SYN002,Player D,1.429
+L001,Sinner,2.584
+L001,Alcaraz,1.545
+L002,Rybakina,2.217
+L002,Gauff,1.743
+L003,Djokovic,2.487
+L003,Medvedev,1.516
