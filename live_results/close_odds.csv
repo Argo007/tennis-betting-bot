@@ -1,5 +1,7 @@
-match_id,sel,close_odds,ts_close
-SYN001,Player A,2.4,1756541595
-SYN001,Player B,1.65,1756541595
-SYN002,Player C,3.1,1756541595
-SYN002,Player D,1.45,1756541595
+match_id,selection,close_odds
+L001,Sinner,2.001
+L001,Alcaraz,1.814
+L002,Rybakina,1.907
+L002,Gauff,1.867
+L003,Djokovic,1.478
+L003,Medvedev,2.696
