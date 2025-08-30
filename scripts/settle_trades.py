@@ -1,152 +1,122 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Settle open trades using close odds (and optional results), compute CLV and PnL,
-and update bankroll state.
+Settle trades from state/trade_log.csv using close_odds.csv.
+Computes CLV, PnL, and updates bankroll state/history.
 
-Inputs:
-  --log         state/trade_log.csv (created by log_live_picks.py)
-  --close-odds  live_results/close_odds.csv  (from fetch_close_odds.py)
-  --results     <optional> CSV with columns: match_id, winner or result (1 for our sel)
-  --state-dir   state
-
-Outputs (updated in place):
-  state/trade_log.csv        (status=open->settled, close_odds, clv, pnl)
-  state/bankroll.json        (bankroll += Σ pnl of newly settled)
-  state/bankroll_history.csv (append new snapshot)
+Usage:
+  python scripts/settle_trades.py \
+    --log state/trade_log.csv \
+    --close-odds live_results/close_odds.csv \
+    --state-dir state \
+    --assume-random-if-missing
 """
-import argparse, os, json, time
-import numpy as np
+import os, argparse, time, json, random
 import pandas as pd
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--log", default="state/trade_log.csv")
 ap.add_argument("--close-odds", default="live_results/close_odds.csv")
-ap.add_argument("--results", default="", help="optional: CSV with match_id,[sel|winner|result]")
 ap.add_argument("--state-dir", default="state")
-ap.add_argument("--assume-random-if-missing", action="store_true",
-                help="If no results provided, simulate outcome by p")
+ap.add_argument("--assume-random-if-missing", action="store_true")
 args = ap.parse_args()
 
 os.makedirs(args.state_dir, exist_ok=True)
-state_path = os.path.join(args.state_dir, "bankroll.json")
-hist_path  = os.path.join(args.state_dir, "bankroll_history.csv")
+bank_p  = os.path.join(args.state_dir, "bankroll.json")
+hist_p  = os.path.join(args.state_dir, "bankroll_history.csv")
+
+def load_bankroll():
+    if os.path.isfile(bank_p):
+        try:
+            return float(json.load(open(bank_p))["bankroll"])
+        except Exception:
+            pass
+    return 1000.0
+
+def save_bankroll(v):
+    with open(bank_p, "w") as f:
+        json.dump({"bankroll": float(v)}, f)
+
+def append_hist(ts, bankroll):
+    row = pd.DataFrame([{"ts": int(ts), "bankroll": float(bankroll)}])
+    if os.path.isfile(hist_p):
+        try:
+            old = pd.read_csv(hist_p)
+            pd.concat([old, row], ignore_index=True).to_csv(hist_p, index=False)
+            return
+        except Exception:
+            pass
+    row.to_csv(hist_p, index=False)
 
 if not os.path.isfile(args.log):
-    print("No trade log; nothing to settle.")
+    print("No trade_log.csv -> nothing to settle.")
     raise SystemExit(0)
 
 log = pd.read_csv(args.log)
-if log.empty or "status" not in log.columns:
-    print("Empty or malformed trade log.")
+if log.empty:
+    print("trade_log.csv empty -> nothing to settle.")
     raise SystemExit(0)
 
-open_mask = log["status"].astype(str).str.lower().eq("open")
-to_settle = log[open_mask].copy()
-if to_settle.empty:
-    print("No open trades to settle.")
-    raise SystemExit(0)
+# Load close odds
+close_map = {}
+if os.path.isfile(args.close_odds):
+    try:
+        clos = pd.read_csv(args.close_odds)
+        for _, r in clos.iterrows():
+            close_map[(str(r.get("match_id","")), str(r.get("sel","")))] = float(r.get("close_odds", r.get("odds", 0)))
+    except Exception:
+        pass
 
-# close odds
-co = pd.read_csv(args.close_odds) if os.path.isfile(args.close_odds) else pd.DataFrame()
-if co.empty:
-    print("No close odds; cannot compute CLV. Aborting.")
-    raise SystemExit(0)
+bankroll = load_bankroll()
+settled_any = False
+now = int(time.time())
 
-# normalize for join
-for c in ("match_id","sel"):
-    if c in co.columns:
-        co[c] = co[c].astype(str)
-    if c in to_settle.columns:
-        to_settle[c] = to_settle[c].astype(str)
+# Work only on OPEN trades
+def compute_pnl(win, odds, stake):
+    return float(stake) * (float(odds) - 1.0) if win else -float(stake)
 
-# bring selection name into log if missing
-if "sel" not in to_settle.columns:
-    to_settle["sel"] = to_settle["selection"]
+for idx, r in log.iterrows():
+    status = str(r.get("status","")).lower()
+    if status == "settled":
+        continue
 
-# join to get close_odds
-merged = pd.merge(to_settle, co[["match_id","sel","close_odds"]], on=["match_id","sel"], how="left")
+    mid = str(r.get("match_id",""))
+    sel = str(r.get("selection", r.get("sel","")))
+    odds = float(r.get("odds", 0))
+    p    = float(r.get("p", 0))
+    stake = float(r.get("stake_eur", 0))
 
-# optional results
-res = pd.read_csv(args.results) if (args.results and os.path.isfile(args.results)) else pd.DataFrame()
-res_cols = [c for c in ["match_id","sel","winner","result"] if c in res.columns]
-if not res.empty and res_cols:
-    res = res.copy()
-    for c in ("match_id","sel"):
-        if c in res.columns: res[c] = res[c].astype(str)
-    merged = pd.merge(merged, res, on=[c for c in ("match_id","sel") if c in merged.columns and c in res.columns], how="left")
+    # CLV
+    close_odds = close_map.get((mid, sel), float("nan"))
+    if not pd.notna(close_odds):
+        close_odds = odds  # fallback: flat close
 
-# derive result: prefer explicit 'result' (1/0), else compare 'sel' to 'winner', else simulate by p
-def derive_result(row):
-    # explicit numeric result
-    rv = row.get("result", "")
-    if str(rv).strip() in ("0","1"):
-        return int(rv)
-    # winner name
-    if "winner" in row and isinstance(row["winner"], str) and "sel" in row and isinstance(row["sel"], str):
-        return int(row["winner"].strip() == row["sel"].strip())
-    # simulate by p if allowed
-    if args.assume_random_if_missing and "p" in row:
-        return int(np.random.random() < float(row["p"]))
-    return None  # unknown
+    clv = float(pd.np.log(close_odds / max(odds, 1e-9)))  # log(close/entry)
 
-merged["close_odds"] = merged["close_odds"].astype(float)
-merged["clv"] = np.log(merged["close_odds"]) - np.log(merged["odds"].astype(float))
-merged["derived_result"] = merged.apply(derive_result, axis=1)
-
-# PnL calc
-def pnl_row(row):
-    stake = float(row.get("stake_eur", 0.0))
-    if row.get("derived_result", None) == 1:
-        return stake * (float(row["odds"]) - 1.0)
-    elif row.get("derived_result", None) == 0:
-        return -stake
+    # Outcome
+    res = r.get("result", None)
+    if pd.isna(res) or res == "" or str(res).lower() == "nan":
+        if args.assume_random_if_missing:
+            win = random.random() < p
+        else:
+            # leave open if we can't assume result
+            continue
     else:
-        return 0.0
+        win = bool(int(res))
 
-merged["pnl"] = merged.apply(pnl_row, axis=1)
-merged["settled_ts"] = int(time.time())
-merged["status"] = np.where(merged["derived_result"].isin([0,1]), "settled", "open")
+    pnl = compute_pnl(win, odds, stake)
+    bankroll += pnl
+    log.loc[idx, "status"] = "settled"
+    log.loc[idx, "close_odds"] = float(close_odds)
+    log.loc[idx, "clv"] = float(clv)
+    log.loc[idx, "pnl"] = float(pnl)
+    log.loc[idx, "settled_ts"] = now
+    settled_any = True
 
-# write back into log (only update rows we touched)
-upd = log.copy()
-key_cols = ["ts","match_id","selection"]
-mkey = ["ts","match_id","selection"]
-if "selection" not in merged.columns and "sel" in merged.columns:
-    merged = merged.rename(columns={"sel":"selection"})
-merged = merged.set_index(mkey)
-upd = upd.set_index(mkey)
+# Persist
+log.to_csv(args.log, index=False)
+save_bankroll(bankroll)
+append_hist(now, bankroll)
 
-for col in ["close_odds","clv","pnl","settled_ts","status","derived_result"]:
-    upd.loc[merged.index, col] = merged[col]
+print(f"Settled={settled_any} | New bankroll €{bankroll:.2f}")
 
-upd = upd.reset_index()
-upd.to_csv(args.log, index=False)
-print(f"Updated trade log -> {args.log}")
-
-# update bankroll state with newly-settled PnL
-# (sum only rows we just settled)
-settled_now = merged[merged["status"] == "settled"]
-sum_pnl = float(settled_now["pnl"].sum()) if not settled_now.empty else 0.0
-
-# load state
-bankroll = 1000.0
-state = {"bankroll": bankroll}
-if os.path.isfile(state_path):
-    with open(state_path, "r") as f:
-        try:
-            state = json.load(f)
-            bankroll = float(state.get("bankroll", 1000.0))
-        except Exception:
-            pass
-
-bankroll = round(bankroll + sum_pnl, 2)
-state["bankroll"] = bankroll
-with open(state_path, "w") as f:
-    json.dump(state, f, indent=2)
-
-# append history
-hist = pd.read_csv(hist_path) if os.path.isfile(hist_path) else pd.DataFrame(columns=["ts","bankroll"])
-hist = pd.concat([hist, pd.DataFrame([{"ts": int(time.time()), "bankroll": bankroll}])], ignore_index=True)
-hist.to_csv(hist_path, index=False)
-print(f"Bankroll updated by {sum_pnl:+.2f} -> {bankroll:.2f}")
