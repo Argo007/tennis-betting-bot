@@ -38,7 +38,6 @@ env:
   CLOSE_ODDS_FILE: "close_odds.csv"
   DASHBOARD_HTML: "docs/index.html"
 
-  # expose inputs to shell and python
   INPUT_MODE: ${{ github.event.inputs.mode }}
   INPUT_MIN_EDGE: ${{ github.event.inputs.min_edge }}
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
@@ -48,6 +47,7 @@ env:
 jobs:
   engine:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,31 +69,45 @@ jobs:
       - name: Prepare folders
         run: |
           mkdir -p "${STATE_DIR}" "${DOCS_DIR}" "${SNAPSHOT_DIR}"
-          # Ensure trade log has header
           if [ ! -f "${TRADE_LOG}" ]; then
             echo "ts,match,selection,odds,edge,stake" > "${TRADE_LOG}"
           fi
 
-      - name: Generate picks (respects inputs)
+      - name: Generate picks (respects inputs; auto-detects CLI)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
           set -e
           if [ -f tennis_value_picks_pro.py ]; then
-            python tennis_value_picks_pro.py \
-              --out "${PICKS_FILE}" \
-              --state-dir "${STATE_DIR}" \
-              --min-edge "${INPUT_MIN_EDGE}" \
-              --kelly-scale "${INPUT_KELLY_SCALE}" \
-              --max-frac "${INPUT_MAX_FRAC}"
+            # Inspect help to choose correct flag set
+            if python tennis_value_picks_pro.py -h 2>&1 | grep -q -- " --kelly "; then
+              echo "::notice::Using new CLI (--kelly/--lookahead-h/--region)"
+              python tennis_value_picks_pro.py \
+                --kelly "${INPUT_KELLY_SCALE}" \
+                --lookahead-h 12 \
+                --region all \
+                --out "${PICKS_FILE}" || GEN_FAIL=1
+            else
+              echo "::notice::Using legacy CLI (--min-edge/--kelly-scale/--max-frac/--state-dir)"
+              python tennis_value_picks_pro.py \
+                --min-edge "${INPUT_MIN_EDGE}" \
+                --kelly-scale "${INPUT_KELLY_SCALE}" \
+                --max-frac "${INPUT_MAX_FRAC}" \
+                --state-dir "${STATE_DIR}" \
+                --out "${PICKS_FILE}" || GEN_FAIL=1
+            fi
           elif [ -f generate_picks.py ]; then
             python generate_picks.py \
-              --out "${PICKS_FILE}" \
-              --state-dir "${STATE_DIR}" \
               --min-edge "${INPUT_MIN_EDGE}" \
               --kelly-scale "${INPUT_KELLY_SCALE}" \
-              --max-frac "${INPUT_MAX_FRAC}"
+              --max-frac "${INPUT_MAX_FRAC}" \
+              --state-dir "${STATE_DIR}" \
+              --out "${PICKS_FILE}" || GEN_FAIL=1
           else
-            echo "No pick generator found; creating empty ${PICKS_FILE}."
+            GEN_FAIL=1
+          fi
+
+          if [ "${GEN_FAIL:-0}" = "1" ]; then
+            echo "::warning::Pick generator failed or missing; creating placeholder ${PICKS_FILE}"
             echo "ts,match,selection,odds,edge,stake" > "${PICKS_FILE}"
           fi
 
@@ -129,21 +143,16 @@ jobs:
           if not os.path.isfile(picks) or os.path.getsize(picks) == 0:
             raise SystemExit("No picks to log.")
           with open(picks, newline='') as f:
-            rdr = csv.DictReader(f)
-            rows = list(rdr)
-          if not rows:
-            raise SystemExit("No picks to log.")
+            rdr = csv.DictReader(f); rows = list(rdr)
+          if not rows: raise SystemExit("No picks to log.")
           out = []
           for r in rows:
             ts = r.get("ts") or str(int(time.time()))
-            stake = r.get("stake")
-            try:
-              stake = min(float(stake) if stake not in (None, "") else max_stake, max_stake)
-            except Exception:
-              stake = max_stake
+            try: stake = min(float(r.get("stake") or max_stake), max_stake)
+            except Exception: stake = max_stake
             out.append([ts, r.get("match",""), r.get("selection",""), r.get("odds",""), r.get("edge",""), f"{stake:.2f}"])
           with open(log, "a", newline='') as f:
-            w = csv.writer(f); [w.writerow(r) for r in out]
+            w = csv.writer(f); w.writerows(out)
           print(f"Appended {len(out)} rows to {log}")
           PY
 
