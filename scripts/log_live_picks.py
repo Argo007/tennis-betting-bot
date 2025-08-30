@@ -1,83 +1,177 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Log live picks to state/trade_log.csv with Kelly sizing + caps.
-Skips duplicates by (match_id, selection).
+Append today's live picks to state/trade_log.csv with calculated stakes.
+
+Accepted flags (both hyphen and underscore styles work):
+  --picks <CSV>                 input picks CSV (match_id, sel, odds, p[, edge])
+  --state-dir <DIR>             state folder (default: state)
+  --kelly                       enable Kelly sizing (default: True)
+  --kelly-scale <float>         scale Kelly fraction (e.g., 0.5)
+  --max-frac <float>            max fraction of bankroll per bet (e.g., 0.05)
+  --abs-cap <float>             absolute € cap per bet (e.g., 200)
+  --assume-random-if-missing    if picks missing/empty, exit 0 quietly
+
+Workflow expectation:
+- Reads state/bankroll.json {"bankroll": <float>} if present; else assumes 1000.
+- Appends rows to state/trade_log.csv with columns:
+  ts,match_id,selection,odds,p,edge,stake_eur,bankroll_snapshot
 """
-import os, argparse, time, json
+
+import argparse
+import json
+import os
+from datetime import datetime, timezone
 import pandas as pd
+import sys
+from typing import Optional
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--picks", required=True)
-ap.add_argument("--state-dir", default="state")
-ap.add_argument("--kelly", type=float, default=float(os.getenv("KELLY_SCALE","0.5")))
-ap.add_argument("--stake-cap", type=float, default=float(os.getenv("STAKE_CAP","0.05")))
-ap.add_argument("--max-stake-eur", type=float, default=float(os.getenv("MAX_STAKE_EUR","200")))
-args = ap.parse_args()
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--picks", required=True, help="Input picks CSV")
+    p.add_argument("--state-dir", "--state_dir", dest="state_dir", default="state")
+    # sizing controls
+    p.add_argument("--kelly", action="store_true", default=True, help="Use Kelly sizing")
+    p.add_argument("--no-kelly", dest="kelly", action="store_false", help="Disable Kelly sizing")
+    p.add_argument("--kelly-scale", "--kelly_scale", dest="kelly_scale", type=float, default=0.5)
+    p.add_argument("--max-frac", "--max_frac", dest="max_frac", type=float, default=0.05)
+    p.add_argument("--abs-cap", "--abs_cap", dest="abs_cap", type=float, default=200.0)
+    p.add_argument("--assume-random-if-missing", "--assume_random_if_missing",
+                   dest="assume_random_if_missing", type=lambda s: str(s).lower() in ("1","true","yes"),
+                   default=False)
+    return p.parse_args()
 
-os.makedirs(args.state_dir, exist_ok=True)
-log_path  = os.path.join(args.state_dir, "trade_log.csv")
-bank_path = os.path.join(args.state_dir, "bankroll.json")
-
-def load_bankroll():
-    if os.path.isfile(bank_path):
-        try: return float(json.load(open(bank_path))["bankroll"])
-        except Exception: pass
+def read_bankroll(state_dir: str) -> float:
+    bk_path = os.path.join(state_dir, "bankroll.json")
+    if os.path.isfile(bk_path):
+        try:
+            with open(bk_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            b = float(data.get("bankroll", 1000.0))
+            return max(b, 0.0)
+        except Exception:
+            return 1000.0
     return 1000.0
 
-def save_bankroll(v: float):
-    with open(bank_path, "w") as f: json.dump({"bankroll": float(v)}, f)
+def coerce_prob(x) -> Optional[float]:
+    if pd.isna(x):
+        return None
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    if v > 1.0:
+        v = v / 100.0
+    if v < 0 or v > 1:
+        return None
+    return v
 
 def kelly_fraction(p: float, odds: float) -> float:
-    b = max(float(odds)-1.0, 1e-9); q = 1.0 - float(p)
-    f = (b*float(p) - q) / b
-    return max(0.0, f)
+    # Decimal odds Kelly: f* = (p*(o-1) - (1-p)) / (o-1)
+    b = max(odds - 1.0, 0.0)
+    if b <= 0:
+        return 0.0
+    return (p * b - (1 - p)) / b
 
-picks = pd.read_csv(args.picks)
-if "selection" not in picks.columns and "sel" in picks.columns:
-    picks = picks.rename(columns={"sel":"selection"})
-need = {"match_id","selection","odds"}
-miss = need - set(picks.columns)
-if miss: raise SystemExit(f"{args.picks} missing {sorted(miss)}")
-if "p" not in picks.columns:
-    picks["p"] = 1.0 / picks["odds"].clip(lower=1e-9)
-if "edge" not in picks.columns:
-    picks["edge"] = picks["p"] - 1.0 / picks["odds"].clip(lower=1e-9)
+def main():
+    args = parse_args()
+    os.makedirs(args.state_dir, exist_ok=True)
 
-existing = pd.read_csv(log_path) if os.path.isfile(log_path) else pd.DataFrame()
-if not existing.empty and "selection" not in existing.columns and "sel" in existing.columns:
-    existing = existing.rename(columns={"sel":"selection"})
-existing_uids = set()
-if not existing.empty:
-    for _, r in existing.iterrows():
-        existing_uids.add(f"{r.get('match_id','')}::{r.get('selection','')}")
+    # Load picks
+    if not os.path.isfile(args.picks):
+        if args.assume_random_if_missing:
+            print("No picks file; assuming none. Nothing to log.")
+            return 0
+        print(f"ERROR: picks file not found: {args.picks}", file=sys.stderr)
+        return 2
 
-bankroll = load_bankroll()
-ts = int(time.time())
-rows, skipped = [], 0
+    df = pd.read_csv(args.picks)
+    if df.empty:
+        if args.assume_random_if_missing:
+            print("Empty picks; nothing to log.")
+            return 0
+        print("Empty picks; nothing to log.")
+        return 0
 
-for _, r in picks.iterrows():
-    mid, sel, odds = r["match_id"], r["selection"], float(r["odds"])
-    p, edge = float(r["p"]), float(r["edge"])
-    uid = f"{mid}::{sel}"
-    if uid in existing_uids: 
-        skipped += 1; continue
-    f_star = kelly_fraction(p, odds) * float(args.kelly)
-    stake = min(f_star*bankroll, args.stake_cap*bankroll, args.max_stake_eur)
-    stake = max(0.0, round(stake, 2))
-    if stake <= 0: 
-        skipped += 1; continue
-    rows.append({
-        "ts": ts, "match_id": mid, "selection": sel,
-        "odds": float(odds), "p": float(p), "edge": float(edge),
-        "stake_eur": float(stake), "status": "open",
-        "bankroll_snapshot": float(bankroll),
+    # Map columns flexibly
+    cols = {c.lower(): c for c in df.columns}
+    def get_col(*cands):
+        for c in cands:
+            if c in cols: return cols[c]
+        return None
+
+    col_match = get_col("match_id","match","id")
+    col_sel   = get_col("sel","selection","pick")
+    col_odds  = get_col("odds","price")
+    col_p     = get_col("p","prob","probability")
+    col_edge  = get_col("edge")
+
+    required_missing = [name for name,val in
+                        [("match_id",col_match),("sel",col_sel),("odds",col_odds)]
+                        if val is None]
+    if required_missing:
+        print(f"ERROR: picks is missing required columns: {required_missing}", file=sys.stderr)
+        return 2
+
+    out = pd.DataFrame({
+        "match_id": df[col_match].astype(str),
+        "selection": df[col_sel].astype(str),
+        "odds": pd.to_numeric(df[col_odds], errors="coerce"),
     })
 
-if not rows:
-    print(f"Nothing to log (skipped={skipped})."); raise SystemExit(0)
+    if col_p:
+        out["p"] = df[col_p].apply(coerce_prob)
+    else:
+        out["p"] = None
 
-log = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True) if not existing.empty else pd.DataFrame(rows)
-log.to_csv(log_path, index=False)
-print(f"Logged {len(rows)} trades (skipped {skipped}) -> {log_path} @ bankroll €{bankroll:.2f}")
-if not os.path.isfile(bank_path): save_bankroll(bankroll)
+    if col_edge:
+        out["edge"] = pd.to_numeric(df[col_edge], errors="coerce")
+    else:
+        # compute if possible
+        out["edge"] = out.apply(
+            lambda r: (r["p"] * r["odds"] - 1.0) if pd.notna(r["p"]) and pd.notna(r["odds"]) else None,
+            axis=1
+        )
+
+    out = out.dropna(subset=["odds"]).copy()
+    if out.empty:
+        print("No valid rows to log.")
+        return 0
+
+    # bankroll & stake sizing
+    bankroll = read_bankroll(args.state_dir)
+    max_frac = max(float(args.max_frac), 0.0)
+    abs_cap  = max(float(args.abs_cap), 0.0)
+    kscale   = max(float(args.kelly_scale), 0.0)
+
+    def sized_stake(row):
+        # default flat €0 if no p/edge
+        if not args.kelly or pd.isna(row.get("p")) or pd.isna(row.get("odds")):
+            return 0.0
+        f = kelly_fraction(row["p"], row["odds"])
+        f = max(0.0, f) * kscale
+        # clamp
+        f = min(f, max_frac) if max_frac > 0 else f
+        stake = bankroll * f
+        if abs_cap > 0:
+            stake = min(stake, abs_cap)
+        # nice rounding for reporting
+        return round(stake, 2)
+
+    out["stake_eur"] = out.apply(sized_stake, axis=1)
+    out["bankroll_snapshot"] = bankroll
+    out["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    # Order for log
+    out = out[["ts","match_id","selection","odds","p","edge","stake_eur","bankroll_snapshot"]]
+
+    # Append to state/trade_log.csv
+    log_path = os.path.join(args.state_dir, "trade_log.csv")
+    header = not os.path.isfile(log_path)
+    out.to_csv(log_path, mode="a", header=header, index=False)
+    print(f"Appended {len(out)} rows to {log_path}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
