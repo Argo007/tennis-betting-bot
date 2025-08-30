@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: "all"
-        options: [all, live]
+        options: ["all", "live"]
       min_edge:
         description: "edge threshold (e.g., 0.05)"
         required: true
@@ -26,7 +26,7 @@ on:
         type: choice
         required: true
         default: "false"
-        options: [false, true]
+        options: ["false", "true"]
 
 env:
   PYTHON_VERSION: "3.11"
@@ -38,6 +38,7 @@ env:
   CLOSE_ODDS_FILE: "close_odds.csv"
   DASHBOARD_HTML: "docs/index.html"
 
+  # Inputs (always strings from workflow_dispatch)
   INPUT_MODE: ${{ github.event.inputs.mode }}
   INPUT_MIN_EDGE: ${{ github.event.inputs.min_edge }}
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
@@ -78,12 +79,26 @@ jobs:
           GEN_FAIL=0
           if [ -f tennis_value_picks_pro.py ]; then
             if python tennis_value_picks_pro.py -h 2>&1 | grep -q " --kelly "; then
-              python tennis_value_picks_pro.py --kelly "${INPUT_KELLY_SCALE}" --lookahead-h 12 --region all --out "${PICKS_FILE}" || GEN_FAIL=1
+              python tennis_value_picks_pro.py \
+                --kelly "${INPUT_KELLY_SCALE}" \
+                --lookahead-h 12 \
+                --region all \
+                --out "${PICKS_FILE}" || GEN_FAIL=1
             else
-              python tennis_value_picks_pro.py --min-edge "${INPUT_MIN_EDGE}" --kelly-scale "${INPUT_KELLY_SCALE}" --max-frac "${INPUT_MAX_FRAC}" --state-dir "${STATE_DIR}" --out "${PICKS_FILE}" || GEN_FAIL=1
+              python tennis_value_picks_pro.py \
+                --min-edge "${INPUT_MIN_EDGE}" \
+                --kelly-scale "${INPUT_KELLY_SCALE}" \
+                --max-frac "${INPUT_MAX_FRAC}" \
+                --state-dir "${STATE_DIR}" \
+                --out "${PICKS_FILE}" || GEN_FAIL=1
             fi
           elif [ -f generate_picks.py ]; then
-            python generate_picks.py --min-edge "${INPUT_MIN_EDGE}" --kelly-scale "${INPUT_KELLY_SCALE}" --max-frac "${INPUT_MAX_FRAC}" --state-dir "${STATE_DIR}" --out "${PICKS_FILE}" || GEN_FAIL=1
+            python generate_picks.py \
+              --min-edge "${INPUT_MIN_EDGE}" \
+              --kelly-scale "${INPUT_KELLY_SCALE}" \
+              --max-frac "${INPUT_MAX_FRAC}" \
+              --state-dir "${STATE_DIR}" \
+              --out "${PICKS_FILE}" || GEN_FAIL=1
           else
             GEN_FAIL=1
           fi
@@ -147,7 +162,11 @@ jobs:
       - name: Settle trades (PnL + CLV; update bankroll)
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ] && [ -f settle_trades.py ]; then
-            python settle_trades.py --log "${STATE_DIR}/trade_log.csv" --state-dir "${STATE_DIR}" --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" --out "${STATE_DIR}/settled_trades.csv"
+            python settle_trades.py \
+              --log "${STATE_DIR}/trade_log.csv" \
+              --state-dir "${STATE_DIR}" \
+              --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" \
+              --out "${STATE_DIR}/settled_trades.csv"
           else
             echo "No trade_log or settle_trades.py; skipping real settlement."
           fi
@@ -187,3 +206,4 @@ jobs:
             git commit -m "tennis_engine: update state and dashboard [skip ci]"
             git push
           fi
+
