@@ -24,7 +24,7 @@ on:
         required: false
         default: "true"
   schedule:
-    - cron: "5,25,45 * * * *"
+    - cron: "5,25,45 * * * *"  # every 20 min
 
 jobs:
   engine:
@@ -60,7 +60,9 @@ jobs:
       - name: Fetch live odds
         run: |
           python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv"
-          python scripts/fetch_live_odds.py --out "${LIVE_OUTDIR}/live_odds.csv"
+          python scripts/fetch_live_odds.py \
+            --matches "${LIVE_OUTDIR}/live_matches.csv" \
+            --out "${LIVE_OUTDIR}/live_odds.csv"
 
       - name: Generate live value picks
         run: |
