@@ -23,10 +23,11 @@ on:
         description: 'Inline results (e.g., "L002=1,L003=0") — optional'
         required: false
         default: ""
+  # Every 20 minutes from 06:00–23:59 UTC. Adjust as needed.
   schedule:
-    # every 20 minutes between 06:00–23:59 UTC
     - cron: "*/20 6-23 * * *"
 
+# prevent overlaps
 concurrency:
   group: tennis-engine-live
   cancel-in-progress: true
@@ -43,6 +44,7 @@ env:
 jobs:
   engine:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,7 +79,7 @@ jobs:
           python scripts/tennis_value_picks_live.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
             --out "${LIVE_OUTDIR}/picks_live.csv" \
-            --edge "${{ github.event.inputs.min_edge || '0.05' }}"
+            --min-edge "${{ github.event.inputs.min_edge || '0.05' }}"
 
       - name: Log live picks (append to state/trade_log.csv)
         run: |
