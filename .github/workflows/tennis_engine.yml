@@ -1,6 +1,6 @@
 name: Tennis Engine LIVE (Manual Only)
 
-# ✅ give the job the rights it needs
+# Ensure the token can write. You ALSO must enable this in repo Settings → Actions → Workflow permissions.
 permissions:
   contents: write
   pull-requests: write
@@ -58,8 +58,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # token is GITHUB_TOKEN by default; keep creds for PR commit
           persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -89,26 +89,12 @@ jobs:
           GEN_FAIL=0
           if [ -f tennis_value_picks_pro.py ]; then
             if python tennis_value_picks_pro.py -h 2>&1 | grep -q " --kelly "; then
-              python tennis_value_picks_pro.py \
-                --kelly "${INPUT_KELLY_SCALE}" \
-                --lookahead-h 12 \
-                --region all \
-                --out "${PICKS_FILE}" || GEN_FAIL=1
+              python tennis_value_picks_pro.py --kelly "${INPUT_KELLY_SCALE}" --lookahead-h 12 --region all --out "${PICKS_FILE}" || GEN_FAIL=1
             else
-              python tennis_value_picks_pro.py \
-                --min-edge "${INPUT_MIN_EDGE}" \
-                --kelly-scale "${INPUT_KELLY_SCALE}" \
-                --max-frac "${INPUT_MAX_FRAC}" \
-                --state-dir "${STATE_DIR}" \
-                --out "${PICKS_FILE}" || GEN_FAIL=1
+              python tennis_value_picks_pro.py --min-edge "${INPUT_MIN_EDGE}" --kelly-scale "${INPUT_KELLY_SCALE}" --max-frac "${INPUT_MAX_FRAC}" --state-dir "${STATE_DIR}" --out "${PICKS_FILE}" || GEN_FAIL=1
             fi
           elif [ -f generate_picks.py ]; then
-            python generate_picks.py \
-              --min-edge "${INPUT_MIN_EDGE}" \
-              --kelly-scale "${INPUT_KELLY_SCALE}" \
-              --max-frac "${INPUT_MAX_FRAC}" \
-              --state-dir "${STATE_DIR}" \
-              --out "${PICKS_FILE}" || GEN_FAIL=1
+            python generate_picks.py --min-edge "${INPUT_MIN_EDGE}" --kelly-scale "${INPUT_KELLY_SCALE}" --max-frac "${INPUT_MAX_FRAC}" --state-dir "${STATE_DIR}" --out "${PICKS_FILE}" || GEN_FAIL=1
           else
             GEN_FAIL=1
           fi
@@ -205,7 +191,6 @@ jobs:
           python "$TMP"
           rm -f "$TMP"
 
-      # ------- Save results as artifact no matter what -------
       - name: Upload state + dashboard artifact
         uses: actions/upload-artifact@v4
         with:
@@ -217,9 +202,27 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # ------- Prefer PR over direct push (works with branch protection) -------
+      - name: Detect changes
+        id: diff
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit changes
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "tennis_engine: update state and dashboard [skip ci]"
+
       - name: Create PR with updated state + docs
+        if: steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
+        continue-on-error: true   # Don't fail the whole run if repo settings block PRs
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "tennis_engine: update state and dashboard [skip ci]"
@@ -230,6 +233,7 @@ jobs:
             - Dashboard: `docs/index.html`
             - Picks: `picks_live.csv`
           branch: bot/engine-state
+          branch-suffix: timestamp
           delete-branch: true
           add-paths: |
             .state/**
