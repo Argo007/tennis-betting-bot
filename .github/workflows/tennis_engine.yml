@@ -1,6 +1,5 @@
 name: Tennis Engine LIVE (Manual Only)
 
-# Ensure the token can write. You ALSO must enable this in repo Settings → Actions → Workflow permissions.
 permissions:
   contents: write
   pull-requests: write
@@ -32,6 +31,12 @@ on:
         required: true
         default: "false"
         options: ["false", "true"]
+      use_pr:
+        description: "attempt to open a PR with changes (requires repo setting or PAT)"
+        type: choice
+        required: true
+        default: "false"
+        options: ["false", "true"]
 
 env:
   PYTHON_VERSION: "3.11"
@@ -48,6 +53,7 @@ env:
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
   INPUT_MAX_FRAC: ${{ github.event.inputs.max_frac }}
   INPUT_ASSUME_RANDOM: ${{ github.event.inputs.assume_random_if_missing }}
+  INPUT_USE_PR: ${{ github.event.inputs.use_pr }}
 
 jobs:
   engine:
@@ -158,11 +164,7 @@ jobs:
       - name: Settle trades (PnL + CLV; update bankroll)
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ] && [ -f settle_trades.py ]; then
-            python settle_trades.py \
-              --log "${STATE_DIR}/trade_log.csv" \
-              --state-dir "${STATE_DIR}" \
-              --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" \
-              --out "${STATE_DIR}/settled_trades.csv"
+            python settle_trades.py --log "${STATE_DIR}/trade_log.csv" --state-dir "${STATE_DIR}" --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" --out "${STATE_DIR}/settled_trades.csv"
           else
             echo "No trade_log or settle_trades.py; skipping real settlement."
           fi
@@ -191,17 +193,7 @@ jobs:
           python "$TMP"
           rm -f "$TMP"
 
-      - name: Upload state + dashboard artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: engine-state-and-dashboard
-          path: |
-            .state/**
-            docs/**
-            picks_live.csv
-          if-no-files-found: warn
-          retention-days: 14
-
+      # ---------- Commit/PR outputs (no artifacts anymore) ----------
       - name: Detect changes
         id: diff
         run: |
@@ -212,6 +204,15 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set push token
+        id: tok
+        run: |
+          if [ -n "${{ secrets.ACTIONS_PAT }}" ]; then
+            echo "token=${{ secrets.ACTIONS_PAT }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Commit changes
         if: steps.diff.outputs.changed == 'true'
         run: |
@@ -219,12 +220,21 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "tennis_engine: update state and dashboard [skip ci]"
 
-      - name: Create PR with updated state + docs
+      - name: Push to bot branch (fallback path)
         if: steps.diff.outputs.changed == 'true'
+        env:
+          PUSH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          BR="bot/engine-state-$(date -u +%Y%m%dT%H%M%SZ)"
+          git checkout -b "$BR"
+          git push "https://${PUSH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:"$BR" || echo "::warning::Push blocked by policy."
+
+      - name: Create PR (optional)
+        if: steps.diff.outputs.changed == 'true' && env.INPUT_USE_PR == 'true'
         uses: peter-evans/create-pull-request@v6
-        continue-on-error: true   # Don't fail the whole run if repo settings block PRs
+        continue-on-error: true
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.tok.outputs.token }}
           commit-message: "tennis_engine: update state and dashboard [skip ci]"
           title: "engine: update state and dashboard"
           body: |
@@ -233,7 +243,7 @@ jobs:
             - Dashboard: `docs/index.html`
             - Picks: `picks_live.csv`
           branch: bot/engine-state
-          branch-suffix: timestamp
+          branch-suffix: short-commit-hash
           delete-branch: true
           add-paths: |
             .state/**
