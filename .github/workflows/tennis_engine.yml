@@ -69,44 +69,25 @@ jobs:
       - name: Prepare folders
         run: |
           mkdir -p "${STATE_DIR}" "${DOCS_DIR}" "${SNAPSHOT_DIR}"
-          if [ ! -f "${TRADE_LOG}" ]; then
-            echo "ts,match,selection,odds,edge,stake" > "${TRADE_LOG}"
-          fi
+          [ -f "${TRADE_LOG}" ] || echo "ts,match,selection,odds,edge,stake" > "${TRADE_LOG}"
 
       - name: Generate picks (respects inputs; auto-detects CLI)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
           set -e
+          GEN_FAIL=0
           if [ -f tennis_value_picks_pro.py ]; then
-            # Inspect help to choose correct flag set
-            if python tennis_value_picks_pro.py -h 2>&1 | grep -q -- " --kelly "; then
-              echo "::notice::Using new CLI (--kelly/--lookahead-h/--region)"
-              python tennis_value_picks_pro.py \
-                --kelly "${INPUT_KELLY_SCALE}" \
-                --lookahead-h 12 \
-                --region all \
-                --out "${PICKS_FILE}" || GEN_FAIL=1
+            if python tennis_value_picks_pro.py -h 2>&1 | grep -q " --kelly "; then
+              python tennis_value_picks_pro.py --kelly "${INPUT_KELLY_SCALE}" --lookahead-h 12 --region all --out "${PICKS_FILE}" || GEN_FAIL=1
             else
-              echo "::notice::Using legacy CLI (--min-edge/--kelly-scale/--max-frac/--state-dir)"
-              python tennis_value_picks_pro.py \
-                --min-edge "${INPUT_MIN_EDGE}" \
-                --kelly-scale "${INPUT_KELLY_SCALE}" \
-                --max-frac "${INPUT_MAX_FRAC}" \
-                --state-dir "${STATE_DIR}" \
-                --out "${PICKS_FILE}" || GEN_FAIL=1
+              python tennis_value_picks_pro.py --min-edge "${INPUT_MIN_EDGE}" --kelly-scale "${INPUT_KELLY_SCALE}" --max-frac "${INPUT_MAX_FRAC}" --state-dir "${STATE_DIR}" --out "${PICKS_FILE}" || GEN_FAIL=1
             fi
           elif [ -f generate_picks.py ]; then
-            python generate_picks.py \
-              --min-edge "${INPUT_MIN_EDGE}" \
-              --kelly-scale "${INPUT_KELLY_SCALE}" \
-              --max-frac "${INPUT_MAX_FRAC}" \
-              --state-dir "${STATE_DIR}" \
-              --out "${PICKS_FILE}" || GEN_FAIL=1
+            python generate_picks.py --min-edge "${INPUT_MIN_EDGE}" --kelly-scale "${INPUT_KELLY_SCALE}" --max-frac "${INPUT_MAX_FRAC}" --state-dir "${STATE_DIR}" --out "${PICKS_FILE}" || GEN_FAIL=1
           else
             GEN_FAIL=1
           fi
-
-          if [ "${GEN_FAIL:-0}" = "1" ]; then
+          if [ "$GEN_FAIL" = "1" ]; then
             echo "::warning::Pick generator failed or missing; creating placeholder ${PICKS_FILE}"
             echo "ts,match,selection,odds,edge,stake" > "${PICKS_FILE}"
           fi
@@ -114,47 +95,44 @@ jobs:
       - name: Compute MAX_STAKE_EUR from bankroll and input max_frac
         id: bankroll
         run: |
-          python - <<'PY'
-          import os, json
-          state_dir = os.environ["STATE_DIR"]
-          max_frac = float(os.environ["INPUT_MAX_FRAC"])
-          bankp = os.path.join(state_dir, "bankroll.json")
-          bankroll = 1000.0
-          if os.path.isfile(bankp):
-            try:
-              bankroll = float(json.load(open(bankp)).get("bankroll", bankroll))
-            except Exception:
-              pass
-          max_stake = round(bankroll * max_frac, 2)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"max_stake={max_stake}\n")
-          print(f"Bankroll={bankroll}  max_frac={max_frac}  MAX_STAKE_EUR={max_stake}")
-          PY
+          TMP=/tmp/compute_bankroll.py
+          : > "$TMP"
+          echo "import os, json, pathlib" >> "$TMP"
+          echo "state = os.environ['STATE_DIR']" >> "$TMP"
+          echo "max_frac = float(os.environ['INPUT_MAX_FRAC'])" >> "$TMP"
+          echo "p = pathlib.Path(state) / 'bankroll.json'" >> "$TMP"
+          echo "bankroll = 1000.0" >> "$TMP"
+          echo "if p.is_file():" >> "$TMP"
+          echo "  try: bankroll = float(json.load(open(p)).get('bankroll', bankroll))" >> "$TMP"
+          echo "  except Exception: pass" >> "$TMP"
+          echo "max_stake = round(bankroll * max_frac, 2)" >> "$TMP"
+          echo "open(os.environ['GITHUB_OUTPUT'],'a').write(f'max_stake={max_stake}\\n')" >> "$TMP"
+          echo "print(f'Bankroll={bankroll} max_frac={max_frac} MAX_STAKE_EUR={max_stake}')" >> "$TMP"
+          python "$TMP"
+          rm -f "$TMP"
 
       - name: Log live picks (append to state/trade_log.csv)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
-          set -e
-          python - <<'PY'
-          import os, csv, time
-          picks = os.environ["PICKS_FILE"]
-          log = os.environ["TRADE_LOG"]
-          max_stake = float("${{ steps.bankroll.outputs.max_stake }}")
-          if not os.path.isfile(picks) or os.path.getsize(picks) == 0:
-            raise SystemExit("No picks to log.")
-          with open(picks, newline='') as f:
-            rdr = csv.DictReader(f); rows = list(rdr)
-          if not rows: raise SystemExit("No picks to log.")
-          out = []
-          for r in rows:
-            ts = r.get("ts") or str(int(time.time()))
-            try: stake = min(float(r.get("stake") or max_stake), max_stake)
-            except Exception: stake = max_stake
-            out.append([ts, r.get("match",""), r.get("selection",""), r.get("odds",""), r.get("edge",""), f"{stake:.2f}"])
-          with open(log, "a", newline='') as f:
-            w = csv.writer(f); w.writerows(out)
-          print(f"Appended {len(out)} rows to {log}")
-          PY
+          TMP=/tmp/log_picks.py
+          : > "$TMP"
+          echo "import os,csv,time,pathlib,sys" >> "$TMP"
+          echo "picks=os.environ['PICKS_FILE']; log=os.environ['TRADE_LOG']; max_stake=float('${{ steps.bankroll.outputs.max_stake }}')" >> "$TMP"
+          echo "p=pathlib.Path(picks)" >> "$TMP"
+          echo "if (not p.is_file()) or p.stat().st_size==0: sys.exit(0)" >> "$TMP"
+          echo "rows=list(csv.DictReader(open(picks)))" >> "$TMP"
+          echo "if not rows: sys.exit(0)" >> "$TMP"
+          echo "out=[]" >> "$TMP"
+          echo "for r in rows:" >> "$TMP"
+          echo "  ts=r.get('ts') or str(int(time.time()))" >> "$TMP"
+          echo "  try: st=min(float(r.get('stake') or max_stake), max_stake)" >> "$TMP"
+          echo "  except: st=max_stake" >> "$TMP"
+          echo "  out.append([ts,r.get('match',''),r.get('selection',''),r.get('odds',''),r.get('edge',''),f'{st:.2f}'])" >> "$TMP"
+          echo "w=csv.writer(open(log,'a',newline=''))" >> "$TMP"
+          echo "w.writerows(out)" >> "$TMP"
+          echo "print(f'Appended {len(out)} rows to {log}')" >> "$TMP"
+          python "$TMP"
+          rm -f "$TMP"
 
       - name: Snapshot close odds (for CLV)
         run: |
@@ -168,18 +146,10 @@ jobs:
 
       - name: Settle trades (PnL + CLV; update bankroll)
         run: |
-          if [ -f "${STATE_DIR}/trade_log.csv" ]; then
-            if [ -f settle_trades.py ]; then
-              python settle_trades.py \
-                --log "${STATE_DIR}/trade_log.csv" \
-                --state-dir "${STATE_DIR}" \
-                --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" \
-                --out "${STATE_DIR}/settled_trades.csv"
-            else
-              echo "settle_trades.py missing; skipping real settlement."
-            fi
+          if [ -f "${STATE_DIR}/trade_log.csv" ] && [ -f settle_trades.py ]; then
+            python settle_trades.py --log "${STATE_DIR}/trade_log.csv" --state-dir "${STATE_DIR}" --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" --out "${STATE_DIR}/settled_trades.csv"
           else
-            echo "No trade_log.csv; nothing to settle."
+            echo "No trade_log or settle_trades.py; skipping real settlement."
           fi
 
       - name: Build dashboard
@@ -187,25 +157,24 @@ jobs:
           if [ -f make_dashboard.py ]; then
             python make_dashboard.py --state-dir "${STATE_DIR}" --out "${DASHBOARD_HTML}"
           else
-            cat > "${DASHBOARD_HTML}" <<HTML
-            <!doctype html><meta charset="utf-8"><title>Tennis Engine</title>
-            <h1>Tennis Engine</h1><p>Dashboard generator not found; placeholder page.</p>
-            HTML
+            echo '<!doctype html><meta charset="utf-8"><title>Tennis Engine</title><h1>Tennis Engine</h1><p>Dashboard generator not found; placeholder page.</p>' > "${DASHBOARD_HTML}"
+            echo "Wrote placeholder dashboard."
           fi
 
       - name: Print summary table (last 20 trades)
         run: |
-          python - <<'PY'
-          import os, csv
-          from tabulate import tabulate
-          p = os.environ["TRADE_LOG"]
-          if not os.path.isfile(p) or os.path.getsize(p)==0:
-            print("No trades logged."); raise SystemExit(0)
-          with open(p) as f:
-            rows = list(csv.DictReader(f))
-          rows = rows[-20:]
-          print(tabulate(rows, headers="keys", tablefmt="github"))
-          PY
+          TMP=/tmp/print_table.py
+          : > "$TMP"
+          echo "import os,csv,pathlib,sys" >> "$TMP"
+          echo "p=os.environ['TRADE_LOG']" >> "$TMP"
+          echo "P=pathlib.Path(p)" >> "$TMP"
+          echo "if (not P.is_file()) or P.stat().st_size==0: print('No trades logged.'); sys.exit(0)" >> "$TMP"
+          echo "rows=list(csv.DictReader(open(p)))" >> "$TMP"
+          echo "rows=rows[-20:]" >> "$TMP"
+          echo "from tabulate import tabulate" >> "$TMP"
+          echo "print(tabulate(rows, headers='keys', tablefmt='github'))" >> "$TMP"
+          python "$TMP"
+          rm -f "$TMP"
 
       - name: Auto-commit state + docs
         run: |
