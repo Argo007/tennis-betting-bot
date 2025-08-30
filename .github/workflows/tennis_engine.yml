@@ -43,8 +43,8 @@ on:
         default: "1"
 
   schedule:
-    - cron: "0 */6 * * *"      # backtest lane every 6h
-    - cron: "*/30 * * * *"     # live lane every 30m
+    - cron: "0 */6 * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: write
@@ -56,12 +56,10 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.10"
-  # Default folders
   OUTDIR: results
   LIVE_OUTDIR: live_results
   STATE_DIR: state
   DOCS_DIR: docs
-  # Default knobs (used when schedule triggers; dispatch can override)
   MIN_EDGE: "0.08"
   KELLY_SCALE: "0.5"
   BANKROLL: "1000"
@@ -101,7 +99,7 @@ jobs:
         run: |
           mkdir -p "${OUTDIR}" "${LIVE_OUTDIR}" "${STATE_DIR}" "${DOCS_DIR}"
 
-      # Resolve workflow-dispatch inputs into env for later steps (cannot do this in job.env)
+      # Resolve inputs → env for this run
       - name: Resolve inputs -> env
         run: |
           echo "MODE=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || 'all' }}" >> "$GITHUB_ENV"
@@ -162,6 +160,14 @@ jobs:
         run: |
           python scripts/tennis_value_picks_live.py \
             --odds "${LIVE_OUTDIR}/live_odds.csv" \
+            --outdir "${LIVE_OUTDIR}" \
+            --min-edge "${MIN_EDGE}" || true
+
+      # >>>> Fallback to guarantee picks when empty <<<<
+      - name: Fallback — create synthetic live picks when none
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'backtest' }}
+        run: |
+          python scripts/fill_with_synthetic_live.py \
             --outdir "${LIVE_OUTDIR}" \
             --min-edge "${MIN_EDGE}" || true
 
