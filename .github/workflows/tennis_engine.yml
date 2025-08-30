@@ -127,9 +127,7 @@ jobs:
           import os, csv, time, pathlib, sys
           picks = os.environ['PICKS_FILE']
           log = os.environ['TRADE_LOG']
-          ms = float(os.environ.get('MAX_STAKE','0') or '0')
-          # If MAX_STAKE wasn't exported, read from step output env
-          ms = float(os.environ.get('max_stake', os.environ.get('MAX_STAKE','0')) or '0') or float("${{ steps.bankroll.outputs.max_stake }}")
+          ms = float("${{ steps.bankroll.outputs.max_stake }}")
           p = pathlib.Path(picks)
           if (not p.is_file()) or p.stat().st_size == 0:
               sys.exit(0)
@@ -175,22 +173,79 @@ jobs:
             echo '<!doctype html><meta charset="utf-8"><title>Tennis Engine</title><h1>Tennis Engine</h1><p>Placeholder dashboard.</p>' > "${DASHBOARD_HTML}"
           fi
 
-      - name: Print summary (last 20 trades)
+      - name: Results summary (visible in this Actions run)
         run: |
           python - <<'PY'
-          import os, csv, pathlib, sys
-          p = os.environ['TRADE_LOG']
-          P = pathlib.Path(p)
-          if (not P.is_file()) or P.stat().st_size == 0:
-              print("No trades logged."); sys.exit(0)
-          rows = list(csv.DictReader(open(p)))[-20:]
-          try:
-              from tabulate import tabulate
-              print(tabulate(rows, headers='keys', tablefmt='github'))
-          except Exception:
-              # simple fallback
-              for r in rows: print(r)
+          import os, csv, pathlib, json
+          from datetime import datetime
+
+          sd = os.environ['STATE_DIR']
+          picks = os.environ['PICKS_FILE']
+          log = os.path.join(sd, 'trade_log.csv')
+          settled = os.path.join(sd, 'settled_trades.csv')
+          bankp = os.path.join(sd, 'bankroll.json')
+          dashboard = os.environ['DASHBOARD_HTML']
+
+          def head(path, limit, fields=None):
+            if not os.path.isfile(path) or os.path.getsize(path)==0:
+              return []
+            with open(path, newline='') as f:
+              rows = list(csv.DictReader(f))
+            if fields:
+              rows = [{k:r.get(k,'')} for r in rows[-limit:] for k in [None]][::0]  # placeholder, replaced below
+            return rows[-limit:]
+
+          def md_table(rows, columns):
+            if not rows: return "_(none)_\n"
+            out = []
+            out.append("| " + " | ".join(columns) + " |")
+            out.append("|" + "|".join(["---"]*len(columns)) + "|")
+            for r in rows:
+              out.append("| " + " | ".join(str(r.get(c,'')) for c in columns) + " |")
+            return "\n".join(out) + "\n"
+
+          # Load bankroll if present
+          bankroll = None
+          if os.path.isfile(bankp):
+            try:
+              bankroll = float(json.load(open(bankp)).get("bankroll"))
+            except Exception:
+              pass
+
+          now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+          picks_rows = head(picks, 15)
+          log_rows = head(log, 20)
+          settled_rows = head(settled, 20)
+
+          # Choose columns for nice display if headers exist
+          def cols(rows, fallback):
+            return fallback if not rows else list(rows[-1].keys())
+
+          picks_cols = [c for c in ["ts","match","selection","odds","edge","stake"] if not picks_rows or c in picks_rows[-1]]
+          log_cols   = [c for c in ["ts","match","selection","odds","edge","stake"] if not log_rows or c in log_rows[-1]]
+          set_cols   = [c for c in ["ts","match","selection","odds","edge","stake","result","pnl","clv"] if not settled_rows or c in settled_rows[-1]]
+
+          md = []
+          md.append(f"# Tennis Engine — Run Summary ({now})\n")
+          md.append("**Files updated**: `picks_live.csv`, `.state/*`, `docs/index.html`  \n")
+          if bankroll is not None:
+            md.append(f"**Bankroll**: **€{bankroll:,.2f}**\n")
+          md.append("\n## Latest Picks\n")
+          md.append(md_table(picks_rows, picks_cols))
+          md.append("\n## Last 20 Trades (trade_log)\n")
+          md.append(md_table(log_rows, log_cols))
+          md.append("\n## Last 20 Settlements\n")
+          md.append(md_table(settled_rows, set_cols))
+          md.append(f"\n**Dashboard**: `{dashboard}` (enable GitHub Pages → /docs to view on the web)\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write("\n".join(md))
           PY
+
+      # Optional: stamp every run so a commit is created even if nothing changed
+      # - name: Stamp run
+      #   run: |
+      #     date -u +"%Y-%m-%dT%H:%M:%SZ" >> .state/run_history.log
 
       - name: Commit & push changes to main
         run: |
