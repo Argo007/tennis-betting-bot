@@ -18,37 +18,36 @@ on:
         required: true
         default: "0.50"
       max_frac:
-        description: "max % bankroll per bet (e.g., 0.05)"
+        description: "max % bankroll per bet (e.g., 0.02)"
         required: true
-        default: "0.05"
-      abs_cap:
-        description: "absolute € stake cap"
+        default: "0.02"
+      assume_random_if_missing:
+        description: "impute missing odds/results randomly?"
+        type: choice
         required: true
-        default: "200"
-      assume_random:
-        description: "simulate result if missing (true/false)"
-        required: true
-        default: "true"
-      notify_rows:
-        description: "notify if >= rows"
-        required: true
-        default: "1"
+        default: "false"
+        options: [false, true]
+
+env:
+  PYTHON_VERSION: "3.11"
+  STATE_DIR: ".state"
+  DOCS_DIR: "docs"
+  SNAPSHOT_DIR: ".state/snapshots"
+  PICKS_FILE: "picks_live.csv"
+  TRADE_LOG: ".state/trade_log.csv"
+  CLOSE_ODDS_FILE: "close_odds.csv"
+  DASHBOARD_HTML: "docs/index.html"
+
+  # expose inputs to shell and python
+  INPUT_MODE: ${{ github.event.inputs.mode }}
+  INPUT_MIN_EDGE: ${{ github.event.inputs.min_edge }}
+  INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
+  INPUT_MAX_FRAC: ${{ github.event.inputs.max_frac }}
+  INPUT_ASSUME_RANDOM: ${{ github.event.inputs.assume_random_if_missing }}
 
 jobs:
   engine:
     runs-on: ubuntu-latest
-    env:
-      LIVE_OUTDIR: live_results
-      STATE_DIR: state
-      RESULTS_DIR: results
-      DOCS_DIR: docs
-      MIN_EDGE: ${{ github.event.inputs.min_edge }}
-      KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
-      MAX_FRAC: ${{ github.event.inputs.max_frac }}
-      ABS_CAP: ${{ github.event.inputs.abs_cap }}
-      ASSUME_RANDOM: ${{ github.event.inputs.assume_random }}
-      NOTIFY_ROWS: ${{ github.event.inputs.notify_rows }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,120 +55,157 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          # hard guarantees for our scripts
-          pip install pandas requests
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy tabulate
+          fi
 
-      # 1) Fetch live odds (matches + odds -> CSVs)
-      - name: Fetch live odds
-        shell: bash
+      - name: Prepare folders
         run: |
-          mkdir -p "${LIVE_OUTDIR}"
-          python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv"
-          python scripts/fetch_live_odds.py --matches "${LIVE_OUTDIR}/live_matches.csv" --out "${LIVE_OUTDIR}/live_odds.csv"
+          mkdir -p "${STATE_DIR}" "${DOCS_DIR}" "${SNAPSHOT_DIR}"
+          # Ensure trade log has header
+          if [ ! -f "${TRADE_LOG}" ]; then
+            echo "ts,match,selection,odds,edge,stake" > "${TRADE_LOG}"
+          fi
 
-      # 2) Generate live value picks (from odds)
-      - name: Generate live value picks
-        shell: bash
+      - name: Generate picks (respects inputs)
+        if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
-          python scripts/tennis_value_picks_live.py \
-            --odds "${LIVE_OUTDIR}/live_odds.csv" \
-            --outdir "${LIVE_OUTDIR}" \
-            --min-edge "${MIN_EDGE}"
-
-      # 3) Compute MAX_STAKE_EUR once (safe helper script)
-      - name: Compute MAX_STAKE_EUR
-        id: maxstake
-        shell: bash
-        run: |
-          python scripts/compute_max_stake.py \
-            --state-dir "${STATE_DIR}" \
-            --max-frac "${MAX_FRAC}" \
-            --floor 1 > .max_stake_eur.txt
-          echo "MAX_STAKE_EUR=$(cat .max_stake_eur.txt)" >> $GITHUB_ENV
-          echo "max_stake=$(cat .max_stake_eur.txt)"
-      
-      # 4) Log live picks (append to state/trade_log.csv)
-      - name: Log live picks (append to state/trade_log.csv)
-        shell: bash
-        run: |
-          if [ -f "${LIVE_OUTDIR}/picks_live.csv" ]; then
-            python scripts/log_live_picks.py \
-              --picks "${LIVE_OUTDIR}/picks_live.csv" \
+          set -e
+          if [ -f tennis_value_picks_pro.py ]; then
+            python tennis_value_picks_pro.py \
+              --out "${PICKS_FILE}" \
               --state-dir "${STATE_DIR}" \
-              --kelly "${KELLY_SCALE}" \
-              --stake-cap "${ABS_CAP}" \
-              --max-stake-eur "${MAX_STAKE_EUR}" \
-              --assume-random-if-missing "${ASSUME_RANDOM}"
+              --min-edge "${INPUT_MIN_EDGE}" \
+              --kelly-scale "${INPUT_KELLY_SCALE}" \
+              --max-frac "${INPUT_MAX_FRAC}"
+          elif [ -f generate_picks.py ]; then
+            python generate_picks.py \
+              --out "${PICKS_FILE}" \
+              --state-dir "${STATE_DIR}" \
+              --min-edge "${INPUT_MIN_EDGE}" \
+              --kelly-scale "${INPUT_KELLY_SCALE}" \
+              --max-frac "${INPUT_MAX_FRAC}"
           else
-            echo "No live picks generated."
+            echo "No pick generator found; creating empty ${PICKS_FILE}."
+            echo "ts,match,selection,odds,edge,stake" > "${PICKS_FILE}"
           fi
 
-      # 5) Snapshot close odds for CLV
-      - name: Snapshot close odds (for CLV)
-        shell: bash
+      - name: Compute MAX_STAKE_EUR from bankroll and input max_frac
+        id: bankroll
         run: |
-          if [ -f "${LIVE_OUTDIR}/live_odds.csv" ]; then
-            python scripts/fetch_close_odds.py \
-              --odds "${LIVE_OUTDIR}/live_odds.csv" \
-              --out "${LIVE_OUTDIR}/close_odds.csv" \
-              --max-drift 0.08
+          python - <<'PY'
+          import os, json
+          state_dir = os.environ["STATE_DIR"]
+          max_frac = float(os.environ["INPUT_MAX_FRAC"])
+          bankp = os.path.join(state_dir, "bankroll.json")
+          bankroll = 1000.0
+          if os.path.isfile(bankp):
+            try:
+              bankroll = float(json.load(open(bankp)).get("bankroll", bankroll))
+            except Exception:
+              pass
+          max_stake = round(bankroll * max_frac, 2)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"max_stake={max_stake}\n")
+          print(f"Bankroll={bankroll}  max_frac={max_frac}  MAX_STAKE_EUR={max_stake}")
+          PY
+
+      - name: Log live picks (append to state/trade_log.csv)
+        if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
+        run: |
+          set -e
+          python - <<'PY'
+          import os, csv, time
+          picks = os.environ["PICKS_FILE"]
+          log = os.environ["TRADE_LOG"]
+          max_stake = float("${{ steps.bankroll.outputs.max_stake }}")
+          if not os.path.isfile(picks) or os.path.getsize(picks) == 0:
+            raise SystemExit("No picks to log.")
+          with open(picks, newline='') as f:
+            rdr = csv.DictReader(f)
+            rows = list(rdr)
+          if not rows:
+            raise SystemExit("No picks to log.")
+          out = []
+          for r in rows:
+            ts = r.get("ts") or str(int(time.time()))
+            stake = r.get("stake")
+            try:
+              stake = min(float(stake) if stake not in (None, "") else max_stake, max_stake)
+            except Exception:
+              stake = max_stake
+            out.append([ts, r.get("match",""), r.get("selection",""), r.get("odds",""), r.get("edge",""), f"{stake:.2f}"])
+          with open(log, "a", newline='') as f:
+            w = csv.writer(f); [w.writerow(r) for r in out]
+          print(f"Appended {len(out)} rows to {log}")
+          PY
+
+      - name: Snapshot close odds (for CLV)
+        run: |
+          if [ -f "${CLOSE_ODDS_FILE}" ]; then
+            stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+            cp "${CLOSE_ODDS_FILE}" "${SNAPSHOT_DIR}/close_odds_${stamp}.csv"
+            echo "Snapshot: ${SNAPSHOT_DIR}/close_odds_${stamp}.csv"
           else
-            echo "No live_odds.csv to snapshot."
+            echo "No ${CLOSE_ODDS_FILE}; skipping CLV snapshot."
           fi
 
-      # 6) Settle trades (PnL + CLV; update bankroll)
       - name: Settle trades (PnL + CLV; update bankroll)
-        shell: bash
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
-            EXTRA=""
-            # settle_trades.py uses a store_true flag; pass it only when true
-            if [ "${ASSUME_RANDOM}" = "true" ]; then
-              EXTRA="--assume-random-if-missing"
+            if [ -f settle_trades.py ]; then
+              python settle_trades.py \
+                --log "${STATE_DIR}/trade_log.csv" \
+                --state-dir "${STATE_DIR}" \
+                --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" \
+                --out "${STATE_DIR}/settled_trades.csv"
+            else
+              echo "settle_trades.py missing; skipping real settlement."
             fi
-            python scripts/settle_trades.py \
-              --log "${STATE_DIR}/trade_log.csv" \
-              --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
-              --state-dir "${STATE_DIR}" \
-              ${EXTRA}
           else
-            echo "No trade_log.csv to settle."
+            echo "No trade_log.csv; nothing to settle."
           fi
 
-      # 7) Build attractive dashboard (HTML injected into job summary)
       - name: Build dashboard
-        shell: bash
         run: |
-          python scripts/make_dashboard.py \
-            --state-dir "${STATE_DIR}" \
-            --live-dir "${LIVE_OUTDIR}" \
-            --results-dir "${RESULTS_DIR}" \
-            --min-edge "${MIN_EDGE}" \
-            --kelly "${KELLY_SCALE}" \
-            --max-frac "${MAX_FRAC}" \
-            --abs-cap "${ABS_CAP}"
+          if [ -f make_dashboard.py ]; then
+            python make_dashboard.py --state-dir "${STATE_DIR}" --out "${DASHBOARD_HTML}"
+          else
+            cat > "${DASHBOARD_HTML}" <<HTML
+            <!doctype html><meta charset="utf-8"><title>Tennis Engine</title>
+            <h1>Tennis Engine</h1><p>Dashboard generator not found; placeholder page.</p>
+            HTML
+          fi
 
-      # 8) Print clean summary table (short)
-      - name: Print clean summary table
-        shell: bash
+      - name: Print summary table (last 20 trades)
         run: |
-          python scripts/quick_summary.py --state-dir "${STATE_DIR}" --live-dir "${LIVE_OUTDIR}"
+          python - <<'PY'
+          import os, csv
+          from tabulate import tabulate
+          p = os.environ["TRADE_LOG"]
+          if not os.path.isfile(p) or os.path.getsize(p)==0:
+            print("No trades logged."); raise SystemExit(0)
+          with open(p) as f:
+            rows = list(csv.DictReader(f))
+          rows = rows[-20:]
+          print(tabulate(rows, headers="keys", tablefmt="github"))
+          PY
 
-      # 9) Auto-commit state + docs
       - name: Auto-commit state + docs
-        shell: bash
-        env:
-          GH_USER_NAME: "github-actions[bot]"
-          GH_USER_EMAIL: "github-actions[bot]@users.noreply.github.com"
         run: |
-          python scripts/autocommit_state.py \
-            --paths "${STATE_DIR}" "${RESULTS_DIR}" "${DOCS_DIR}" \
-            --message "chore: update state/docs after LIVE run" \
-            --user-name "${GH_USER_NAME}" \
-            --user-email "${GH_USER_EMAIL}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "tennis_engine: update state and dashboard [skip ci]"
+            git push
+          fi
