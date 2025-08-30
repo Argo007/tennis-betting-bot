@@ -1,42 +1,53 @@
-name: Tennis Engine LIVE (Cron + Manual)
+name: Tennis Engine LIVE (Manual Only)
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "choose what to run"
+        type: choice
+        required: true
+        default: "all"
+        options: [all, live]
       min_edge:
-        description: "Edge threshold (e.g. 0.05)"
-        required: false
+        description: "edge threshold (e.g., 0.05)"
+        required: true
         default: "0.05"
       kelly_scale:
-        description: "Kelly scale (e.g. 0.5)"
-        required: false
-        default: "0.5"
+        description: "kelly scale (0.0–1.0)"
+        required: true
+        default: "0.50"
       max_frac:
-        description: "Max % bankroll per bet (e.g. 0.05)"
-        required: false
+        description: "max % bankroll per bet (e.g., 0.05)"
+        required: true
         default: "0.05"
       abs_cap:
-        description: "Absolute € stake cap"
-        required: false
+        description: "absolute € stake cap"
+        required: true
         default: "200"
-      assume_random_if_missing:
-        description: "Assume random result if settle inputs missing (true/false)"
-        required: false
-        default: "false"
-  schedule:
-    - cron: "*/30 * * * *"
+      assume_random:
+        description: "simulate result if missing (true/false)"
+        required: true
+        default: "true"
+      notify_rows:
+        description: "notify if >= rows"
+        required: true
+        default: "1"
 
 jobs:
   engine:
     runs-on: ubuntu-latest
     env:
-      STATE_DIR: state
       LIVE_OUTDIR: live_results
-      MIN_EDGE: ${{ inputs.min_edge || '0.05' }}
-      KELLY_SCALE: ${{ inputs.kelly_scale || '0.5' }}
-      MAX_FRAC: ${{ inputs.max_frac || '0.05' }}
-      ABS_CAP: ${{ inputs.abs_cap || '200' }}
-      ASSUME_RANDOM: ${{ inputs.assume_random_if_missing || 'false' }}
+      STATE_DIR: state
+      RESULTS_DIR: results
+      DOCS_DIR: docs
+      MIN_EDGE: ${{ github.event.inputs.min_edge }}
+      KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
+      MAX_FRAC: ${{ github.event.inputs.max_frac }}
+      ABS_CAP: ${{ github.event.inputs.abs_cap }}
+      ASSUME_RANDOM: ${{ github.event.inputs.assume_random }}
+      NOTIFY_ROWS: ${{ github.event.inputs.notify_rows }}
 
     steps:
       - name: Checkout
@@ -48,27 +59,21 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas requests
-          fi
+          pip install -r requirements.txt || true
+          # hard guarantees for our scripts
+          pip install pandas requests
 
-      - name: Prepare folders
-        shell: bash
-        run: |
-          mkdir -p "${STATE_DIR}" "${LIVE_OUTDIR}" results docs
-
-      # ================= LIVE FETCH =================
+      # 1) Fetch live odds (matches + odds -> CSVs)
       - name: Fetch live odds
         shell: bash
         run: |
+          mkdir -p "${LIVE_OUTDIR}"
           python scripts/fetch_live_matches.py --out "${LIVE_OUTDIR}/live_matches.csv"
           python scripts/fetch_live_odds.py --matches "${LIVE_OUTDIR}/live_matches.csv" --out "${LIVE_OUTDIR}/live_odds.csv"
 
+      # 2) Generate live value picks (from odds)
       - name: Generate live value picks
         shell: bash
         run: |
@@ -77,17 +82,19 @@ jobs:
             --outdir "${LIVE_OUTDIR}" \
             --min-edge "${MIN_EDGE}"
 
-      # ================= MAX STAKE (no inline python) =================
+      # 3) Compute MAX_STAKE_EUR once (safe helper script)
       - name: Compute MAX_STAKE_EUR
         id: maxstake
         shell: bash
         run: |
-          val=$(python scripts/compute_max_stake.py \
-                  --state-dir "${STATE_DIR}" \
-                  --max-frac "${MAX_FRAC}")
-          echo "MAX_STAKE_EUR=${val}"
-          echo "max_stake_eur=${val}" >> "$GITHUB_OUTPUT"
-
+          python scripts/compute_max_stake.py \
+            --state-dir "${STATE_DIR}" \
+            --max-frac "${MAX_FRAC}" \
+            --floor 1 > .max_stake_eur.txt
+          echo "MAX_STAKE_EUR=$(cat .max_stake_eur.txt)" >> $GITHUB_ENV
+          echo "max_stake=$(cat .max_stake_eur.txt)"
+      
+      # 4) Log live picks (append to state/trade_log.csv)
       - name: Log live picks (append to state/trade_log.csv)
         shell: bash
         run: |
@@ -97,12 +104,13 @@ jobs:
               --state-dir "${STATE_DIR}" \
               --kelly "${KELLY_SCALE}" \
               --stake-cap "${ABS_CAP}" \
-              --max-stake-eur "${{ steps.maxstake.outputs.max_stake_eur }}" \
+              --max-stake-eur "${MAX_STAKE_EUR}" \
               --assume-random-if-missing "${ASSUME_RANDOM}"
           else
             echo "No live picks generated."
           fi
 
+      # 5) Snapshot close odds for CLV
       - name: Snapshot close odds (for CLV)
         shell: bash
         run: |
@@ -112,51 +120,56 @@ jobs:
               --out "${LIVE_OUTDIR}/close_odds.csv" \
               --max-drift 0.08
           else
-            echo "No live_odds.csv present; skipping close odds snapshot."
+            echo "No live_odds.csv to snapshot."
           fi
 
+      # 6) Settle trades (PnL + CLV; update bankroll)
       - name: Settle trades (PnL + CLV; update bankroll)
         shell: bash
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ]; then
-            FLAG=""
+            EXTRA=""
+            # settle_trades.py uses a store_true flag; pass it only when true
             if [ "${ASSUME_RANDOM}" = "true" ]; then
-              FLAG="--assume-random-if-missing"
+              EXTRA="--assume-random-if-missing"
             fi
             python scripts/settle_trades.py \
               --log "${STATE_DIR}/trade_log.csv" \
               --close-odds "${LIVE_OUTDIR}/close_odds.csv" \
               --state-dir "${STATE_DIR}" \
-              ${FLAG}
+              ${EXTRA}
           else
-            echo "No ${STATE_DIR}/trade_log.csv; nothing to settle."
+            echo "No trade_log.csv to settle."
           fi
 
+      # 7) Build attractive dashboard (HTML injected into job summary)
       - name: Build dashboard
         shell: bash
         run: |
           python scripts/make_dashboard.py \
             --state-dir "${STATE_DIR}" \
-            --results "results" \
-            --live "${LIVE_OUTDIR}" \
-            --out "docs"
+            --live-dir "${LIVE_OUTDIR}" \
+            --results-dir "${RESULTS_DIR}" \
+            --min-edge "${MIN_EDGE}" \
+            --kelly "${KELLY_SCALE}" \
+            --max-frac "${MAX_FRAC}" \
+            --abs-cap "${ABS_CAP}"
 
+      # 8) Print clean summary table (short)
       - name: Print clean summary table
         shell: bash
         run: |
-          python scripts/quick_summary.py \
-            --state-dir "${STATE_DIR}" \
-            --results "results" \
-            --live "${LIVE_OUTDIR}"
+          python scripts/quick_summary.py --state-dir "${STATE_DIR}" --live-dir "${LIVE_OUTDIR}"
 
+      # 9) Auto-commit state + docs
       - name: Auto-commit state + docs
         shell: bash
+        env:
+          GH_USER_NAME: "github-actions[bot]"
+          GH_USER_EMAIL: "github-actions[bot]@users.noreply.github.com"
         run: |
           python scripts/autocommit_state.py \
-             --log "${STATE_DIR}/trade_log.csv" \
-             --paths docs ${STATE_DIR} \
-             --message "Auto-commit: update trade_log + docs" \
-             --user-name "TennisBot" \
-             --user-email "bot@tennis-engine.local"
-
-
+            --paths "${STATE_DIR}" "${RESULTS_DIR}" "${DOCS_DIR}" \
+            --message "chore: update state/docs after LIVE run" \
+            --user-name "${GH_USER_NAME}" \
+            --user-email "${GH_USER_EMAIL}"
