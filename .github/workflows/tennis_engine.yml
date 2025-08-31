@@ -11,7 +11,7 @@ on:
         type: choice
         required: true
         default: "all"
-        options: ["all", "live"]
+        options: ["all", "live"]   # live = Generate+Log only; all = full pipeline
       min_edge:
         description: "edge threshold (e.g., 0.05)"
         required: true
@@ -30,6 +30,14 @@ on:
         required: true
         default: "false"
         options: ["false", "true"]
+      edge_goal:
+        description: "Total Edge goal (points) for progress bar"
+        required: true
+        default: "8.0"
+      top_n:
+        description: "How many top picks to show"
+        required: true
+        default: "15"
 
 env:
   PYTHON_VERSION: "3.11"
@@ -46,6 +54,8 @@ env:
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
   INPUT_MAX_FRAC: ${{ github.event.inputs.max_frac }}
   INPUT_ASSUME_RANDOM: ${{ github.event.inputs.assume_random_if_missing }}
+  EDGE_GOAL: ${{ github.event.inputs.edge_goal }}
+  TOP_N: ${{ github.event.inputs.top_n }}
 
 jobs:
   engine:
@@ -155,6 +165,7 @@ jobs:
           PY
 
       - name: Snapshot close odds (CLV)
+        if: env.INPUT_MODE == 'all'
         run: |
           if [ -f "${CLOSE_ODDS_FILE}" ]; then
             stamp="$(date -u +'%Y%m%d%H%M%SZ')"
@@ -165,6 +176,7 @@ jobs:
           fi
 
       - name: Settle trades (PnL + CLV; update bankroll)
+        if: env.INPUT_MODE == 'all'
         run: |
           if [ -f "${STATE_DIR}/trade_log.csv" ] && [ -f settle_trades.py ]; then
             python settle_trades.py --log "${STATE_DIR}/trade_log.csv" --state-dir "${STATE_DIR}" --assume-random-if-missing "${INPUT_ASSUME_RANDOM}" --out "${STATE_DIR}/settled_trades.csv"
@@ -173,6 +185,7 @@ jobs:
           fi
 
       - name: Build dashboard
+        if: env.INPUT_MODE == 'all'
         run: |
           if [ -f make_dashboard.py ]; then
             python make_dashboard.py --state-dir "${STATE_DIR}" --out "${DASHBOARD_HTML}"
@@ -198,6 +211,8 @@ jobs:
             dashboard = os.environ['DASHBOARD_HTML']
             run_ts = os.environ.get('RUN_TS')
             kelly_scale = float(os.environ.get('KELLY_SCALE_INPUT','0.5') or 0.5)
+            top_n = int(os.environ.get('TOP_N','15') or 15)
+            goal  = float(os.environ.get('EDGE_GOAL','8.0') or 8.0)
 
             def read_csv(path):
               if not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -238,13 +253,23 @@ jobs:
               if not (b > 0 and 0 < true_p < 1): return 0.0
               return max(0.0, (b*true_p - (1-true_p)) / b)
 
-            # Build top picks + totals (robust to missing values)
+            # Build top picks + totals; infer edge if missing and a prob column exists
             top_rows=[]; total_edge=0.0; total_kelly_eur=0.0
-            missing_edge=0
+            missing_edge=0; inferred_edge=0
             for r in picks or []:
               odds = fnum(r.get("odds"))
               e = fnum(r.get("edge"))
-              if e is None: missing_edge += 1
+              if e is None:
+                # try to infer from probability columns (0..1)
+                for k in ("prob","win_prob","p","model_p"):
+                  p_est = fnum(r.get(k))
+                  if p_est is not None and 0 < p_est < 1 and odds and odds>0:
+                    implied = 1.0/odds
+                    e = (p_est / implied) - 1.0         # e = true_p / implied_p - 1
+                    inferred_edge += 1
+                    break
+                if e is None:
+                  missing_edge += 1
               implied = (1/odds) if odds and odds>0 else None
               true_p = max(0.0, min(1.0, implied*(1+e))) if (implied is not None and e is not None) else None
               kf = kelly_fraction(odds, true_p) if (odds and true_p is not None) else 0.0
@@ -260,13 +285,10 @@ jobs:
                 "edge": f"{e:.4f}" if e is not None else "",
                 "kelly€": f"{kelly_eur:.2f}" if kelly_eur>0 else (r.get("stake","") or ""),
               })
-            # sort safely by numeric edge
-            top_rows = sorted(top_rows, key=lambda r: safe_key(r.get("edge"), -1e9), reverse=True)[:15] if top_rows else []
-
-            # Top pick highlight
+            top_rows = sorted(top_rows, key=lambda r: safe_key(r.get("edge"), -1e9), reverse=True)[:top_n] if top_rows else []
             top_pick = top_rows[0] if top_rows else None
 
-            # PnL & CLV snapshot from last 20 settlements
+            # PnL & CLV snapshot
             last_set = last_n(settled, 20)
             pnls = [fnum(r.get("pnl")) for r in last_set if fnum(r.get("pnl")) is not None]
             clvs = [fnum(r.get("clv")) for r in last_set if fnum(r.get("clv")) is not None]
@@ -289,27 +311,28 @@ jobs:
             if clv_avg is not None: kpis.append(f"**Avg CLV (last 20)**: {clv_avg:+.4f}")
 
             total_edge_points = total_edge*100
-            goal=8.0
             prog=int(max(0,min(100,(total_edge_points/goal)*100))) if goal>0 else 0
             bar="█"*(prog//10)+"░"*(10-prog//10)
-            kpis.append(f"**Total Edge**: {total_edge_points:.2f} pts / **Goal 8.00**  `{bar}` {prog}%")
+            kpis.append(f"**Total Edge**: {total_edge_points:.2f} pts / **Goal {goal:.2f}**  `{bar}` {prog}%")
             if bankroll is not None:
               kpis.append(f"**Total Kelly stake (est.)**: €{total_kelly_eur:.2f} @ scale={kelly_scale:g}")
 
             md=[]
             md.append(f"# Tennis Engine — Run Summary ({now})\n")
-            # Warning banners
-            if (picks and missing_edge == len(picks)) or (total_edge_points == 0):
-              md.append("> ⚠️ **No edge values found in current picks.** The generator didn’t output an `edge` column or it’s blank. Total Edge will stay at 0 until that’s provided.\n")
+            if picks:
+              if inferred_edge>0:
+                md.append(f"> ℹ️ **Inferred edge** for {inferred_edge} picks from probability columns (prob/win_prob/p/model_p).\n")
+              if missing_edge == len(picks):
+                md.append("> ⚠️ **No edge values found** in current picks and none could be inferred. Total Edge stays at 0.\n")
+            else:
+              md.append("> ⚠️ No picks produced.\n")
             md.append(" • ".join(kpis)+"\n")
 
             if top_pick:
               md.append("### 🔥 Top Pick\n")
-              md.append(f"- {top_pick.get('match','?')} — **{top_pick.get('selection','?')}** @ {top_pick.get('odds','?')}  ")
-              if top_pick.get('edge'):
-                md.append(f"(edge {top_pick['edge']})  ")
-              if top_pick.get('kelly€'):
-                md.append(f"— **kelly {top_pick['kelly€']}**  ")
+              md.append(f"- {top_pick.get('match','?')} — **{top_pick.get('selection','?')}** @ {top_pick.get('odds','?')}")
+              if top_pick.get('edge'): md.append(f"  (edge {top_pick['edge']})")
+              if top_pick.get('kelly€'): md.append(f" — **kelly {top_pick['kelly€']}**")
               md.append("\n")
 
             md.append("## Top Picks by Edge\n")
@@ -325,7 +348,7 @@ jobs:
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write("\n".join(md))
 
           except Exception as e:
-            msg = f"### Summary generation error\n```\n{e}\n```\n(Shown for debugging, workflow continues.)\n"
+            msg = f"### Summary generation error\n```\n{e}\n```\n(Workflow continues.)\n"
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write(msg)
           PY
 
