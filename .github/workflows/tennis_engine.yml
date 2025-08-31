@@ -1,17 +1,20 @@
 name: Tennis Engine LIVE (Manual Only)
 
+# Needs these so we can push commits and publish Pages from THIS workflow
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "choose what to run"
+        description: "choose what to run (live = fast generate+log; all = full pipeline + deploy)"
         type: choice
         required: true
         default: "all"
-        options: ["all", "live"]   # live = Generate+Log only; all = full pipeline
+        options: ["all", "live"]
       min_edge:
         description: "edge threshold (e.g., 0.05)"
         required: true
@@ -197,6 +200,8 @@ jobs:
         continue-on-error: true
         env:
           KELLY_SCALE_INPUT: ${{ env.INPUT_KELLY_SCALE }}
+          EDGE_GOAL: ${{ env.EDGE_GOAL }}
+          TOP_N: ${{ env.TOP_N }}
         run: |
           python - <<'PY'
           try:
@@ -253,19 +258,17 @@ jobs:
               if not (b > 0 and 0 < true_p < 1): return 0.0
               return max(0.0, (b*true_p - (1-true_p)) / b)
 
-            # Build top picks + totals; infer edge if missing and a prob column exists
             top_rows=[]; total_edge=0.0; total_kelly_eur=0.0
             missing_edge=0; inferred_edge=0
             for r in picks or []:
               odds = fnum(r.get("odds"))
               e = fnum(r.get("edge"))
               if e is None:
-                # try to infer from probability columns (0..1)
                 for k in ("prob","win_prob","p","model_p"):
                   p_est = fnum(r.get(k))
                   if p_est is not None and 0 < p_est < 1 and odds and odds>0:
                     implied = 1.0/odds
-                    e = (p_est / implied) - 1.0         # e = true_p / implied_p - 1
+                    e = (p_est / implied) - 1.0
                     inferred_edge += 1
                     break
                 if e is None:
@@ -288,7 +291,6 @@ jobs:
             top_rows = sorted(top_rows, key=lambda r: safe_key(r.get("edge"), -1e9), reverse=True)[:top_n] if top_rows else []
             top_pick = top_rows[0] if top_rows else None
 
-            # PnL & CLV snapshot
             last_set = last_n(settled, 20)
             pnls = [fnum(r.get("pnl")) for r in last_set if fnum(r.get("pnl")) is not None]
             clvs = [fnum(r.get("clv")) for r in last_set if fnum(r.get("clv")) is not None]
@@ -344,12 +346,12 @@ jobs:
             md.append("## Last 20 Settlements\n")
             md.append(md_table(last_set, ["ts","match","selection","odds","edge","stake","result","pnl","clv"]))
 
-            md.append(f"\n**Dashboard**: `docs/index.html` — enable GitHub Pages → /docs to view it on the web.\n")
+            md.append(f"\n**Dashboard**: `docs/index.html` — published by this workflow when mode=all.\n")
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write("\n".join(md))
 
           except Exception as e:
-            msg = f"### Summary generation error\n```\n{e}\n```\n(Workflow continues.)\n"
-            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write(msg)
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### Summary generation error\n```\n{e}\n```\n(Workflow continues.)\n")
           PY
 
       - name: Commit & push changes to main
@@ -363,3 +365,30 @@ jobs:
             git commit -m "engine: update state+dashboard [skip ci]"
             git push
           fi
+
+  # --- Built-in Pages deploy (runs only for mode=all) ---
+  deploy_pages:
+    if: ${{ github.event.inputs.mode == 'all' }}
+    needs: engine
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: "pages"
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site (docs/)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
