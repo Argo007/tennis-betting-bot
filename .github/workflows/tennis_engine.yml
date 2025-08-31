@@ -167,7 +167,7 @@ jobs:
       - name: Snapshot close odds (CLV)
         run: |
           if [ -f "${CLOSE_ODDS_FILE}" ]; then
-            stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+            stamp="$(date -u +'%Y%m%d%H%M%SZ')"
             cp "${CLOSE_ODDS_FILE}" "${SNAPSHOT_DIR}/close_odds_${stamp}.csv"
             echo "Snapshot saved."
           else
@@ -219,6 +219,10 @@ jobs:
             try: return float(x)
             except: return None
 
+          def safe_key(x, default):
+            v = fnum(x)
+            return v if v is not None else default
+
           # bankroll
           bankroll = None
           if os.path.isfile(bank_fp):
@@ -241,7 +245,6 @@ jobs:
             return "⚪️"
 
           def kelly_fraction(odds, true_p):
-            # b = odds-1; f* = (bp - q)/b with q=1-p
             b = odds - 1.0
             if not (b > 0 and 0 < true_p < 1): return 0.0
             return max(0.0, (b*true_p - (1-true_p)) / b)
@@ -252,29 +255,31 @@ jobs:
 
           for r in picks or []:
             odds = fnum(r.get("odds"))
-            e = fnum(r.get("edge"))  # edge as decimal (e.g., 0.05 = +5%)
-            stake_txt = r.get("stake")
+            e = fnum(r.get("edge"))  # decimal (0.05 = 5%)
             implied = (1/odds) if odds and odds>0 else None
             true_p = None
             if implied is not None and e is not None:
               true_p = max(0.0, min(1.0, implied * (1 + e)))
             kf = kelly_fraction(odds, true_p) if (odds and true_p is not None) else 0.0
             kelly_eur = (bankroll or 0.0) * kelly_scale * kf
-            if e is not None: total_edge += e
+            if e is not None:
+              total_edge += e
             total_kelly_eur += kelly_eur
 
             top_rows.append({
               "🏷": edge_bucket(e),
               "match": r.get("match",""),
               "selection": r.get("selection",""),
-              "odds": f"{odds:.2f}" if odds else (r.get("odds","") or ""),
-              "implied_p": f"{(implied*100):.1f}%" if implied else "",
-              "edge": f"{e:.4f}" if e is not None else "",
-              "kelly€": f"{kelly_eur:.2f}" if kelly_eur>0 else (stake_txt or ""),
+              "odds": f"{odds:.2f}" if odds is not None else (r.get("odds","") or ""),
+              "implied_p": f"{(implied*100):.1f}%" if implied is not None else "",
+              "edge": (f"{e:.4f}" if e is not None else ""),
+              "kelly€": f"{kelly_eur:.2f}" if kelly_eur>0 else (r.get("stake","") or ""),
             })
 
-          # Sort by edge desc
-          top_rows = sorted(top_rows, key=lambda x: fnum(x.get("edge")), reverse=True)[:15] if top_rows else []
+          # Sort by numeric edge (missing edge -> very small sentinel so they go last)
+          def edge_num(row):
+            return safe_key(row.get("edge"), -1e9)
+          top_rows = sorted(top_rows, key=edge_num, reverse=True)[:15] if top_rows else []
 
           # PnL & CLV snapshot from last 20 settlements
           last_set = last_n(settled, 20)
@@ -298,15 +303,13 @@ jobs:
           if pnl_sum is not None: kpis.append(f"**PnL (last 20)**: {pnl_sum:+.2f}")
           if clv_avg is not None: kpis.append(f"**Avg CLV (last 20)**: {clv_avg:+.4f}")
 
-          # Total Edge across current picks (goal = 8.0)
-          total_edge_points = total_edge * 100  # convert to percentage points
+          # Total Edge across current picks (goal = 8.0 edge points)
+          total_edge_points = total_edge * 100  # percentage points
           goal = 8.0
-          prog = min(100, max(0, int((total_edge_points/goal)*100))) if goal>0 else 0
-          bar_blocks = int(prog/10)
-          bar = "█"*bar_blocks + "░"*(10-bar_blocks)
+          prog = int(max(0, min(100, (total_edge_points/goal)*100))) if goal>0 else 0
+          bar = "█"*(prog//10) + "░"*(10 - prog//10)
           kpis.append(f"**Total Edge**: {total_edge_points:.2f} pts / **Goal 8.00**  `{bar}` {prog}%")
 
-          # Total suggested Kelly stake
           if bankroll is not None:
             kpis.append(f"**Total Kelly stake (est.)**: €{total_kelly_eur:.2f} @ scale={kelly_scale:g}")
 
