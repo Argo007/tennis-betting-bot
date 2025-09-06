@@ -12,10 +12,10 @@ on:
         description: "live = generate+log only, all = full pipeline + deploy"
         type: choice
         required: true
-        default: "all"
-        options: ["all", "live"]
+        default: all
+        options: [all, live]
       min_edge:
-        description: "edge threshold (decimal, e.g., 0.05)"
+        description: "edge threshold (e.g., 0.05)"
         required: true
         default: "0.05"
       kelly_scale:
@@ -31,7 +31,7 @@ on:
         type: choice
         required: true
         default: "false"
-        options: ["false","true"]
+        options: [false, true]
       edge_goal:
         description: "Total Edge goal (points)"
         required: true
@@ -41,11 +41,11 @@ on:
         required: true
         default: "15"
       force_edge_strategy:
-        description: "fallback only when model columns missing"
+        description: "fallback only when model cols missing"
         type: choice
         required: true
         default: "none"
-        options: ["none", "uplift_pct", "min_edge"]
+        options: [none, uplift_pct, min_edge]
       force_edge_uplift_pct:
         description: "when strategy=uplift_pct (e.g. 3 = +3% to implied prob)"
         required: true
@@ -54,7 +54,6 @@ on:
 env:
   PYTHON_VERSION: "3.11"
 
-  # paths
   STATE_DIR: ".state"
   DOCS_DIR: "docs"
   SNAPSHOT_DIR: ".state/snapshots"
@@ -63,7 +62,6 @@ env:
   CLOSE_ODDS_FILE: "close_odds.csv"
   DASHBOARD_HTML: "docs/index.html"
 
-  # inputs -> env
   INPUT_MODE: ${{ github.event.inputs.mode }}
   INPUT_MIN_EDGE: ${{ github.event.inputs.min_edge }}
   INPUT_KELLY_SCALE: ${{ github.event.inputs.kelly_scale }}
@@ -73,9 +71,6 @@ env:
   TOP_N: ${{ github.event.inputs.top_n }}
   FORCE_EDGE_STRATEGY: ${{ github.event.inputs.force_edge_strategy }}
   FORCE_EDGE_UPLIFT_PCT: ${{ github.event.inputs.force_edge_uplift_pct }}
-
-  # optional tuning for finals bump (read by enrich script)
-  # FINALS_KELLY_SCALE: "0.85"
 
 jobs:
   engine:
@@ -106,7 +101,7 @@ jobs:
       - name: Stamp run
         run: echo "RUN_TS=$(date -u +'%Y%m%d%H%M%S')" >> "$GITHUB_ENV"
 
-      - name: Compute bankroll + max stake
+      - name: Compute bankroll + max stake (safe heredoc)
         id: bankroll
         run: |
           python <<'PY'
@@ -128,16 +123,14 @@ jobs:
 
       - name: Export bankroll envs
         run: |
-          {
-            echo "BANKROLL=${{ steps.bankroll.outputs.bankroll }}";
-            echo "MAX_STAKE_EUR=${{ steps.bankroll.outputs.max_stake }}";
-            echo "KELLY_SCALE=${INPUT_KELLY_SCALE}";
-            echo "MIN_EDGE=${INPUT_MIN_EDGE}";
-          } >> "$GITHUB_ENV"
-"
+          echo "BANKROLL=${{ steps.bankroll.outputs.bankroll }}" >> "$GITHUB_ENV"
+          echo "MAX_STAKE_EUR=${{ steps.bankroll.outputs.max_stake }}" >> "$GITHUB_ENV"
+          echo "KELLY_SCALE=$INPUT_KELLY_SCALE" >> "$GITHUB_ENV"
+          echo "MIN_EDGE=$INPUT_MIN_EDGE" >> "$GITHUB_ENV"
 
       - name: Generate picks (auto-detect generator)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
+        shell: bash
         continue-on-error: true
         run: |
           if [ -f tennis_value_picks_pro.py ]; then
@@ -155,22 +148,25 @@ jobs:
       - name: Log live picks to trade_log.csv
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
-          python -c "import os,csv,time,pathlib;
-picks=os.environ['PICKS_FILE']; log=os.environ['TRADE_LOG'];
-run_ts=os.environ.get('RUN_TS') or str(int(time.time()))
-p=pathlib.Path(picks)
-rows=(list(csv.DictReader(open(picks))) if (p.is_file() and p.stat().st_size>0) else [])
-import sys
-if not rows: sys.exit(0)
-if not path:=pathlib.Path(log): pass
-if not path.is_file():
-  csv.writer(open(log,'w',newline='')).writerow(['ts','match','selection','odds','edge','stake'])
-out=[]
-for r in rows:
-  ts=(r.get('ts') or '').strip() or run_ts
-  out.append([ts, r.get('match','—'), r.get('selection','—'), r.get('odds',''), r.get('edge',''), r.get('kelly_stake','')])
-w=csv.writer(open(log,'a',newline='')); w.writerows(out)
-print(f'Appended {len(out)} rows to {log}')"        
+          python <<'PY'
+          import os, csv, time, pathlib
+          picks = os.environ['PICKS_FILE']
+          log = os.environ['TRADE_LOG']
+          run_ts = os.environ.get('RUN_TS') or time.strftime('%Y%m%d%H%M%S', time.gmtime())
+          p = pathlib.Path(picks)
+          rows = list(csv.DictReader(open(picks))) if (p.is_file() and p.stat().st_size>0) else []
+          if not rows: raise SystemExit(0)
+          path = pathlib.Path(log)
+          if not path.is_file():
+              csv.writer(open(log,'w',newline='')).writerow(['ts','match','selection','odds','edge','stake'])
+          out=[]
+          for r in rows:
+              ts=(r.get('ts') or '').strip() or run_ts
+              out.append([ts, r.get('match','—'), r.get('selection','—'),
+                          r.get('odds',''), r.get('edge',''), r.get('kelly_stake','')])
+          csv.writer(open(log,'a',newline='')).writerows(out)
+          print(f"Appended {len(out)} rows to {log}")
+          PY
 
       - name: Snapshot close odds (for CLV)
         if: env.INPUT_MODE == 'all'
@@ -200,43 +196,47 @@ print(f'Appended {len(out)} rows to {log}')"
         if: env.INPUT_MODE == 'all'
         run: python scripts/make_dashboard.py
 
-      - name: Results summary (visible in this Actions run)
+      - name: Results summary (Actions log)
         run: |
-          python -c "import os,csv;
-def read(p):
-  import os
-  if (not os.path.isfile(p)) or os.path.getsize(p)==0: return []
-  return list(csv.DictReader(open(p)))
-def fnum(x):
-  try:
-    s=str(x).strip()
-    if s.endswith('%'): return float(s[:-1])/100.0
-    return float(s)
-  except: return None
-picks=read(os.environ.get('PICKS_FILE','picks_live.csv'))
-top_n=int(os.environ.get('TOP_N','15'))
-edge_goal=float(os.environ.get('EDGE_GOAL','8.0') or 8.0)
-rows=[]; tot_e=0.0; tot_k=0.0
-for r in picks:
-  e=fnum(r.get('edge')); k=fnum(r.get('kelly_stake')); o=fnum(r.get('odds')); ip=fnum(r.get('implied_p'))
-  if e is not None: tot_e+=e
-  if k: tot_k+=k or 0.0
-  rows.append({
-    'match': r.get('match','—'), 'selection': r.get('selection','—'),
-    'odds': f'{o:.2f}' if o else r.get('odds',''),
-    'implied_p': f'{(ip*100):.1f}%' if ip else '',
-    'edge': f'{e:.4f}' if e is not None else '', 'kelly€': f'{k:.2f}' if k else ''
-  })
-rows=sorted(rows, key=lambda x: float(x.get('edge') or -9e9), reverse=True)[:top_n]
-total_pts=tot_e*100
-prog=int(max(0,min(100,(total_pts/edge_goal)*100))) if edge_goal>0 else 0
-bar='█'*(prog//10)+'░'*(10-prog//10)
-print(f'**Total Edge:** {total_pts:.2f} pts / Goal {edge_goal:.2f}  `{bar}` {prog}%  •  **Total Kelly:** €{tot_k:.2f}\n')
-print('### 🔥 Top Picks by Edge')
-print('| match | selection | odds | implied_p | edge | kelly€ |')
-print('|---|---|---:|---:|---:|---:|')
-for r in rows:
-  print(f\"| {r['match']} | {r['selection']} | {r['odds']} | {r['implied_p']} | {r['edge']} | {r['kelly€']} |\")" >> "$GITHUB_STEP_SUMMARY"
+          python <<'PY'
+          import os, csv
+          def read(p):
+              import os
+              if (not os.path.isfile(p)) or os.path.getsize(p)==0: return []
+              return list(csv.DictReader(open(p)))
+          def fnum(x):
+              try:
+                  s=str(x).strip()
+                  if s.endswith('%'): return float(s[:-1])/100.0
+                  return float(s)
+              except: return None
+          picks=read(os.environ.get('PICKS_FILE','picks_live.csv'))
+          top_n=int(os.environ.get('TOP_N','15') or 15)
+          goal=float(os.environ.get('EDGE_GOAL','8.0') or 8.0)
+          rows=[]; tot_e=0.0; tot_k=0.0
+          for r in picks:
+              e=fnum(r.get('edge')); k=fnum(r.get('kelly_stake')); o=fnum(r.get('odds')); ip=fnum(r.get('implied_p'))
+              if e is not None: tot_e+=e
+              if k: tot_k+=k or 0.0
+              rows.append({
+                'match': r.get('match','—'), 'selection': r.get('selection','—'),
+                'odds': f'{o:.2f}' if o else (r.get('odds') or ''),
+                'implied_p': f'{(ip*100):.1f}%' if ip else '',
+                'edge': f'{e:.4f}' if e is not None else '',
+                'kelly€': f'{k:.2f}' if k else ''
+              })
+          rows=sorted(rows, key=lambda x: float(x.get('edge') or -9e9), reverse=True)[:top_n]
+          total_pts=tot_e*100
+          prog=int(max(0,min(100,(total_pts/goal)*100))) if goal>0 else 0
+          bar='█'*(prog//10)+'░'*(10-prog//10)
+          print(f"**Total Edge:** {total_pts:.2f} pts / Goal {goal:.2f}  `{bar}` {prog}%  •  **Total Kelly:** €{tot_k:.2f}\n")
+          print('### 🔥 Top Picks by Edge')
+          print('| match | selection | odds | implied_p | edge | kelly€ |')
+          print('|---|---|---:|---:|---:|---:|')
+          for r in rows:
+              print(f"| {r['match']} | {r['selection']} | {r['odds']} | {r['implied_p']} | {r['edge']} | {r['kelly€']} |")
+          PY
+        shell: bash
 
       - name: Commit & push changes
         run: |
