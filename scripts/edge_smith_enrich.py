@@ -1,94 +1,113 @@
 #!/usr/bin/env python3
-import os, csv, math
-from pathlib import Path
+"""
+Compute EdgeSmith/TrueEdge8 features and raw edges.
 
-def fnum(x, pct_allowed=True):
+Default I/O:
+  IN  = outputs/prob_enriched.csv
+  OUT = outputs/edge_enriched.csv
+
+Uses env metrics if present:
+  WEIGHT_SURFACE_BOOST, WEIGHT_RECENT_FORM, WEIGHT_ELO_CORE, ...
+"""
+
+import csv, os
+from pathlib import Path
+import argparse
+from math import isfinite
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OUT_DIR   = REPO_ROOT / "outputs"
+INFILE    = OUT_DIR / "prob_enriched.csv"
+OUTFILE   = OUT_DIR / "edge_enriched.csv"
+
+def log(m): print(f"[edge_enrich] {m}", flush=True)
+
+def f(x):
     try:
-        s = str(x).strip()
-        if pct_allowed and s.endswith('%'): return float(s[:-1])/100.0
-        return float(s)
+        v = float(x)
+        return v if isfinite(v) else None
     except: return None
 
-def clamp(v, lo=0.0, hi=1.0): return max(lo, min(hi, v))
+def w(name, default): 
+    try: return float(os.getenv(name, default))
+    except: return default
 
-def read_csv(path):
-    p = Path(path)
-    if not p.is_file() or p.stat().st_size == 0: return []
-    with open(path, newline='') as f:
-        return list(csv.DictReader(f))
+WEIGHTS = {
+    "SURFACE":      w("WEIGHT_SURFACE_BOOST", 0.18),
+    "RECENT":       w("WEIGHT_RECENT_FORM", 0.22),
+    "ELO":          w("WEIGHT_ELO_CORE", 0.28),
+    "SERVE_RETURN": w("WEIGHT_SERVE_RETURN_SPLIT", 0.10),
+    "H2H":          w("WEIGHT_HEAD2HEAD", 0.06),
+    "TRAVEL":       w("WEIGHT_TRAVEL_FATIGUE", -0.05),
+    "INJURY":       w("WEIGHT_INJURY_PENALTY", -0.07),
+    "DRIFT":        w("WEIGHT_MARKET_DRIFT", 0.08),
+}
 
-def write_csv(path, rows, headers):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader(); w.writerows(rows)
+def pseudo_trueedge8(row):
+    # Proxy scores (until you have real predictors wired)
+    # Use available probs/odds to craft stable surrogates
+    pa = f(row.get("prob_a_vigfree")) or 0.5
+    pb = f(row.get("prob_b_vigfree")) or 0.5
+    oa = f(row.get("odds_a")) or 2.0
+    ob = f(row.get("odds_b")) or 2.0
 
-def choose(*vals):
-    for v in vals:
-        if v is not None and str(v).strip() != "": return str(v).strip()
-    return ""
+    features = {
+        "SURFACE":      0.0,      # placeholder hook
+        "RECENT":       0.0,
+        "ELO":          (pa - pb),             # as a crude proxy
+        "SERVE_RETURN": (1/oa - 1/ob),
+        "H2H":          0.0,
+        "TRAVEL":       0.0,
+        "INJURY":       0.0,
+        "DRIFT":        (pb - pa),
+    }
+    score = sum(features[k]*WEIGHTS[k] for k in WEIGHTS)
+    return score, features
 
-def infer_match(r):
-    m = choose(r.get('match'), r.get('event'), r.get('event_name'),
-               r.get('fixture'), r.get('game'))
-    if m: return m
-    home = choose(r.get('home'), r.get('home_team'), r.get('player_a'),
-                  r.get('player1'), r.get('p1'), r.get('player'))
-    away = choose(r.get('away'), r.get('away_team'), r.get('player_b'),
-                  r.get('player2'), r.get('p2'), r.get('opponent'),
-                  r.get('opp'), r.get('vs'), r.get('against'))
-    if home or away: return f"{home} vs {away}".strip()
-    return "—"
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default=str(INFILE))
+    ap.add_argument("--output", default=str(OUTFILE))
+    args = ap.parse_args()
 
-def infer_selection(r):
-    return choose(r.get('selection'), r.get('selection_name'), r.get('runner'),
-                  r.get('runner_name'), r.get('player'), r.get('team'),
-                  r.get('name'), r.get('side'), r.get('bet_selection')) or "—"
+    inp = Path(args.input)
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
 
-def enrich(picks_path, bankroll, max_stake, kelly_scale, min_edge,
-           force_strategy="none", uplift_pct=0.0):
-    rows = read_csv(picks_path)
-    if not rows: return
-    headers = list(rows[0].keys())
-    for k in ("match","selection","implied_p","adj_prob","edge","kelly_stake"):
-        if k not in headers: headers.append(k)
+    if not inp.exists():
+        with out.open("w", newline="", encoding="utf-8") as f:
+            f.write("event_date,tournament,player_a,player_b,odds_a,odds_b,prob_a_vigfree,prob_b_vigfree,trueedge8,edge_a,edge_b\n")
+        log(f"missing input; wrote header-only → {out}")
+        return
 
+    rows = list(csv.DictReader(inp.open("r", encoding="utf-8")))
+    enriched = []
     for r in rows:
-        r["match"] = infer_match(r)
-        r["selection"] = infer_selection(r)
+        pa = f(r.get("prob_a_vigfree")); pb = f(r.get("prob_b_vigfree"))
+        oa = f(r.get("odds_a")); ob = f(r.get("odds_b"))
+        if None in (pa, pb, oa, ob): 
+            continue
 
-        odds = fnum(r.get("odds"))
-        implied = 1.0/odds if (odds and odds>0) else None
-        r["implied_p"] = f"{implied:.6f}" if implied is not None else ""
+        te8, _ = pseudo_trueedge8(r)
+        # expected value edges vs decimal odds
+        ev_a = pa*oa - 1.0
+        ev_b = pb*ob - 1.0
+        r["trueedge8"] = round(te8, 6)
+        r["edge_a"] = round(ev_a, 6)
+        r["edge_b"] = round(ev_b, 6)
+        enriched.append(r)
 
-        base_p = fnum(r.get("model_conf"))
-        p = base_p if (base_p is not None and 0.0 < base_p < 1.0) else None
+    if not enriched:
+        with out.open("w", newline="", encoding="utf-8") as f:
+            f.write("event_date,tournament,player_a,player_b,odds_a,odds_b,prob_a_vigfree,prob_b_vigfree,trueedge8,edge_a,edge_b\n")
+        log(f"no rows; wrote header-only → {out}")
+        return
 
-        if p is None and implied is not None:
-            p = clamp(implied * (1.0 + float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0)/100.0))
-
-        ed = (p - implied) if (p is not None and implied is not None) else None
-        r["adj_prob"] = f"{p:.6f}" if p is not None else ""
-        r["edge"] = f"{ed:.6f}" if ed is not None else ""
-
-        stake=0.0
-        if ed is not None and p is not None and odds and odds>1.0:
-            b = odds - 1.0
-            k_star = ((p*b) - (1.0 - p)) / b
-            k_star = max(0.0, k_star)
-            finals_scale = float(os.environ.get("FINALS_KELLY_SCALE", 0.85)) if "final" in r.get("match","").lower() else 1.0
-            scale = float(kelly_scale) * finals_scale
-            stake = min(float(max_stake), float(bankroll) * k_star * scale)
-        r["kelly_stake"] = f"{stake:.2f}"
-
-    write_csv(picks_path, rows, headers)
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=enriched[0].keys())
+        w.writeheader()
+        w.writerows(enriched)
+    log(f"wrote {len(enriched)} rows → {out}")
 
 if __name__ == "__main__":
-    picks = os.environ.get("PICKS_FILE","picks_live.csv")
-    bankroll = float(os.environ.get("BANKROLL","1000"))
-    max_stake = float(os.environ.get("MAX_STAKE_EUR","20"))
-    kelly_scale = float(os.environ.get("KELLY_SCALE","0.5"))
-    min_edge = float(os.environ.get("MIN_EDGE","0.05"))
-    enrich(picks, bankroll, max_stake, kelly_scale, min_edge,
-           os.environ.get("FORCE_EDGE_STRATEGY","none"),
-           float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0.0))
+    main()
