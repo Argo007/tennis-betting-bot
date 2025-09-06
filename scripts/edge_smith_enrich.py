@@ -1,10 +1,9 @@
-- name: Write EdgeSmith enrich script
-  shell: bash
-  run: |
-    mkdir -p scripts
-    cat > scripts/edge_smith_enrich.py <<'PY'
+      - name: Write EdgeSmith enrich script
+        shell: bash
+        run: |
+          mkdir -p scripts
+          cat > scripts/edge_smith_enrich.py <<'PY'
 #!/usr/bin/env python3
-# EdgeSmith — enrich picks with adjusted probabilities, edge & Kelly stake.
 import os, csv, math
 from pathlib import Path
 
@@ -16,9 +15,6 @@ def fnum(x, pct_allowed=True):
     except: return None
 
 def clamp(v, lo=0.0, hi=1.0): return max(lo, min(hi, v))
-def tanh(x):
-    try: return math.tanh(float(x))
-    except: return 0.0
 
 def read_csv(path):
     p = Path(path)
@@ -54,22 +50,14 @@ def infer_selection(r):
                   r.get('runner_name'), r.get('player'), r.get('team'),
                   r.get('name'), r.get('side'), r.get('bet_selection')) or "—"
 
-def finals_tag(r):
-    r1 = (r.get('round') or r.get('tournament_round') or "").lower()
-    if "final" in r1: return True
-    t = (r.get('tournament') or r.get('event') or r.get('match') or "").lower()
-    return "final" in t
-
 def enrich(picks_path, bankroll, max_stake, kelly_scale, min_edge,
            force_strategy="none", uplift_pct=0.0):
     rows = read_csv(picks_path)
-    if not rows: return {"rows":0,"with_edge":0}
-
+    if not rows: return
     headers = list(rows[0].keys())
     for k in ("match","selection","implied_p","adj_prob","edge","kelly_stake"):
         if k not in headers: headers.append(k)
 
-    with_edge=0
     for r in rows:
         r["match"] = infer_match(r)
         r["selection"] = infer_selection(r)
@@ -81,45 +69,25 @@ def enrich(picks_path, bankroll, max_stake, kelly_scale, min_edge,
         base_p = fnum(r.get("model_conf"))
         p = base_p if (base_p is not None and 0.0 < base_p < 1.0) else None
 
-        # infer prob if missing
-        if p is None:
-            fo = fnum(r.get("fair")) or fnum(r.get("fair_odds")) or fnum(r.get("true_odds")) or fnum(r.get("model_odds"))
-            if fo and fo>0: p = 1.0/fo
-            if p is None:
-                p = fnum(r.get('prob')) or fnum(r.get('win_prob')) or fnum(r.get('p'))
+        # simple fallback if missing prob: tiny uplift on implied
+        if p is None and implied is not None:
+            p = clamp(implied * (1.0 + float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0)/100.0))
 
-        ed = None
-        if implied is not None:
-            if p is not None:
-                ed = p - implied
-            else:
-                if force_strategy == "uplift_pct" and float(uplift_pct)>0:
-                    p = clamp(implied * (1.0 + float(uplift_pct)/100.0))
-                    ed = p - implied
-                elif force_strategy == "min_edge":
-                    ed = min_edge
-                    p  = clamp(implied * (1.0 + ed))
-
+        ed = (p - implied) if (p is not None and implied is not None) else None
         r["adj_prob"] = f"{p:.6f}" if p is not None else ""
         r["edge"] = f"{ed:.6f}" if ed is not None else ""
 
-        # Kelly
         stake=0.0
         if ed is not None and p is not None and odds and odds>1.0:
             b = odds - 1.0
             k_star = ((p*b) - (1.0 - p)) / b
             k_star = max(0.0, k_star)
-            finals = finals_tag(r)
-            finals_scale = float(os.environ.get("FINALS_KELLY_SCALE", 0.85)) if finals else 1.0
+            finals_scale = float(os.environ.get("FINALS_KELLY_SCALE", 0.85)) if "final" in r.get("match","").lower() else 1.0
             scale = float(kelly_scale) * finals_scale
             stake = min(float(max_stake), float(bankroll) * k_star * scale)
         r["kelly_stake"] = f"{stake:.2f}"
 
-        if ed is not None: with_edge += 1
-
     write_csv(picks_path, rows, headers)
-    print(f"Enriched {len(rows)} rows; edges for {with_edge}.")
-    return {"rows":len(rows),"with_edge":with_edge}
 
 if __name__ == "__main__":
     picks = os.environ.get("PICKS_FILE","picks_live.csv")
@@ -127,8 +95,7 @@ if __name__ == "__main__":
     max_stake = float(os.environ.get("MAX_STAKE_EUR","20"))
     kelly_scale = float(os.environ.get("KELLY_SCALE","0.5"))
     min_edge = float(os.environ.get("MIN_EDGE","0.05"))
-    force_strategy = (os.environ.get("FORCE_EDGE_STRATEGY") or "none").lower().strip()
-    uplift = float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0.0)
-    enrich(picks, bankroll, max_stake, kelly_scale, min_edge, force_strategy, uplift)
+    enrich(picks, bankroll, max_stake, kelly_scale, min_edge,
+           os.environ.get("FORCE_EDGE_STRATEGY","none"), float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0.0))
 PY
-    chmod +x scripts/edge_smith_enrich.py
+          chmod +x scripts/edge_smith_enrich.py
