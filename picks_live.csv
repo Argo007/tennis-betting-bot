@@ -1,11 +1,11 @@
 date,player,opponent,odds,model_conf,book_count,match,selection,edge,stake
-2025-08-10,Fritz,Sinner,2.35,0.52,3,—,Fritz,,0.00
-2025-08-10,Alcaraz,Rublev,1.55,0.6,3,—,Alcaraz,,0.00
-2025-08-11,Tauson,Rybakina,3.2,0.45,3,—,Tauson,,0.00
-2025-08-11,Osaka,Keys,1.9,0.52,3,—,Osaka,,0.00
-2025-08-12,Medvedev,Zverev,1.85,0.52,3,—,Medvedev,,0.00
-2025-08-12,Fernandez,Sabalenka,2.7,0.45,3,—,Fernandez,,0.00
-2025-08-13,Khachanov,Tsitsipas,2.4,0.52,3,—,Khachanov,,0.00
-2025-08-13,Swiatek,Krejcikova,1.25,0.6,3,—,Swiatek,,0.00
-2025-08-14,De Minaur,Hurkacz,2.05,0.52,3,—,De Minaur,,0.00
-2025-08-14,Kasatkina,Jabeur,2.6,0.45,3,—,Kasatkina,,0.00
+2025-08-10,Fritz,Sinner,2.35,0.52,3,vs Sinner,Fritz,0.094468,20.00
+2025-08-10,Alcaraz,Rublev,1.55,0.6,3,vs Rublev,Alcaraz,-0.045161,0.00
+2025-08-11,Tauson,Rybakina,3.2,0.45,3,vs Rybakina,Tauson,0.137500,20.00
+2025-08-11,Osaka,Keys,1.9,0.52,3,vs Keys,Osaka,-0.006316,0.00
+2025-08-12,Medvedev,Zverev,1.85,0.52,3,vs Zverev,Medvedev,-0.020541,0.00
+2025-08-12,Fernandez,Sabalenka,2.7,0.45,3,vs Sabalenka,Fernandez,0.079630,20.00
+2025-08-13,Khachanov,Tsitsipas,2.4,0.52,3,vs Tsitsipas,Khachanov,0.103333,20.00
+2025-08-13,Swiatek,Krejcikova,1.25,0.6,3,vs Krejcikova,Swiatek,-0.200000,0.00
+2025-08-14,De Minaur,Hurkacz,2.05,0.52,3,vs Hurkacz,De Minaur,0.032195,20.00
+2025-08-14,Kasatkina,Jabeur,2.6,0.45,3,vs Jabeur,Kasatkina,0.065385,20.00
