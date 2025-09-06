@@ -1,51 +1,80 @@
 #!/usr/bin/env python3
 """
-tennis-betting-bot unified runner
-- daily: full E2E (data -> picks -> dashboard -> notifications -> state)
-- live: minimal loop for live picks & notifications
-- backtest: dataset -> matrix runs -> reports -> summary
+tennis-betting-bot unified runner (with visible metrics)
+- daily: data -> dataset -> engine -> dashboard/notify -> state
+- live:  live data -> dataset -> live engine -> dashboard/notify
+- backtest: dataset -> matrix/sweeps -> reports -> summary
 
-Design:
-- subprocess calls to existing repo scripts (no fragile imports)
-- clear logging, fail-fast, JSON run meta
-- standard IO locations
+This version:
+- Centralizes METRICS (Kelly + TrueEdge8 + risk controls)
+- Prints metrics at start and writes results/metrics_config.json
+- Exports metrics as env vars for every sub-process
+- Explicit --outdir for fetchers to avoid CLI errors
 """
-import argparse, json, os, subprocess, sys, time, shutil
+
+import argparse, json, os, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ---------- repo paths ----------
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS   = REPO_ROOT / "scripts"
+DATA_DIR  = REPO_ROOT / "data"
+RAW_DIR   = DATA_DIR / "raw"
+ODDS_DIR  = RAW_DIR / "odds"
 RESULTS   = REPO_ROOT / "results"
 LIVE_RES  = REPO_ROOT / "live_results"
 STATE_DIR = REPO_ROOT / "state"
 DOTSTATE  = REPO_ROOT / ".state"
 DOCS_DIR  = REPO_ROOT / "docs"
 RUN_META  = RESULTS / "run_meta.json"
+METRICS_JSON = RESULTS / "metrics_config.json"
 
 PY = sys.executable  # current python
 
+# ---------- central metrics ----------
+# Tweak here; this gets printed and exported to all steps as env vars.
+METRICS = {
+    # Kelly & staking
+    "KELLY_FRACTION": 0.50,       # 0.0–1.0
+    "KELLY_SCALE": 1.00,          # multiply Kelly to be more/less aggressive
+    "STAKE_CAP_PCT": 0.04,        # max % of bankroll per bet
+    "DAILY_RISK_BUDGET_PCT": 0.12,# cap total risk per day
+
+    # Value thresholds
+    "MIN_EDGE_EV": 0.02,          # minimum EV to accept (2%)
+    "MIN_PROBABILITY": 0.05,      # ignore ultra-longshots below 5%
+
+    # TrueEdge8 weights (example blend)
+    "WEIGHT_SURFACE_BOOST": 0.18,
+    "WEIGHT_RECENT_FORM": 0.22,
+    "WEIGHT_ELO_CORE": 0.28,
+    "WEIGHT_SERVE_RETURN_SPLIT": 0.10,
+    "WEIGHT_HEAD2HEAD": 0.06,
+    "WEIGHT_TRAVEL_FATIGUE": -0.05,  # negative weight reduces edge
+    "WEIGHT_INJURY_PENALTY": -0.07,
+    "WEIGHT_MARKET_DRIFT": 0.08,
+
+    # Odds & vig handling
+    "VIG_METHOD": "shin",         # 'shin' | 'proportional' | 'none'
+    "ODDS_PRIORITY": "close,live,synthetic",  # fetch/use order
+
+    # Bankroll & settlement
+    "BANKROLL_START": 1000.0,
+    "BANKROLL_FILE": str(STATE_DIR / "bankroll.json"),
+
+    # Hygiene / filters
+    "IGNORE_INPLAY_AFTER_MIN": 25,  # ignore live picks after minute 25
+    "MAX_MATCHES_PER_EVENT": 3,     # limit exposure per tournament
+}
+
+# ---------- utils ----------
 def log(msg):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{ts}] {msg}", flush=True)
 
-def run(cmd, timeout=600):
-    """Run a command list; raise on nonzero."""
-    log(f"→ {cmd}")
-    t0 = time.time()
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout)
-    dt = time.time() - t0
-    if proc.stdout:
-        print(proc.stdout.strip())
-    if proc.returncode != 0:
-        if proc.stderr:
-            print(proc.stderr.strip(), file=sys.stderr)
-        raise RuntimeError(f"Command failed ({dt:.1f}s): {' '.join(cmd)}")
-    log(f"✓ done in {dt:.1f}s")
-    return proc
-
 def ensure_dirs():
-    for p in [RESULTS, LIVE_RES, STATE_DIR, DOTSTATE, DOCS_DIR, REPO_ROOT / "data" / "raw" / "odds"]:
+    for p in [RESULTS, LIVE_RES, STATE_DIR, DOTSTATE, DOCS_DIR, RAW_DIR, ODDS_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 def write_meta(mode, status="ok", extra=None):
@@ -61,21 +90,53 @@ def write_meta(mode, status="ok", extra=None):
     RUN_META.write_text(json.dumps(meta, indent=2))
     log(f"meta → {RUN_META}")
 
+def dump_metrics():
+    METRICS_JSON.write_text(json.dumps(METRICS, indent=2))
+    log("=== ACTIVE METRICS / PARAMETERS ===")
+    for k, v in METRICS.items():
+        log(f"{k} = {v}")
+    log(f"metrics → {METRICS_JSON}")
+
+def run(cmd, timeout=900, extra_env=None):
+    """Run a command with merged env; raise on nonzero."""
+    env = os.environ.copy()
+    # export metrics
+    for k, v in METRICS.items():
+        env[k] = str(v)
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
+    log(f"→ {cmd}")
+    t0 = time.time()
+    proc = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout, env=env
+    )
+    dt = time.time() - t0
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.returncode != 0:
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        raise RuntimeError(f"Command failed ({dt:.1f}s): {' '.join(cmd)}")
+    log(f"✓ done in {dt:.1f}s")
+    return proc
+
 def fresh_file(p: Path, max_age_min: int) -> bool:
     if not p.exists(): return False
     age = time.time() - p.stat().st_mtime
     return age <= max_age_min * 60
 
+# ---------- steps ----------
 def step_fetch_daily():
-    # Prefer close odds for daily; backfill with synthetic if needed
-    run([PY, str(SCRIPTS / "fetch_tennis_data.py")])
-    run([PY, str(SCRIPTS / "fetch_close_odds.py")])
-    run([PY, str(SCRIPTS / "fill_with_synthetic_live.py")])  # harmless if not needed
+    run([PY, str(SCRIPTS / "fetch_tennis_data.py"), "--outdir", str(RAW_DIR)])
+    run([PY, str(SCRIPTS / "fetch_close_odds.py"), "--outdir", str(ODDS_DIR)])
+    if (SCRIPTS / "fill_with_synthetic_live.py").exists():
+        run([PY, str(SCRIPTS / "fill_with_synthetic_live.py"), "--outdir", str(ODDS_DIR)])
 
 def step_fetch_live():
-    run([PY, str(SCRIPTS / "fetch_live_matches.py")])
-    run([PY, str(SCRIPTS / "fetch_live_odds.py")])
-    run([PY, str(SCRIPTS / "fill_with_synthetic_live.py")])
+    run([PY, str(SCRIPTS / "fetch_live_matches.py"), "--outdir", str(RAW_DIR)])
+    run([PY, str(SCRIPTS / "fetch_live_odds.py"),   "--outdir", str(ODDS_DIR)])
+    if (SCRIPTS / "fill_with_synthetic_live.py").exists():
+        run([PY, str(SCRIPTS / "fill_with_synthetic_live.py"), "--outdir", str(ODDS_DIR)])
 
 def step_build_dataset():
     run([PY, str(SCRIPTS / "build_from_raw.py")])
@@ -87,21 +148,16 @@ def step_build_dataset():
     run([PY, str(SCRIPTS / "append_metrics.py")])
 
 def step_engine_daily():
-    # Use your pro engine as daily default
     run([PY, str(SCRIPTS / "tennis_value_picks_pro.py")])
 
 def step_engine_live():
     run([PY, str(SCRIPTS / "tennis_value_picks_live.py")])
-    # optional log of live decisions
     if (SCRIPTS / "log_live_picks.py").exists():
         run([PY, str(SCRIPTS / "log_live_picks.py")])
 
 def step_outputs_and_notify():
-    # dashboard
     if (SCRIPTS / "make_dashboard.py").exists():
         run([PY, str(SCRIPTS / "make_dashboard.py")])
-        # docs/ is the GH Pages / dashboard output target
-    # notifications (safe to skip if not configured)
     if (SCRIPTS / "notify_picks.py").exists():
         try:
             run([PY, str(SCRIPTS / "notify_picks.py")], timeout=120)
@@ -109,7 +165,6 @@ def step_outputs_and_notify():
             log(f"notify_picks soft-failed: {e}")
 
 def step_state_rollup():
-    # settle and update bankroll (skip silently if scripts not present)
     if (SCRIPTS / "settle_trades.py").exists():
         run([PY, str(SCRIPTS / "settle_trades.py")])
     if (SCRIPTS / "update_bankroll_state.py").exists():
@@ -121,10 +176,10 @@ def guard_daily_outputs():
     picks_csv = REPO_ROOT / "picks_live.csv"
     if not picks_csv.exists() or picks_csv.stat().st_size == 0:
         raise RuntimeError("picks_live.csv missing or empty — engine produced no picks.")
-    # optional freshness: ensure recent write
     if not fresh_file(picks_csv, 30):
         raise RuntimeError("picks_live.csv is stale (>30 min).")
 
+# ---------- modes ----------
 def mode_daily():
     step_fetch_daily()
     step_build_dataset()
@@ -139,15 +194,12 @@ def mode_live():
     step_engine_live()
     step_outputs_and_notify()
 
-def mode_backtest(args):
-    # assumes dataset exists; but we can ensure build to be safe
+def mode_backtest():
     step_build_dataset()
-    # matrix & sweeps if present
     if (SCRIPTS / "run_matrix_backtest.py").exists():
         run([PY, str(SCRIPTS / "run_matrix_backtest.py")])
     if (SCRIPTS / "parameter_sweep.py").exists():
         run([PY, str(SCRIPTS / "parameter_sweep.py")])
-    # reports
     if (SCRIPTS / "generate_report.py").exists():
         run([PY, str(SCRIPTS / "generate_report.py")])
     if (SCRIPTS / "merge_report.py").exists():
@@ -155,12 +207,15 @@ def mode_backtest(args):
     if (SCRIPTS / "quick_summary.py").exists():
         run([PY, str(SCRIPTS / "quick_summary.py")])
 
+# ---------- main ----------
 def main():
     parser = argparse.ArgumentParser(description="tennis-betting-bot unified pipeline")
     parser.add_argument("--mode", required=True, choices=["daily", "live", "backtest"])
     args = parser.parse_args()
 
     ensure_dirs()
+    dump_metrics()
+
     t0 = time.time()
     try:
         if args.mode == "daily":
@@ -168,8 +223,9 @@ def main():
         elif args.mode == "live":
             mode_live()
         else:
-            mode_backtest(args)
-        write_meta(args.mode, status="ok", extra={"elapsed_sec": round(time.time()-t0, 1)})
+            mode_backtest()
+        elapsed = round(time.time() - t0, 1)
+        write_meta(args.mode, status="ok", extra={"elapsed_sec": elapsed})
         log("ALL GOOD.")
     except Exception as e:
         write_meta(args.mode, status="error", extra={"error": str(e)})
