@@ -1,8 +1,3 @@
-      - name: Write EdgeSmith enrich script
-        shell: bash
-        run: |
-          mkdir -p scripts
-          cat > scripts/edge_smith_enrich.py <<'PY'
 #!/usr/bin/env python3
 import os, csv, math
 from pathlib import Path
@@ -69,7 +64,6 @@ def enrich(picks_path, bankroll, max_stake, kelly_scale, min_edge,
         base_p = fnum(r.get("model_conf"))
         p = base_p if (base_p is not None and 0.0 < base_p < 1.0) else None
 
-        # simple fallback if missing prob: tiny uplift on implied
         if p is None and implied is not None:
             p = clamp(implied * (1.0 + float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0)/100.0))
 
@@ -96,6 +90,5 @@ if __name__ == "__main__":
     kelly_scale = float(os.environ.get("KELLY_SCALE","0.5"))
     min_edge = float(os.environ.get("MIN_EDGE","0.05"))
     enrich(picks, bankroll, max_stake, kelly_scale, min_edge,
-           os.environ.get("FORCE_EDGE_STRATEGY","none"), float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0.0))
-PY
-          chmod +x scripts/edge_smith_enrich.py
+           os.environ.get("FORCE_EDGE_STRATEGY","none"),
+           float(os.environ.get("FORCE_EDGE_UPLIFT_PCT","0") or 0.0))
