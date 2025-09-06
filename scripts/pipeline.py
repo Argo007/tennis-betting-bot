@@ -9,7 +9,7 @@ This version:
 - Centralizes METRICS (Kelly + TrueEdge8 + risk controls)
 - Prints metrics at start and writes results/metrics_config.json
 - Exports metrics as env vars for every sub-process
-- Explicit --outdir for fetchers to avoid CLI errors
+- Explicit --outdir and --odds for fetchers to avoid CLI errors
 """
 
 import argparse, json, os, subprocess, sys, time
@@ -33,39 +33,38 @@ METRICS_JSON = RESULTS / "metrics_config.json"
 PY = sys.executable  # current python
 
 # ---------- central metrics ----------
-# Tweak here; this gets printed and exported to all steps as env vars.
 METRICS = {
     # Kelly & staking
-    "KELLY_FRACTION": 0.50,       # 0.0–1.0
-    "KELLY_SCALE": 1.00,          # multiply Kelly to be more/less aggressive
-    "STAKE_CAP_PCT": 0.04,        # max % of bankroll per bet
-    "DAILY_RISK_BUDGET_PCT": 0.12,# cap total risk per day
+    "KELLY_FRACTION": 0.50,
+    "KELLY_SCALE": 1.00,
+    "STAKE_CAP_PCT": 0.04,
+    "DAILY_RISK_BUDGET_PCT": 0.12,
 
     # Value thresholds
-    "MIN_EDGE_EV": 0.02,          # minimum EV to accept (2%)
-    "MIN_PROBABILITY": 0.05,      # ignore ultra-longshots below 5%
+    "MIN_EDGE_EV": 0.02,
+    "MIN_PROBABILITY": 0.05,
 
-    # TrueEdge8 weights (example blend)
+    # TrueEdge8 weights
     "WEIGHT_SURFACE_BOOST": 0.18,
     "WEIGHT_RECENT_FORM": 0.22,
     "WEIGHT_ELO_CORE": 0.28,
     "WEIGHT_SERVE_RETURN_SPLIT": 0.10,
     "WEIGHT_HEAD2HEAD": 0.06,
-    "WEIGHT_TRAVEL_FATIGUE": -0.05,  # negative weight reduces edge
+    "WEIGHT_TRAVEL_FATIGUE": -0.05,
     "WEIGHT_INJURY_PENALTY": -0.07,
     "WEIGHT_MARKET_DRIFT": 0.08,
 
     # Odds & vig handling
-    "VIG_METHOD": "shin",         # 'shin' | 'proportional' | 'none'
-    "ODDS_PRIORITY": "close,live,synthetic",  # fetch/use order
+    "VIG_METHOD": "shin",
+    "ODDS_PRIORITY": "close,live,synthetic",
 
     # Bankroll & settlement
     "BANKROLL_START": 1000.0,
     "BANKROLL_FILE": str(STATE_DIR / "bankroll.json"),
 
     # Hygiene / filters
-    "IGNORE_INPLAY_AFTER_MIN": 25,  # ignore live picks after minute 25
-    "MAX_MATCHES_PER_EVENT": 3,     # limit exposure per tournament
+    "IGNORE_INPLAY_AFTER_MIN": 25,
+    "MAX_MATCHES_PER_EVENT": 3,
 }
 
 # ---------- utils ----------
@@ -100,9 +99,8 @@ def dump_metrics():
 def run(cmd, timeout=900, extra_env=None):
     """Run a command with merged env; raise on nonzero."""
     env = os.environ.copy()
-    # export metrics
     for k, v in METRICS.items():
-        env[k] = str(v)
+        env[k] = str(v)  # export metrics to children
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
     log(f"→ {cmd}")
@@ -128,13 +126,21 @@ def fresh_file(p: Path, max_age_min: int) -> bool:
 # ---------- steps ----------
 def step_fetch_daily():
     run([PY, str(SCRIPTS / "fetch_tennis_data.py"), "--outdir", str(RAW_DIR)])
-    run([PY, str(SCRIPTS / "fetch_close_odds.py"), "--outdir", str(ODDS_DIR)])
+    run([
+        PY, str(SCRIPTS / "fetch_close_odds.py"),
+        "--outdir", str(ODDS_DIR),
+        "--odds", "oddsportal"
+    ])
     if (SCRIPTS / "fill_with_synthetic_live.py").exists():
         run([PY, str(SCRIPTS / "fill_with_synthetic_live.py"), "--outdir", str(ODDS_DIR)])
 
 def step_fetch_live():
     run([PY, str(SCRIPTS / "fetch_live_matches.py"), "--outdir", str(RAW_DIR)])
-    run([PY, str(SCRIPTS / "fetch_live_odds.py"),   "--outdir", str(ODDS_DIR)])
+    run([
+        PY, str(SCRIPTS / "fetch_live_odds.py"),
+        "--outdir", str(ODDS_DIR),
+        "--odds", "oddsportal"
+    ])
     if (SCRIPTS / "fill_with_synthetic_live.py").exists():
         run([PY, str(SCRIPTS / "fill_with_synthetic_live.py"), "--outdir", str(ODDS_DIR)])
 
