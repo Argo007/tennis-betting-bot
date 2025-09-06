@@ -1,149 +1,111 @@
-#!/usr/bin/env python3
-import argparse, os, json, pandas as pd
-from datetime import datetime, timezone
+# scripts/make_dashboard.py
+import os, csv, math, json
+from pathlib import Path
+from datetime import datetime
 
-def eur(x): 
-    try: return f"€{float(x):,.2f}"
-    except: return x
+STATE_DIR = os.environ.get("STATE_DIR",".state")
+DOCS = os.environ.get("DOCS_DIR","docs")
+HTML = os.environ.get("DASHBOARD_HTML", os.path.join(DOCS,"index.html"))
+PICKS = os.environ.get("PICKS_FILE","picks_live.csv")
+TRADE_LOG = os.path.join(STATE_DIR,"trade_log.csv")
+SETTLED = os.path.join(STATE_DIR,"settled_trades.csv")
+GOAL = float(os.environ.get("EDGE_GOAL","8.0") or 8.0)
 
-def pct(x):
-    try: return f"{float(x)*100:.1f}%"
-    except: return x
+def read_csv(p):
+    fp = Path(p)
+    if not fp.is_file() or fp.stat().st_size == 0: return []
+    with fp.open(newline='') as f:
+        return list(csv.DictReader(f))
 
-def read_csv(path, **kw):
-    if not os.path.exists(path): return pd.DataFrame()
-    try: 
-        return pd.read_csv(path, **kw)
-    except Exception:
-        return pd.DataFrame()
+def fnum(x):
+    try:
+        s=str(x).strip()
+        if s.endswith('%'): return float(s[:-1])/100.0
+        return float(s)
+    except: return None
 
-def card(label, value):
-    return f"""<div class="card"><div class="label">{label}</div><div class="value">{value}</div></div>"""
+def td(s): return f"<td>{s}</td>"
 
-def table_html(df, max_rows=30):
-    if df.empty: 
-        return "<p><i>No data</i></p>"
-    shown = df.head(max_rows).copy()
-    return shown.to_html(index=False, classes="tbl", border=0, justify="center")
+def table(rows, cols):
+    if not rows: return "<i>(none)</i>"
+    head = "<tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
+    body = []
+    for r in rows:
+        body.append("<tr>" + "".join(td(r.get(c,"")) for c in cols) + "</tr>")
+    return f"<table>{head}{''.join(body)}</table>"
+
+def bucket(e):
+    try:
+        e=float(e)
+        if e >= 0.05: return "🟢"
+        if e >= 0.02: return "🟡"
+        if e < 0: return "🔴"
+    except: pass
+    return "⚪️"
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--state-dir", required=True)
-    ap.add_argument("--live-dir", required=True)
-    ap.add_argument("--results-dir", required=True)
-    ap.add_argument("--min-edge", required=True)
-    ap.add_argument("--kelly", required=True)
-    ap.add_argument("--max-frac", required=True)
-    ap.add_argument("--abs-cap", required=True)
-    args = ap.parse_args()
+    picks = read_csv(PICKS)
+    trades = read_csv(TRADE_LOG)
+    settled = read_csv(SETTLED)
 
-    # state
-    bankroll_json = os.path.join(args.state_dir, "bankroll.json")
-    bankroll = 1000.0
-    settled = 0
-    try:
-        with open(bankroll_json, "r") as f:
-            data = json.load(f)
-            bankroll = float(data.get("bankroll", bankroll))
-            settled = int(data.get("settled_count", 0))
-    except Exception:
-        pass
+    total_edge = 0.0
+    total_kelly = 0.0
+    top = []
+    for r in picks:
+        e = fnum(r.get("edge")); k=fnum(r.get("kelly_stake")); o=fnum(r.get("odds")); ip=fnum(r.get("implied_p"))
+        total_edge += (e or 0.0)
+        total_kelly += (k or 0.0)
+        top.append({
+            "🏷": bucket(e),
+            "match": r.get("match","—"),
+            "selection": r.get("selection","—"),
+            "odds": f"{o:.2f}" if o else (r.get("odds") or ""),
+            "implied_p": f"{(ip*100):.1f}%" if ip else "",
+            "edge": f"{e:.4f}" if e is not None else "",
+            "kelly€": f"{k:.2f}" if k else "",
+        })
+    top = sorted(top, key=lambda x: float(x.get("edge") or -1e9), reverse=True)[:20]
 
-    # derived metrics from trade_log & close_odds if available
-    trades = read_csv(os.path.join(args.state_dir, "trade_log.csv"))
-    # normalise columns
-    for col in ("edge","p","clv"):
-        if col in trades.columns:
-            try: trades[col] = pd.to_numeric(trades[col], errors="coerce")
-            except: pass
-    if "pnl" in trades.columns:
-        try: trades["pnl"] = pd.to_numeric(trades["pnl"], errors="coerce")
-        except: pass
+    total_pts = total_edge*100
+    prog = int(max(0,min(100,(total_pts/GOAL)*100))) if GOAL>0 else 0
+    bar = "█"*(prog//10)+"░"*(10-prog//10)
 
-    last24 = trades.tail(25)  # proxy for "recent"
-    avg_clv = last24["clv"].mean() if "clv" in last24.columns and not last24.empty else 0.0
-
-    # sections
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    cards = "".join([
-        card("Bankroll", eur(bankroll)),
-        card("Settled (count)", f"{settled}"),
-        card("Open (count)", f"{0}"),
-        card("Avg CLV", f"{avg_clv:.4f}"),
-    ])
-
-    # recent settled trades (if present)
-    cols = [c for c in ["match_id","selection","odds","p","edge","stake_eur","close_odds","clv","pnl","settled_ts"] if c in trades.columns]
-    recent_tbl = table_html(trades[cols].sort_values("settled_ts", ascending=False)) if cols else "<p><i>No data</i></p>"
-
-    # live picks table (top)
-    live_picks = read_csv(os.path.join(args.live_dir, "picks_live.csv"))
-    cols_live = [c for c in ["match_id","sel","odds","p","edge"] if c in live_picks.columns]
-    live_tbl = table_html(live_picks[cols_live]) if cols_live else "<p><i>No data</i></p>"
-
-    # historical picks (your sample)
-    historical = read_csv(os.path.join(args.results_dir, "picks_final.csv"))
-    cols_hist = [c for c in ["match_id","player_a","player_b","odds","p","edge"] if c in historical.columns]
-    hist_tbl = table_html(historical[cols_hist]) if cols_hist else "<p><i>No data</i></p>"
-
-    html = f"""
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    html = f"""<!doctype html>
+<meta charset="utf-8">
+<title>Tennis Engine — Dashboard</title>
 <style>
-  .wrap {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-  h1 {{ margin-bottom: 4px; }}
-  .meta {{ color:#666; margin-bottom: 14px }}
-  .cards {{ display:flex; flex-wrap:wrap; gap:10px; margin:12px 0 20px }}
-  .card {{ background:#0d1117; color:#e6edf3; border:1px solid #30363d; padding:10px 14px; border-radius:10px; min-width:140px }}
-  .card .label {{ font-size:12px; opacity:.8 }}
-  .card .value {{ font-size:18px; font-weight:700 }}
-  h2 {{ margin:18px 0 8px }}
-  .tbl {{ border-collapse: collapse; width: 100%; }}
-  .tbl th, .tbl td {{ padding: 6px 10px; border-bottom: 1px solid #e5e7eb; }}
-  .tbl tr:nth-child(even) {{ background: #f9fafb; }}
-  .section {{ margin-bottom: 22px }}
-  .pill {{ display:inline-block; font-size:12px; border:1px solid #e5e7eb; border-radius:999px; padding:2px 8px; margin-left:6px; color:#374151 }}
+body{{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:950px;margin:2rem auto;padding:0 1rem}}
+table{{border-collapse:collapse;width:100%;margin:0.5rem 0}}
+th,td{{border:1px solid #ddd;padding:6px 8px;font-size:14px}}
+th{{background:#f6f6f6;text-align:left}}
+kbd{{background:#eee;padding:1px 4px;border-radius:3px}}
+.progress{{font-family:monospace}}
+.badge{{display:inline-block;padding:.2rem .5rem;background:#222;color:#fff;border-radius:.4rem;font-size:12px}}
+.note{{color:#555;font-size:13px}}
 </style>
-<div class="wrap">
-  <h1>Tennis Engine — Summary</h1>
-  <div class="meta">Generated: {now}
-    <span class="pill">min_edge {args.min_edge}</span>
-    <span class="pill">kelly {args.kelly}</span>
-    <span class="pill">max_frac {args.max_frac}</span>
-    <span class="pill">cap €{args.abs_cap}</span>
-  </div>
 
-  <div class="cards">{cards}</div>
+<h1>Tennis Engine — Run Summary <span class="note">({now})</span></h1>
 
-  <div class="section">
-    <h2>Recent Settled Trades</h2>
-    {recent_tbl}
-  </div>
+<p><b>Total Edge:</b> {total_pts:.2f} pts / Goal {GOAL:.2f}
+  <span class="progress"> {bar} {prog}%</span>
+  &nbsp; • &nbsp; <b>Total Kelly stake:</b> €{total_kelly:.2f}
+</p>
 
-  <div class="section">
-    <h2>Top Live Picks</h2>
-    {live_tbl}
-  </div>
+<h2>🔥 Top Picks by Edge</h2>
+{table(top, ["🏷","match","selection","odds","implied_p","edge","kelly€"])}
 
-  <div class="section">
-    <h2>Historical Picks (latest)</h2>
-    {hist_tbl}
-  </div>
-</div>
+<h2>Last 20 Trades</h2>
+{table(trades[-20:], ["ts","match","selection","odds","edge","stake"])}
+
+<h2>Last 20 Settlements</h2>
+{table(settled[-20:], ["ts","match","selection","odds","edge","stake","result","pnl","clv"])}
+
+<p class="note">Built by <b>EdgeSmith</b>. Inputs: <kbd>{PICKS}</kbd> • State: <kbd>{STATE_DIR}</kbd></p>
 """
-    # Write to GitHub Actions Job Summary
-    try:
-        from pathlib import Path
-        summary = os.environ.get("GITHUB_STEP_SUMMARY")
-        if summary:
-            Path(summary).write_text(html, encoding="utf-8")
-        else:
-            # Local run fallback
-            out = os.path.join(args.results_dir, "dashboard.html")
-            os.makedirs(args.results_dir, exist_ok=True)
-            with open(out, "w", encoding="utf-8") as f:
-                f.write(html)
-            print(f"Wrote {out}")
-    except Exception as e:
-        print("Could not write job summary:", e)
+    Path(DOCS).mkdir(parents=True, exist_ok=True)
+    Path(HTML).write_text(html, encoding="utf-8")
+    print(f"Wrote dashboard -> {HTML}")
 
 if __name__ == "__main__":
     main()
