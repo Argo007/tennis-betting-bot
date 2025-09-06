@@ -9,8 +9,7 @@ on:
         options: [daily, live, backtest]
         default: daily
   schedule:
-    # 07:10 UTC daily (09:10 NL) – adjust as you like
-    - cron: "10 7 * * *"
+    - cron: "10 7 * * *"  # 07:10 UTC daily
 
 concurrency:
   group: tennis-engine-${{ github.ref }}
@@ -34,8 +33,7 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -44,26 +42,23 @@ jobs:
 
       - name: Run pipeline
         env:
-          # Optional secrets (used by notify_picks.py etc.)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # add more as needed (e.g., API keys)
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           MODE="${{ github.event.inputs.mode }}"
           if [ -z "$MODE" ]; then MODE="daily"; fi
           python scripts/pipeline.py --mode "$MODE"
 
-      - name: Upload artifacts (picks & meta)
+      - name: Upload artifacts (picks, meta, metrics)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: results-${{ github.run_id }}
           path: |
-            picks_live.csv
             results/**
+            picks_live.csv
             live_results/**
             docs/**
             state/**
             .state/**
           if-no-files-found: warn
-
