@@ -1,6 +1,5 @@
 name: Tennis Engine LIVE (Manual Only)
 
-# Needs these so we can push commits and publish Pages from THIS workflow
 permissions:
   contents: write
   pages: write
@@ -10,13 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "choose what to run (live = fast generate+log; all = full pipeline + deploy)"
+        description: "live = generate+log only, all = full pipeline + deploy"
         type: choice
         required: true
         default: "all"
-        options: ["all", "live"]
+        options: ["all","live"]
       min_edge:
-        description: "edge threshold (e.g., 0.05)"
+        description: "edge threshold (decimal, e.g., 0.05)"
         required: true
         default: "0.05"
       kelly_scale:
@@ -32,15 +31,25 @@ on:
         type: choice
         required: true
         default: "false"
-        options: ["false", "true"]
+        options: ["false","true"]
       edge_goal:
-        description: "Total Edge goal (points) for progress bar"
+        description: "Total Edge goal (points)"
         required: true
         default: "8.0"
       top_n:
-        description: "How many top picks to show"
+        description: "Top N picks to show"
         required: true
         default: "15"
+      force_edge_strategy:
+        description: "if edge cannot be inferred from data"
+        type: choice
+        required: true
+        default: "none"
+        options: ["none","uplift_pct","min_edge"]
+      force_edge_uplift_pct:
+        description: "used when force_edge_strategy=uplift_pct (e.g. 3 = +3% uplift to implied prob)"
+        required: true
+        default: "0"
 
 env:
   PYTHON_VERSION: "3.11"
@@ -59,6 +68,8 @@ env:
   INPUT_ASSUME_RANDOM: ${{ github.event.inputs.assume_random_if_missing }}
   EDGE_GOAL: ${{ github.event.inputs.edge_goal }}
   TOP_N: ${{ github.event.inputs.top_n }}
+  FORCE_EDGE_STRATEGY: ${{ github.event.inputs.force_edge_strategy }}
+  FORCE_EDGE_UPLIFT_PCT: ${{ github.event.inputs.force_edge_uplift_pct }}
 
 jobs:
   engine:
@@ -79,7 +90,6 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade tabulate
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
@@ -91,8 +101,9 @@ jobs:
         run: |
           mkdir -p "${STATE_DIR}" "${DOCS_DIR}" "${SNAPSHOT_DIR}"
           [ -f "${TRADE_LOG}" ] || echo "ts,match,selection,odds,edge,stake" > "${TRADE_LOG}"
+          [ -f "${DOCS_DIR}/.nojekyll" ] || touch "${DOCS_DIR}/.nojekyll"
 
-      - name: Stamp run (set RUN_TS env)
+      - name: Stamp run
         run: echo "RUN_TS=$(date -u +'%Y%m%d%H%M%S')" >> "$GITHUB_ENV"
 
       - name: Generate picks (auto-detect CLI)
@@ -112,31 +123,152 @@ jobs:
             GEN_FAIL=1
           fi
           if [ "$GEN_FAIL" = "1" ]; then
-            echo "::warning::Pick generator missing/failed; creating placeholder ${PICKS_FILE}"
+            echo "::warning::No generator found or it failed — creating placeholder ${PICKS_FILE}"
             echo "ts,match,selection,odds,edge,stake" > "${PICKS_FILE}"
           fi
 
-      - name: Compute MAX_STAKE_EUR
+      - name: Compute bankroll + MAX_STAKE_EUR
         id: bankroll
         run: |
           python - <<'PY'
           import os, json, pathlib
-          state = os.environ['STATE_DIR']
+          p = pathlib.Path(os.environ['STATE_DIR']) / 'bankroll.json'
           mf = float(os.environ['INPUT_MAX_FRAC'])
-          p = pathlib.Path(state) / 'bankroll.json'
           br = 1000.0
           if p.is_file():
-              try:
-                  br = float(json.load(open(p)).get('bankroll', br))
-              except Exception:
-                  pass
+              try: br = float(json.load(open(p)).get('bankroll', br))
+              except: pass
           ms = round(br * mf, 2)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"bankroll={br}\n")
               f.write(f"max_stake={ms}\n")
-          print(f"Bankroll={br} max_frac={mf} MAX_STAKE_EUR={ms}")
+          print(f"Bankroll={br}  max_frac={mf}  MAX_STAKE_EUR={ms}")
           PY
 
-      - name: Log live picks
+      - name: Enrich picks (derive/force edge + Kelly if missing)
+        if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
+        run: |
+          python - <<'PY'
+          import os, csv
+          from pathlib import Path
+
+          picks_fp = os.environ['PICKS_FILE']
+          if not Path(picks_fp).is_file() or Path(picks_fp).stat().st_size == 0:
+            raise SystemExit(0)
+
+          bankroll = float("${{ steps.bankroll.outputs.bankroll }}")
+          max_stake = float("${{ steps.bankroll.outputs.max_stake }}")
+          kelly_scale = float(os.environ.get('INPUT_KELLY_SCALE','0.5') or 0.5)
+          min_edge = float(os.environ.get('INPUT_MIN_EDGE','0.05') or 0.05)
+          force_strategy = (os.environ.get('FORCE_EDGE_STRATEGY') or 'none').strip().lower()
+          uplift_pct = float(os.environ.get('FORCE_EDGE_UPLIFT_PCT','0') or 0.0)/100.0
+
+          def fnum(x):
+            try:
+              s = str(x).strip()
+              if s.endswith('%'): return float(s[:-1])/100.0
+              return float(s)
+            except: return None
+
+          def infer_edge(row):
+            odds = fnum(row.get('odds'))
+            if not (odds and odds>0): return None, None
+            implied = 1.0/odds
+            # 1) direct edge
+            e = fnum(row.get('edge'))
+            if e is not None:
+              if abs(e) > 1.5: e = e/100.0
+              p = max(0.0, min(1.0, implied*(1.0+e)))
+              return e, p
+            # 2) probability columns
+            for k in ('prob','win_prob','p','model_p'):
+              p = fnum(row.get(k))
+              if p is not None and 0.0 < p < 1.0:
+                e = (p / implied) - 1.0
+                return e, p
+            # 3) fair odds
+            for k in ('fair','fair_odds','true_odds','model_odds','price'):
+              fo = fnum(row.get(k))
+              if fo and fo>0:
+                p = 1.0/fo
+                e = (p / implied) - 1.0
+                return e, p
+            # 4) EV/ROI
+            for k in ('ev','expected_value','roi','return'):
+              ev = fnum(row.get(k))
+              if ev is not None:
+                if abs(ev) > 1.5: ev = ev/100.0
+                p = (ev + 1.0)/odds
+                if 0.0 < p < 1.0:
+                  e = (p / implied) - 1.0
+                  return e, p
+            # 5) invert Kelly
+            for k in ('kelly','kelly_frac','kelly%'):
+              kf = fnum(row.get(k))
+              if kf is not None:
+                if kf > 1.5: kf = kf/100.0
+                b = odds - 1.0
+                if b > 0:
+                  p = ((kf * b) + 1.0) / (b + 1.0)
+                  if 0.0 < p < 1.0:
+                    e = (p / implied) - 1.0
+                    return e, p
+            return None, None
+
+          rows = list(csv.DictReader(open(picks_fp)))
+          if not rows: raise SystemExit(0)
+
+          headers = list(rows[0].keys())
+          for h in ('edge','stake'): 
+            if h not in headers: headers.append(h)
+
+          inferred, forced, kept = 0, 0, 0
+          out=[]
+          for r in rows:
+            odds = fnum(r.get('odds'))
+            if not (odds and odds>0):
+              out.append(r); continue
+            e, p_true = infer_edge(r)
+            if e is not None: kept += 1
+            if e is None and force_strategy == 'uplift_pct' and uplift_pct>0:
+              implied = 1.0/odds
+              p_true = min(1.0, implied * (1.0 + uplift_pct))
+              e = (p_true / implied) - 1.0
+              forced += 1
+            elif e is None and force_strategy == 'min_edge':
+              implied = 1.0/odds
+              e = min_edge
+              p_true = implied*(1.0+e)
+              forced += 1
+            else:
+              inferred += 1 if e is not None else 0
+
+            # Kelly stake
+            stake = fnum(r.get('stake'))
+            if stake is None:
+              b = odds - 1.0
+              if e is not None:
+                if p_true is None:
+                  implied = 1.0/odds
+                  p_true = max(0.0, min(1.0, implied*(1.0+e)))
+                if b > 0 and 0.0 < p_true < 1.0:
+                  k_star = max(0.0, (b*p_true - (1.0-p_true))/b)
+                  stake = min(max_stake, bankroll * kelly_scale * k_star)
+              stake = stake or 0.0
+
+            r['edge'] = (f"{e:.6f}" if e is not None else "")
+            r['stake'] = (f"{stake:.2f}" if stake is not None else "")
+            out.append(r)
+
+          with open(picks_fp, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerows(out)
+
+          print(f"Enriched picks -> kept:{kept} inferred:{inferred} forced:{forced}  strategy={force_strategy} uplift={int(float(os.environ.get('FORCE_EDGE_UPLIFT_PCT','0')))}%")
+          PY
+
+      - name: Log live picks (append to trade_log.csv)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
           python - <<'PY'
@@ -144,26 +276,18 @@ jobs:
           picks = os.environ['PICKS_FILE']
           log = os.environ['TRADE_LOG']
           run_ts = os.environ.get('RUN_TS') or str(int(time.time()))
-          ms = float("${{ steps.bankroll.outputs.max_stake }}")
           p = pathlib.Path(picks)
-          if (not p.is_file()) or p.stat().st_size == 0:
-              sys.exit(0)
+          if (not p.is_file()) or p.stat().st_size == 0: sys.exit(0)
           rows = list(csv.DictReader(open(picks)))
-          if not rows:
-              sys.exit(0)
+          if not rows: sys.exit(0)
           if not pathlib.Path(log).is_file():
               with open(log, 'w', newline='') as f:
                   csv.writer(f).writerow(["ts","match","selection","odds","edge","stake"])
           out=[]
           for r in rows:
               ts=(r.get("ts") or "").strip() or run_ts
-              odds=(r.get("odds") or "").strip()
-              edge=(r.get("edge") or "").strip()
-              try: stake=min(float(r.get("stake") or ms), ms)
-              except Exception: stake=ms
-              out.append([ts, r.get("match",""), r.get("selection",""), odds, edge, f"{stake:.2f}"])
+              out.append([ts, r.get("match",""), r.get("selection",""), r.get("odds",""), r.get("edge",""), r.get("stake","")])
           with open(log, "a", newline="") as f: csv.writer(f).writerows(out)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f: f.write(f"new_rows={len(out)}\n")
           print(f"Appended {len(out)} rows to {log}")
           PY
 
@@ -196,12 +320,14 @@ jobs:
             echo '<!doctype html><meta charset="utf-8"><title>Tennis Engine</title><h1>Tennis Engine</h1><p>Placeholder dashboard.</p>' > "${DASHBOARD_HTML}"
           fi
 
-      - name: Results summary (visible in this Actions run)
+      - name: Results summary (rich, robust)
         continue-on-error: true
         env:
           KELLY_SCALE_INPUT: ${{ env.INPUT_KELLY_SCALE }}
           EDGE_GOAL: ${{ env.EDGE_GOAL }}
           TOP_N: ${{ env.TOP_N }}
+          FORCE_EDGE_STRATEGY: ${{ env.FORCE_EDGE_STRATEGY }}
+          FORCE_EDGE_UPLIFT_PCT: ${{ env.FORCE_EDGE_UPLIFT_PCT }}
         run: |
           python - <<'PY'
           try:
@@ -213,11 +339,13 @@ jobs:
             log_fp   = os.path.join(sd, 'trade_log.csv')
             set_fp   = os.path.join(sd, 'settled_trades.csv')
             bank_fp  = os.path.join(sd, 'bankroll.json')
-            dashboard = os.environ['DASHBOARD_HTML']
             run_ts = os.environ.get('RUN_TS')
             kelly_scale = float(os.environ.get('KELLY_SCALE_INPUT','0.5') or 0.5)
             top_n = int(os.environ.get('TOP_N','15') or 15)
             goal  = float(os.environ.get('EDGE_GOAL','8.0') or 8.0)
+
+            force_strategy = os.environ.get('FORCE_EDGE_STRATEGY','none')
+            uplift_pct = os.environ.get('FORCE_EDGE_UPLIFT_PCT','0')
 
             def read_csv(path):
               if not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -228,74 +356,60 @@ jobs:
             def last_n(rows, n): return rows[-n:] if rows else []
 
             def fnum(x):
-              try: return float(x)
+              try:
+                s=str(x).strip()
+                if s.endswith('%'): return float(s[:-1])/100.0
+                return float(s)
               except: return None
-
-            def safe_key(x, default):
-              v = fnum(x)
-              return v if v is not None else default
-
-            bankroll = None
-            if os.path.isfile(bank_fp):
-              try: bankroll = float(json.load(open(bank_fp)).get('bankroll'))
-              except: pass
 
             picks = read_csv(picks_fp)
             trades = read_csv(log_fp)
             settled = read_csv(set_fp)
+            bankroll=None
+            try: bankroll=float(json.load(open(bank_fp)).get('bankroll'))
+            except: pass
 
-            new_trades = sum(1 for r in trades if (r.get("ts") or "").strip() == (run_ts or "")) if trades else 0
+            new_trades=sum(1 for r in trades if (r.get("ts") or "").strip()==(run_ts or "")) if trades else 0
 
             def edge_bucket(e):
-              if e is None: return "⚪️"
+              if e is None or (isinstance(e,str) and not e): return "⚪️"
+              try: e=float(e)
+              except: return "⚪️"
               if e >= 0.05: return "🟢"
               if e >= 0.02: return "🟡"
               if e < 0:     return "🔴"
               return "⚪️"
 
-            def kelly_fraction(odds, true_p):
-              b = odds - 1.0
-              if not (b > 0 and 0 < true_p < 1): return 0.0
-              return max(0.0, (b*true_p - (1-true_p)) / b)
-
-            top_rows=[]; total_edge=0.0; total_kelly_eur=0.0
-            missing_edge=0; inferred_edge=0
+            # KPIs and tables
+            total_edge=0.0; total_kelly=0.0
+            buckets={"🟢":0,"🟡":0,"🔴":0,"⚪️":0}
+            rows=[]
             for r in picks or []:
-              odds = fnum(r.get("odds"))
-              e = fnum(r.get("edge"))
-              if e is None:
-                for k in ("prob","win_prob","p","model_p"):
-                  p_est = fnum(r.get(k))
-                  if p_est is not None and 0 < p_est < 1 and odds and odds>0:
-                    implied = 1.0/odds
-                    e = (p_est / implied) - 1.0
-                    inferred_edge += 1
-                    break
-                if e is None:
-                  missing_edge += 1
-              implied = (1/odds) if odds and odds>0 else None
-              true_p = max(0.0, min(1.0, implied*(1+e))) if (implied is not None and e is not None) else None
-              kf = kelly_fraction(odds, true_p) if (odds and true_p is not None) else 0.0
-              kelly_eur = (bankroll or 0.0) * kelly_scale * kf
-              if e is not None: total_edge += e
-              total_kelly_eur += kelly_eur
-              top_rows.append({
-                "🏷": edge_bucket(e),
+              e=fnum(r.get("edge")); k=fnum(r.get("stake")); o=fnum(r.get("odds"))
+              tag=edge_bucket(e); buckets[tag]+=1
+              if e is not None: total_edge+=e
+              if k: total_kelly+=k
+              rows.append({
+                "🏷": tag,
                 "match": r.get("match",""),
                 "selection": r.get("selection",""),
-                "odds": f"{odds:.2f}" if odds is not None else (r.get("odds","") or ""),
-                "implied_p": f"{(1/odds)*100:.1f}%" if odds and odds>0 else "",
+                "odds": f"{o:.2f}" if o else (r.get("odds","") or ""),
+                "implied_p": f"{(1/o)*100:.1f}%" if o and o>0 else "",
                 "edge": f"{e:.4f}" if e is not None else "",
-                "kelly€": f"{kelly_eur:.2f}" if kelly_eur>0 else (r.get("stake","") or ""),
+                "kelly€": f"{k:.2f}" if k else "",
               })
-            top_rows = sorted(top_rows, key=lambda r: safe_key(r.get("edge"), -1e9), reverse=True)[:top_n] if top_rows else []
-            top_pick = top_rows[0] if top_rows else None
 
-            last_set = last_n(settled, 20)
-            pnls = [fnum(r.get("pnl")) for r in last_set if fnum(r.get("pnl")) is not None]
-            clvs = [fnum(r.get("clv")) for r in last_set if fnum(r.get("clv")) is not None]
-            pnl_sum = sum(pnls) if pnls else None
-            clv_avg = (sum(clvs)/len(clvs)) if clvs else None
+            def key_edge(row):
+              try: return float(row.get("edge") or -1e9)
+              except: return -1e9
+            top_rows=sorted(rows,key=key_edge,reverse=True)[:top_n] if rows else []
+            top_pick=top_rows[0] if top_rows else None
+
+            last_set=last_n(settled,20)
+            pnls=[fnum(r.get("pnl")) for r in last_set if fnum(r.get("pnl")) is not None]
+            clvs=[fnum(r.get("clv")) for r in last_set if fnum(r.get("clv")) is not None]
+            pnl_sum=sum(pnls) if pnls else None
+            clv_avg=(sum(clvs)/len(clvs)) if clvs else None
 
             def md_table(rows, cols):
               if not rows: return "_(none)_\n"
@@ -304,31 +418,30 @@ jobs:
                 out.append("| "+" | ".join("" if r.get(c) is None else str(r.get(c)) for c in cols)+" |")
               return "\n".join(out)+"\n"
 
-            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+            now=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+            total_edge_pts=total_edge*100
+            prog=int(max(0,min(100,(total_edge_pts/goal)*100))) if goal>0 else 0
+            bar="█"*(prog//10)+"░"*(10-prog//10)
+
             kpis=[]
             if bankroll is not None: kpis.append(f"**Bankroll**: €{bankroll:,.2f}")
             kpis.append(f"**New trades this run**: {new_trades}")
             kpis.append(f"**Total trades**: {len(trades)}")
             if pnl_sum is not None: kpis.append(f"**PnL (last 20)**: {pnl_sum:+.2f}")
             if clv_avg is not None: kpis.append(f"**Avg CLV (last 20)**: {clv_avg:+.4f}")
+            kpis.append(f"**Total Edge**: {total_edge_pts:.2f} pts / **Goal {goal:.2f}**  `{bar}` {prog}%")
+            if total_kelly>0: kpis.append(f"**Total Kelly stake (this picks file)**: €{total_kelly:.2f} @ scale={kelly_scale:g}")
 
-            total_edge_points = total_edge*100
-            prog=int(max(0,min(100,(total_edge_points/goal)*100))) if goal>0 else 0
-            bar="█"*(prog//10)+"░"*(10-prog//10)
-            kpis.append(f"**Total Edge**: {total_edge_points:.2f} pts / **Goal {goal:.2f}**  `{bar}` {prog}%")
-            if bankroll is not None:
-              kpis.append(f"**Total Kelly stake (est.)**: €{total_kelly_eur:.2f} @ scale={kelly_scale:g}")
-
-            md=[]
-            md.append(f"# Tennis Engine — Run Summary ({now})\n")
-            if picks:
-              if inferred_edge>0:
-                md.append(f"> ℹ️ **Inferred edge** for {inferred_edge} picks from probability columns (prob/win_prob/p/model_p).\n")
-              if missing_edge == len(picks):
-                md.append("> ⚠️ **No edge values found** in current picks and none could be inferred. Total Edge stays at 0.\n")
-            else:
+            md=[f"# Tennis Engine — Run Summary ({now})\n"]
+            if force_strategy!="none":
+              md.append(f"> ⚙️ *Forced edge strategy:* **{force_strategy}**  (uplift={uplift_pct}%).\n")
+            if picks and all((r.get('edge') or "")=="" for r in picks):
+              md.append("> ⚠️ No edge could be inferred/forced from the current picks. Provide one of: edge, prob, fair_odds, EV, or kelly; or set a force strategy.\n")
+            elif not picks:
               md.append("> ⚠️ No picks produced.\n")
+
             md.append(" • ".join(kpis)+"\n")
+            md.append(f"**Buckets:** 🟢 {buckets['🟢']}  | 🟡 {buckets['🟡']}  | 🔴 {buckets['🔴']}  | ⚪️ {buckets['⚪️']}\n")
 
             if top_pick:
               md.append("### 🔥 Top Pick\n")
@@ -339,22 +452,19 @@ jobs:
 
             md.append("## Top Picks by Edge\n")
             md.append(md_table(top_rows, ["🏷","match","selection","odds","implied_p","edge","kelly€"]))
-
             md.append("## Last 20 Trades (trade_log)\n")
-            md.append(md_table(last_n(trades,20), ["ts","match","selection","odds","edge","stake"]))
-
+            md.append(md_table(trades[-20:] if trades else [], ["ts","match","selection","odds","edge","stake"]))
             md.append("## Last 20 Settlements\n")
             md.append(md_table(last_set, ["ts","match","selection","odds","edge","stake","result","pnl","clv"]))
+            md.append("\n**Dashboard**: `docs/index.html` — published by this workflow when mode=all.\n")
 
-            md.append(f"\n**Dashboard**: `docs/index.html` — published by this workflow when mode=all.\n")
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write("\n".join(md))
-
           except Exception as e:
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"### Summary generation error\n```\n{e}\n```\n(Workflow continues.)\n")
           PY
 
-      - name: Commit & push changes to main
+      - name: Commit & push changes
         run: |
           git add -A
           if git diff --cached --quiet; then
@@ -362,11 +472,10 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "engine: update state+dashboard [skip ci]"
+            git commit -m "engine: enrich picks + update state+dashboard [skip ci]"
             git push
           fi
 
-  # --- Built-in Pages deploy (runs only for mode=all) ---
   deploy_pages:
     if: ${{ github.event.inputs.mode == 'all' }}
     needs: engine
@@ -380,15 +489,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Configure Pages
         uses: actions/configure-pages@v5
-
       - name: Upload site (docs/)
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
-
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
