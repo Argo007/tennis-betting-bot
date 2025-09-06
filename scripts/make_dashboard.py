@@ -1,8 +1,3 @@
-      - name: Write dashboard script
-        shell: bash
-        run: |
-          mkdir -p scripts
-          cat > scripts/make_dashboard.py <<'PY'
 #!/usr/bin/env python3
 import os, csv
 from pathlib import Path
@@ -88,5 +83,3 @@ def main():
     print(f"Wrote dashboard -> {HTML}")
 
 if __name__=="__main__": main()
-PY
-          chmod +x scripts/make_dashboard.py
