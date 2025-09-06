@@ -145,7 +145,24 @@ jobs:
           print(f"Bankroll={br}  max_frac={mf}  MAX_STAKE_EUR={ms}")
           PY
 
-      - name: Enrich picks (derive/force edge + Kelly if missing)
+      - name: Peek picks (debug columns)
+        if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
+        run: |
+          python - <<'PY'
+          import csv, os
+          fp=os.environ['PICKS_FILE']
+          try:
+            rows=list(csv.DictReader(open(fp)))
+            if rows:
+              print("PICKS COLUMNS:", list(rows[0].keys()))
+              print("FIRST ROW:", {k: rows[0].get(k) for k in list(rows[0].keys())[:12]})
+            else:
+              print("PICKS EMPTY")
+          except Exception as e:
+            print("PICKS READ ERROR:", e)
+          PY
+
+      - name: Enrich picks (names + derive/force edge + Kelly)
         if: env.INPUT_MODE == 'all' || env.INPUT_MODE == 'live'
         run: |
           python - <<'PY'
@@ -165,35 +182,61 @@ jobs:
 
           def fnum(x):
             try:
-              s = str(x).strip()
+              s=str(x).strip()
               if s.endswith('%'): return float(s[:-1])/100.0
               return float(s)
             except: return None
+
+          def first_nonempty(row, keys):
+            for k in keys:
+              v=row.get(k)
+              if v is not None and str(v).strip() != "":
+                return str(v).strip()
+            return ""
+
+          def infer_names(r):
+            # selection first
+            sel = first_nonempty(r, [
+              'selection','selection_name','runner','runner_name','outcome','pick','team','player','name','side'
+            ])
+            # try to build match
+            match = first_nonempty(r, [
+              'match','event','event_name','fixture','game','market','competition','tournament'
+            ])
+            if not match:
+              home = first_nonempty(r, ['home','home_team','player_a','player1','p1'])
+              away = first_nonempty(r, ['away','away_team','player_b','player2','p2'])
+              if home or away:
+                match = f"{home} vs {away}".strip()
+            if not sel:
+              # fallback: if we had home/away, pick selection as home or away based on any boolean flags
+              sel = first_nonempty(r, ['bet','bet_selection','team','player'])
+            if not match:
+              match = "—"
+            if not sel:
+              sel = "—"
+            return match, sel
 
           def infer_edge(row):
             odds = fnum(row.get('odds'))
             if not (odds and odds>0): return None, None
             implied = 1.0/odds
-            # 1) direct edge
             e = fnum(row.get('edge'))
             if e is not None:
               if abs(e) > 1.5: e = e/100.0
               p = max(0.0, min(1.0, implied*(1.0+e)))
               return e, p
-            # 2) probability columns
             for k in ('prob','win_prob','p','model_p'):
               p = fnum(row.get(k))
               if p is not None and 0.0 < p < 1.0:
                 e = (p / implied) - 1.0
                 return e, p
-            # 3) fair odds
             for k in ('fair','fair_odds','true_odds','model_odds','price'):
               fo = fnum(row.get(k))
               if fo and fo>0:
                 p = 1.0/fo
                 e = (p / implied) - 1.0
                 return e, p
-            # 4) EV/ROI
             for k in ('ev','expected_value','roi','return'):
               ev = fnum(row.get(k))
               if ev is not None:
@@ -202,7 +245,6 @@ jobs:
                 if 0.0 < p < 1.0:
                   e = (p / implied) - 1.0
                   return e, p
-            # 5) invert Kelly
             for k in ('kelly','kelly_frac','kelly%'):
               kf = fnum(row.get(k))
               if kf is not None:
@@ -219,17 +261,24 @@ jobs:
           if not rows: raise SystemExit(0)
 
           headers = list(rows[0].keys())
-          for h in ('edge','stake'): 
+          for h in ('match','selection','edge','stake'):
             if h not in headers: headers.append(h)
 
-          inferred, forced, kept = 0, 0, 0
+          kept=inferred=forced=0
           out=[]
           for r in rows:
+            # ensure names
+            m, s = infer_names(r)
+            r['match'] = m
+            r['selection'] = s
+
             odds = fnum(r.get('odds'))
             if not (odds and odds>0):
               out.append(r); continue
+
             e, p_true = infer_edge(r)
             if e is not None: kept += 1
+
             if e is None and force_strategy == 'uplift_pct' and uplift_pct>0:
               implied = 1.0/odds
               p_true = min(1.0, implied * (1.0 + uplift_pct))
@@ -243,7 +292,7 @@ jobs:
             else:
               inferred += 1 if e is not None else 0
 
-            # Kelly stake
+            # Kelly
             stake = fnum(r.get('stake'))
             if stake is None:
               b = odds - 1.0
@@ -265,7 +314,7 @@ jobs:
             w.writeheader()
             w.writerows(out)
 
-          print(f"Enriched picks -> kept:{kept} inferred:{inferred} forced:{forced}  strategy={force_strategy} uplift={int(float(os.environ.get('FORCE_EDGE_UPLIFT_PCT','0')))}%")
+          print(f"Enriched picks: kept:{kept} inferred:{inferred} forced:{forced}  strategy={force_strategy}  uplift={int(float(os.environ.get('FORCE_EDGE_UPLIFT_PCT','0')))}%")
           PY
 
       - name: Log live picks (append to trade_log.csv)
@@ -286,7 +335,7 @@ jobs:
           out=[]
           for r in rows:
               ts=(r.get("ts") or "").strip() or run_ts
-              out.append([ts, r.get("match",""), r.get("selection",""), r.get("odds",""), r.get("edge",""), r.get("stake","")])
+              out.append([ts, r.get("match","—"), r.get("selection","—"), r.get("odds",""), r.get("edge",""), r.get("stake","")])
           with open(log, "a", newline="") as f: csv.writer(f).writerows(out)
           print(f"Appended {len(out)} rows to {log}")
           PY
@@ -343,7 +392,6 @@ jobs:
             kelly_scale = float(os.environ.get('KELLY_SCALE_INPUT','0.5') or 0.5)
             top_n = int(os.environ.get('TOP_N','15') or 15)
             goal  = float(os.environ.get('EDGE_GOAL','8.0') or 8.0)
-
             force_strategy = os.environ.get('FORCE_EDGE_STRATEGY','none')
             uplift_pct = os.environ.get('FORCE_EDGE_UPLIFT_PCT','0')
 
@@ -380,7 +428,6 @@ jobs:
               if e < 0:     return "🔴"
               return "⚪️"
 
-            # KPIs and tables
             total_edge=0.0; total_kelly=0.0
             buckets={"🟢":0,"🟡":0,"🔴":0,"⚪️":0}
             rows=[]
@@ -391,8 +438,8 @@ jobs:
               if k: total_kelly+=k
               rows.append({
                 "🏷": tag,
-                "match": r.get("match",""),
-                "selection": r.get("selection",""),
+                "match": r.get("match","—"),
+                "selection": r.get("selection","—"),
                 "odds": f"{o:.2f}" if o else (r.get("odds","") or ""),
                 "implied_p": f"{(1/o)*100:.1f}%" if o and o>0 else "",
                 "edge": f"{e:.4f}" if e is not None else "",
@@ -472,7 +519,7 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "engine: enrich picks + update state+dashboard [skip ci]"
+            git commit -m "engine: infer names + enrich picks + update docs [skip ci]"
             git push
           fi
 
