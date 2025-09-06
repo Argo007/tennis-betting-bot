@@ -9,7 +9,8 @@ on:
         options: [daily, live, backtest]
         default: daily
   schedule:
-    - cron: "10 7 * * *"  # 07:10 UTC daily
+    # Run daily at 07:10 UTC (09:10 NL). Adjust as needed.
+    - cron: "10 7 * * *"
 
 concurrency:
   group: tennis-engine-${{ github.ref }}
@@ -49,16 +50,18 @@ jobs:
           if [ -z "$MODE" ]; then MODE="daily"; fi
           python scripts/pipeline.py --mode "$MODE"
 
-      - name: Upload artifacts (picks, meta, metrics)
+      - name: Upload artifacts (picks, outputs, meta, metrics, state)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: results-${{ github.run_id }}
           path: |
-            results/**
             picks_live.csv
+            outputs/**
+            results/**
             live_results/**
-            docs/**
             state/**
             .state/**
+            docs/**
           if-no-files-found: warn
+
