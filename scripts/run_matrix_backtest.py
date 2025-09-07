@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-Matrix backtest for tennis-betting-bot.
+Matrix backtest for tennis-betting-bot (robust loader + diagnostics).
 
-- Loads base market/prob data from, in order of availability:
-    1) outputs/prob_enriched.csv
-    2) data/raw/vigfree_matches.csv
-- Uses vig-free probabilities + odds to compute edges.
-- If a realized outcome column is present, uses realized PnL.
-  Otherwise, uses expected value (EV) as proxy.
+Finds input in this order:
+  1) outputs/prob_enriched.csv
+  2) outputs/edge_enriched.csv
+  3) data/raw/vigfree_matches.csv
 
-Outputs:
-  results/backtests/summary.csv            (grid results)
-  results/backtests/logs/picks_cfg<N>.csv  (per-config pick logs)
-  results/backtests/params_cfg<N>.json     (params for each config)
+Understands many column aliases:
+  - date: event_date | date
+  - players: player_a/player_b | home/away
+  - odds: odds_a/odds_b | price_a/price_b | oa/ob
+  - probs: prob_a_vigfree/prob_b_vigfree | prob_a/prob_b | pa/pb | implied_prob_a/_b
+  - outcome: winner | winner_side | winner_name
+
+If outcomes are missing, uses EV deltas (does NOT drift bankroll on EV to avoid bias).
+
+Writes:
+  results/backtests/summary.csv
+  results/backtests/logs/picks_cfg<N>.csv
+  results/backtests/params_cfg<N>.json
+  results/backtests/_diagnostics.json  (why we got 0 rows, etc.)
 """
 
 from __future__ import annotations
 import csv, json, math, os
 from pathlib import Path
 from statistics import mean, pstdev
-from datetime import datetime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR   = REPO_ROOT / "outputs"
@@ -28,294 +35,245 @@ RES_DIR   = REPO_ROOT / "results"
 BT_DIR    = RES_DIR / "backtests"
 LOG_DIR   = BT_DIR / "logs"
 
-# ---- env / defaults (inherit from pipeline but safe alone) --------------------
 BANKROLL_START        = float(os.getenv("BANKROLL_START", "1000.0"))
-KELLY_FRACTION_DFT    = float(os.getenv("KELLY_FRACTION", "0.5"))
-KELLY_SCALE_DFT       = float(os.getenv("KELLY_SCALE", "1.0"))
-STAKE_CAP_PCT_DFT     = float(os.getenv("STAKE_CAP_PCT", "0.04"))
-DAILY_RISK_BUDGET_PCT = float(os.getenv("DAILY_RISK_BUDGET_PCT", "0.12"))
 MAX_MATCHES_PER_EVENT = int(float(os.getenv("MAX_MATCHES_PER_EVENT", "3")))
 
-MIN_EDGE_EV_DFT       = float(os.getenv("MIN_EDGE_EV", "0.02"))
-MIN_PROBABILITY_DFT   = float(os.getenv("MIN_PROBABILITY", "0.05"))
+def log(m): print(f"[backtest] {m}", flush=True)
 
-def log(msg: str):
-    print(f"[backtest] {msg}", flush=True)
-
-# ---- IO helpers ---------------------------------------------------------------
+# ------- IO helpers ------------------------------------------------------------
 def find_input() -> Path | None:
-    # prefer prob_enriched (already normalized), fall back to vigfree
-    cand = [OUT_DIR / "prob_enriched.csv", RAW_DIR / "vigfree_matches.csv"]
-    for p in cand:
+    for p in [OUT_DIR/"prob_enriched.csv", OUT_DIR/"edge_enriched.csv", RAW_DIR/"vigfree_matches.csv"]:
         if p.exists() and p.stat().st_size > 0:
             return p
     return None
 
-def read_csv(path: Path) -> list[dict]:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
-    except Exception:
-        return []
+def read_csv_rows(path: Path) -> list[dict]:
+    with path.open("r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 def write_csv(rows: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        path.write_text("config_id,event_date,tournament,player,side,odds,prob,edge,stake,delta,bankroll\n")
+        path.write_text("cfg_id,n_bets,total_staked,pnl,roi,hitrate,sharpe,end_bankroll\n" if path.name=="summary.csv"
+                        else "config_id,event_date,tournament,player,side,odds,prob,edge,stake,delta,bankroll\n")
         return
     fields = list(rows[0].keys())
     with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fields})
+        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+        w.writerows(rows)
 
 def write_json(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2))
 
-def csv_has_rows(path: Path) -> bool:
+def csv_has_data(path: Path) -> bool:
     try:
-        if not path.exists() or path.stat().st_size == 0: return False
         with path.open("r", encoding="utf-8") as f:
-            r = csv.reader(f); _ = next(r, None); return next(r, None) is not None
+            r = csv.reader(f); next(r, None); return next(r, None) is not None
     except Exception:
         return False
 
-# ---- math --------------------------------------------------------------------
-def ffloat(x):
+# ------- column resolver -------------------------------------------------------
+ALIASES = {
+    "date": ["event_date","date","match_date"],
+    "tour": ["tournament","comp","event","league"],
+    "a":    ["player_a","home","a_player","a_name"],
+    "b":    ["player_b","away","b_player","b_name"],
+    "oa":   ["odds_a","price_a","oa","odd_a","decimal_odds_a"],
+    "ob":   ["odds_b","price_b","ob","odd_b","decimal_odds_b"],
+    "pa":   ["prob_a_vigfree","prob_a","implied_prob_a","pa","p_a"],
+    "pb":   ["prob_b_vigfree","prob_b","implied_prob_b","pb","p_b"],
+    "win":  ["winner","winner_side","win_side","winner_name","winner_player"],
+}
+
+def pick(row: dict, keys: list[str]) -> str:
+    lk = {k.lower(): k for k in row.keys()}
+    for k in keys:
+        if k in lk: return row[lk[k]]
+    return ""
+
+def to_float(x):
     try: return float(x)
     except: return None
 
-def kelly(prob: float, odds: float) -> float:
-    b = odds - 1.0
+def normalize(rows: list[dict]) -> tuple[list[dict], dict]:
+    """Return normalized rows + diagnostics (counts & missing)."""
+    out = []
+    diag = {"total_rows": len(rows), "usable": 0, "reasons": []}
+    for r in rows:
+        d  = (pick(r, ALIASES["date"]) or "").strip()
+        tr = (pick(r, ALIASES["tour"]) or "").strip()
+        a  = (pick(r, ALIASES["a"]) or "").strip()
+        b  = (pick(r, ALIASES["b"]) or "").strip()
+        oa = to_float(pick(r, ALIASES["oa"]))
+        ob = to_float(pick(r, ALIASES["ob"]))
+        pa = to_float(pick(r, ALIASES["pa"]))
+        pb = to_float(pick(r, ALIASES["pb"]))
+
+        if None in (oa,ob,pa,pb) or oa<=1 or ob<=1 or pa<0 or pb<0:
+            continue
+
+        out.append({
+            "date": d or "",
+            "tournament": tr,
+            "player_a": a or "A",
+            "player_b": b or "B",
+            "odds_a": oa, "odds_b": ob,
+            "prob_a": pa, "prob_b": pb,
+            "raw": r,
+        })
+    diag["usable"] = len(out)
+    if diag["usable"] == 0:
+        # sample a reason from first row
+        diag["reasons"].append("No rows with both odds and probs present (oa,ob,pa,pb).")
+    return out, diag
+
+# ------- math ------------------------------------------------------------------
+def kelly(p: float, o: float) -> float:
+    b = o - 1.0
     if b <= 0: return 0.0
-    edge = b*prob - (1.0 - prob)
+    edge = b*p - (1.0 - p)
     return max(0.0, edge / b)
 
-def ev_edge(prob: float, odds: float) -> float:
-    return prob * odds - 1.0
+def edge_ev(p: float, o: float) -> float:
+    return p*o - 1.0
 
-def sharpe_from_deltas(deltas: list[float]) -> float:
+def sharpe(deltas):
     if not deltas: return 0.0
-    mu = mean(deltas)
-    sd = math.sqrt(pstdev(deltas)**2 + 1e-12)
-    return mu / sd if sd > 0 else 0.0
+    mu = mean(deltas); var = pstdev(deltas)**2
+    sd = math.sqrt(var + 1e-12)
+    return mu/sd if sd>0 else 0.0
 
-# ---- outcome detection --------------------------------------------------------
-def detect_outcome(row: dict) -> int|None:
-    """
-    Returns +1 if A wins, -1 if B wins, None if unknown.
-    Accepted columns (case-insensitive):
-      - 'winner' in {'A','B', 'player_a','player_b', '<name>' match}
-      - 'result' or 'outcome' in {'A','B','W','L'} with side context is messy;
-        we only support clear 'winner'.
-    """
-    keys = {k.lower(): k for k in row.keys()}
-    # explicit winner side
-    for k in ("winner","winner_side","win_side"):
-        if k in keys:
-            v = str(row[keys[k]]).strip().lower()
-            if v in ("a","player_a","home","1"): return +1
-            if v in ("b","player_b","away","2"): return -1
-    # explicit winner by name
-    a = (row.get("player_a") or row.get("home") or "").strip().lower()
-    b = (row.get("player_b") or row.get("away") or "").strip().lower()
-    for k in ("winner_name","winner_player","winner"):
-        if k in keys:
-            v = str(row[keys[k]]).strip().lower()
-            if v and a and v == a: return +1
-            if v and b and v == b: return -1
-    return None  # unknown
-
-# ---- pick simulation ----------------------------------------------------------
-def simulate_config(cfg_id: int, params: dict, rows: list[dict]) -> dict:
-    """
-    params:
-      MIN_EDGE_EV, MIN_PROBABILITY, KELLY_FRACTION, KELLY_SCALE,
-      STAKE_CAP_PCT, DAILY_RISK_BUDGET_PCT
-    """
-    bankroll = float(BANKROLL_START)
+# ------- simulation ------------------------------------------------------------
+def simulate(cfg_id: int, params: dict, rows: list[dict]) -> dict:
+    bankroll = float(params["BANKROLL_START"])
     daily_budget_pct = float(params["DAILY_RISK_BUDGET_PCT"])
-    daily_date = None
+    stake_cap_pct    = float(params["STAKE_CAP_PCT"])
+    kf = float(params["KELLY_FRACTION"]) * float(params["KELLY_SCALE"])
+
+    daily_key = None
     daily_spent = 0.0
+    event_count = {}
 
-    picks_log: list[dict] = []
-    bet_deltas: list[float] = []
-    total_staked = 0.0
-    wins = 0; losses = 0
-
-    # event limiter (by tournament/date "event" key)
-    event_count: dict[str,int] = {}
+    picks = []
+    deltas = []
+    wins=losses=0
+    total_staked=0.0
 
     for r in rows:
-        # date normalization
-        d = (r.get("event_date") or r.get("date") or "").strip() or "0000-00-00"
-        if daily_date != d:
-            daily_date = d
-            daily_spent = 0.0
+        d = r["date"]
+        if daily_key != d:
+            daily_key = d; daily_spent = 0.0
 
-        # basics
-        pa = ffloat(r.get("prob_a_vigfree") or r.get("prob_a") or r.get("implied_prob_a"))
-        pb = ffloat(r.get("prob_b_vigfree") or r.get("prob_b") or r.get("implied_prob_b"))
-        oa = ffloat(r.get("odds_a")); ob = ffloat(r.get("odds_b"))
-        if None in (pa,pb,oa,ob) or oa<=1.0 or ob<=1.0:
+        pa, pb = r["prob_a"], r["prob_b"]
+        oa, ob = r["odds_a"], r["odds_b"]
+        ea, eb = edge_ev(pa,oa), edge_ev(pb,ob)
+
+        choose = []
+        if pa >= params["MIN_PROBABILITY"] and ea >= params["MIN_EDGE_EV"]:
+            choose.append(("A", pa, oa, ea, r["player_a"]))
+        if pb >= params["MIN_PROBABILITY"] and eb >= params["MIN_EDGE_EV"]:
+            choose.append(("B", pb, ob, eb, r["player_b"]))
+        if not choose: continue
+        side,p,o,e,name = max(choose, key=lambda x:x[3])
+
+        event_id = f"{d}|{r['tournament']}"
+        if event_count.get(event_id,0) >= MAX_MATCHES_PER_EVENT:
             continue
+        event_count[event_id] = event_count.get(event_id,0)+1
 
-        # edges
-        edge_a = ev_edge(pa, oa)
-        edge_b = ev_edge(pb, ob)
+        frac  = kelly(p,o) * kf
+        stake = min(bankroll*frac, bankroll*stake_cap_pct, bankroll*daily_budget_pct - daily_spent)
+        if stake <= 0: continue
 
-        # eligibility
-        min_ev  = float(params["MIN_EDGE_EV"])
-        min_pr  = float(params["MIN_PROBABILITY"])
+        # outcome (optional)
+        winflag = None
+        w = (pick(r["raw"], ALIASES["win"]) or "").strip().lower()
+        if w in ("a","player_a","home","1", r["player_a"].strip().lower()):
+            winflag = (side=="A")
+        elif w in ("b","player_b","away","2", r["player_b"].strip().lower()):
+            winflag = (side=="B")
 
-        cand = []
-        if pa >= min_pr and edge_a >= min_ev:
-            cand.append(("A", pa, oa, edge_a, r.get("player_a","A")))
-        if pb >= min_pr and edge_b >= min_ev:
-            cand.append(("B", pb, ob, edge_b, r.get("player_b","B")))
-        if not cand:
-            continue
-
-        # per-event cap
-        ev_key = f"{d}|{r.get('tournament','?')}"
-        if event_count.get(ev_key,0) >= MAX_MATCHES_PER_EVENT:
-            continue
-        event_count[ev_key] = event_count.get(ev_key,0)+1
-
-        # choose best edge if both sides eligible
-        side, p, o, e, name = max(cand, key=lambda x: x[3])
-
-        # stake sizing
-        f = kelly(p, o) * float(params["KELLY_FRACTION"]) * float(params["KELLY_SCALE"])
-        stake_cap = bankroll * float(params["STAKE_CAP_PCT"])
-        daily_cap = bankroll * daily_budget_pct
-        stake = min(bankroll * f, stake_cap, max(0.0, daily_cap - daily_spent))
-        if stake <= 0:  # daily budget exhausted or zero Kelly
-            continue
-
-        # realized vs expected outcome
-        outcome = detect_outcome(r)  # +1 A wins, -1 B wins, None
-        if outcome is None:
-            # expected value delta (not changing bankroll for EV mode to avoid drift)
-            delta = stake * e
-            new_br = bankroll  # keep bankroll stable in EV mode
+        if winflag is None:
+            delta = stake*e   # EV mode (don’t update bankroll to avoid drift)
+            new_br = bankroll
         else:
-            win = (outcome == +1 and side=="A") or (outcome == -1 and side=="B")
-            payout = stake * o if win else 0.0
+            payout = stake*o if winflag else 0.0
             delta  = payout - stake
             new_br = bankroll + delta
-            wins  += int(win)
-            losses+= int(not win)
+            wins += int(winflag); losses += int(not winflag)
 
-        # log
-        picks_log.append({
+        picks.append({
             "config_id": cfg_id,
-            "event_date": d,
-            "tournament": r.get("tournament",""),
-            "player": name,
-            "side": side,
-            "odds": round(o,3),
-            "prob": round(p,6),
-            "edge": round(e,6),
-            "stake": round(stake,2),
-            "delta": round(delta,2),
-            "bankroll": round(new_br,2),
+            "event_date": d, "tournament": r["tournament"],
+            "player": name, "side": side,
+            "odds": round(o,3), "prob": round(p,6), "edge": round(e,6),
+            "stake": round(stake,2), "delta": round(delta,2), "bankroll": round(new_br,2),
         })
-        bet_deltas.append(delta)
-        total_staked += stake
-        daily_spent  += stake
-        bankroll = new_br
+        total_staked += stake; deltas.append(delta); bankroll = new_br; daily_spent += stake
 
-    n_bets = len(picks_log)
-    pnl = sum(bet_deltas)
-    roi = (pnl / total_staked) if total_staked > 0 else 0.0
-    hitrate = (wins / (wins+losses)) if (wins+losses)>0 else 0.0
-    sharpe = sharpe_from_deltas(bet_deltas)
+    pnl = sum(deltas)
+    roi = pnl/total_staked if total_staked>0 else 0.0
+    hit = wins/(wins+losses) if (wins+losses)>0 else 0.0
+    shp = sharpe(deltas)
 
     return {
-        "cfg_id": cfg_id,
-        "n_bets": n_bets,
-        "total_staked": round(total_staked,2),
-        "pnl": round(pnl,2),
-        "roi": round(roi,4),
-        "hitrate": round(hitrate,4),
-        "sharpe": round(sharpe,4),
-        "end_bankroll": round(bankroll,2),
-        "picks_log": picks_log,
+        "cfg_id": cfg_id, "n_bets": len(picks),
+        "total_staked": round(total_staked,2), "pnl": round(pnl,2),
+        "roi": round(roi,4), "hitrate": round(hit,4), "sharpe": round(shp,4),
+        "end_bankroll": round(bankroll,2), "picks": picks,
     }
 
-# ---- grid --------------------------------------------------------------------
-def build_grid() -> list[dict]:
-    """
-    Conservative grid sizes — fast and useful. Expand later.
-    """
-    min_edge_opts = [0.01, 0.015, 0.02, 0.03]
-    min_prob_opts = [0.03, 0.04, 0.05]
-    kelly_frac    = [0.25, 0.5, 0.75]
-    stake_cap     = [0.02, 0.04]
-    daily_budget  = [0.08, 0.12, 0.18]
+# ------- grid ------------------------------------------------------------------
+def grid() -> list[dict]:
+    def cfg(me, mp, kf, sc, db):
+        return {
+            "MIN_EDGE_EV": me, "MIN_PROBABILITY": mp,
+            "KELLY_FRACTION": kf, "KELLY_SCALE": 1.0,
+            "STAKE_CAP_PCT": sc, "DAILY_RISK_BUDGET_PCT": db,
+            "BANKROLL_START": float(os.getenv("BANKROLL_START","1000")),
+        }
+    g=[]
+    for me in [0.01,0.015,0.02,0.03]:
+        for mp in [0.03,0.04,0.05]:
+            for kf in [0.25,0.5,0.75]:
+                for sc in [0.02,0.04]:
+                    for db in [0.08,0.12,0.18]:
+                        g.append(cfg(me,mp,kf,sc,db))
+    return g
 
-    grid = []
-    cfg_id = 0
-    for me in min_edge_opts:
-        for mp in min_prob_opts:
-            for kf in kelly_frac:
-                for sc in stake_cap:
-                    for db in daily_budget:
-                        cfg_id += 1
-                        grid.append({
-                            "CFG_ID": cfg_id,
-                            "MIN_EDGE_EV": me,
-                            "MIN_PROBABILITY": mp,
-                            "KELLY_FRACTION": kf,
-                            "KELLY_SCALE": 1.0,
-                            "STAKE_CAP_PCT": sc,
-                            "DAILY_RISK_BUDGET_PCT": db,
-                        })
-    return grid
-
-# ---- main --------------------------------------------------------------------
+# ------- main ------------------------------------------------------------------
 def main():
-    BT_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
+    BT_DIR.mkdir(parents=True, exist_ok=True); LOG_DIR.mkdir(parents=True, exist_ok=True)
     inp = find_input()
-    if not inp or not csv_has_rows(inp):
-        log("No usable input (prob_enriched.csv or vigfree_matches.csv). Writing empty summary.")
-        (BT_DIR / "summary.csv").write_text("cfg_id,n_bets,total_staked,pnl,roi,hitrate,sharpe,end_bankroll\n")
-        return
+    diag = {"input": str(inp) if inp else None}
+    if not inp:
+        write_csv([], BT_DIR/"summary.csv")
+        write_json({"reason": "no_input_file", **diag}, BT_DIR/"_diagnostics.json")
+        log("No input file found."); return
 
-    rows = read_csv(inp)
-    # sort by date if present
-    rows.sort(key=lambda r: (r.get("event_date") or r.get("date") or ""))
+    raw = read_csv_rows(inp)
+    norm, nd = normalize(raw)
+    diag.update(nd)
+    if nd["usable"] == 0:
+        write_csv([], BT_DIR/"summary.csv")
+        write_json({"reason": "no_usable_rows", **diag}, BT_DIR/"_diagnostics.json")
+        log("Input has no usable rows with odds & probs."); return
 
-    grid = build_grid()
-    summary_rows = []
+    # sort by date string (already ISO-like)
+    norm.sort(key=lambda r: r["date"])
+    configs = grid()
 
-    for cfg in grid:
-        cfg_id = cfg["CFG_ID"]
-        res = simulate_config(cfg_id, cfg, rows)
+    summary=[]
+    for i, p in enumerate(configs, start=1):
+        res = simulate(i, p, norm)
+        write_csv(res["picks"], LOG_DIR/f"picks_cfg{i}.csv")
+        write_json(p, BT_DIR/f"params_cfg{i}.json")
+        summary.append({k: res[k] for k in ("cfg_id","n_bets","total_staked","pnl","roi","hitrate","sharpe","end_bankroll")})
 
-        # write per-config artifacts
-        write_csv(res["picks_log"], LOG_DIR / f"picks_cfg{cfg_id}.csv")
-        write_json(cfg,               BT_DIR / f"params_cfg{cfg_id}.json")
-
-        summary_rows.append({
-            "cfg_id": cfg_id,
-            "n_bets": res["n_bets"],
-            "total_staked": res["total_staked"],
-            "pnl": res["pnl"],
-            "roi": res["roi"],
-            "hitrate": res["hitrate"],
-            "sharpe": res["sharpe"],
-            "end_bankroll": res["end_bankroll"],
-        })
-
-    # write summary
-    write_csv(summary_rows, BT_DIR / "summary.csv")
-    log(f"Backtest done over {len(grid)} configs → {BT_DIR/'summary.csv'}")
+    write_csv(summary, BT_DIR/"summary.csv")
+    write_json(diag, BT_DIR/"_diagnostics.json")
+    log(f"Backtest done over {len(configs)} configs → {BT_DIR/'summary.csv'}")
 
 if __name__ == "__main__":
     main()
