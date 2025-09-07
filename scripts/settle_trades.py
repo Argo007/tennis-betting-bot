@@ -1,164 +1,196 @@
+
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Settle trades:
-- reads state/trade_log.csv (open bets)
-- joins with close_odds to compute CLV
-- simulates/uses result to compute PnL
-- updates bankroll.json and appends to bankroll_history.csv
-- writes settled_trades.csv (idempotent; won’t double-settle)
+Settle trades and update bankroll (safe, argument-optional).
 
-Usage (now YAML-safe):
-  python scripts/settle_trades.py \
-      --log state/trade_log.csv \
-      --close-odds live_results/close_odds.csv \
-      --state-dir state \
-      --assume-random-if-missing true
+Defaults (all paths are relative to repo root):
+  --log           results/trade_log.csv          # optional; header-only if missing
+  --close-odds    (latest) data/raw/odds/close_odds_*.csv  # optional
+  --state-dir     state/
+  --assume-random-if-missing  false              # don't change bankroll without results
+  --out           results/settlements.csv
+
+Trade log schema (flexible; we try to map common names):
+  event_date, tournament, player, side, odds, stake, result
+    - result ∈ {'W','L','V','void','push'} (case-insensitive)
+    - If result is missing and --assume-random-if-missing=true, we settle
+      by sampling a Bernoulli with p≈1/odds (still optional and off by default).
+
+Outputs:
+  results/settlements.csv with:
+    event_date,tournament,player,odds,stake,result,payout,delta,
+    bankroll_before,bankroll_after,source
+
+Bankroll:
+  Reads state/bankroll.json or uses env BANKROLL_START (default 1000.0).
+  Writes updated bankroll.json only if at least one row was settled.
 """
-import argparse
-import os
-import sys
-import json
-import time
-from datetime import datetime
-import pandas as pd
 
-def parse_bool(v: str) -> bool:
-    s = str(v).strip().lower()
-    if s in {"true","t","1","yes","y"}:
-        return True
-    if s in {"false","f","0","no","n"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Expected true/false, got: {v}")
+import argparse, csv, json, os, random
+from glob import glob
+from pathlib import Path
+from datetime import datetime, timezone
 
-def load_df(path: str) -> pd.DataFrame:
-    if not os.path.isfile(path):
-        return pd.DataFrame()
+# ---------- paths & env ----------
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RAW_DIR   = REPO_ROOT / "data" / "raw"
+ODDS_DIR  = RAW_DIR / "odds"
+RES_DIR   = REPO_ROOT / "results"
+
+DEFAULT_LOG        = RES_DIR / "trade_log.csv"
+DEFAULT_STATE_DIR  = REPO_ROOT / "state"
+DEFAULT_OUT        = RES_DIR / "settlements.csv"
+BANKROLL_FILE_ENV  = os.getenv("BANKROLL_FILE")  # pipeline exports this
+BANKROLL_START     = float(os.getenv("BANKROLL_START", "1000.0"))
+
+def log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[settle] {ts} {msg}", flush=True)
+
+def latest_close_odds() -> Path | None:
+    files = sorted(glob(str(ODDS_DIR / "close_odds_*.csv")))
+    return Path(files[-1]) if files else None
+
+def read_bankroll(state_dir: Path) -> float:
+    f = Path(BANKROLL_FILE_ENV) if BANKROLL_FILE_ENV else state_dir / "bankroll.json"
+    if f.exists():
+        try:
+            return float(json.loads(f.read_text()).get("bankroll", BANKROLL_START))
+        except Exception:
+            return BANKROLL_START
+    return BANKROLL_START
+
+def write_bankroll(state_dir: Path, value: float):
+    f = Path(BANKROLL_FILE_ENV) if BANKROLL_FILE_ENV else state_dir / "bankroll.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"bankroll": round(value, 2)}, indent=2))
+
+def csv_has_rows(path: Path) -> bool:
     try:
-        return pd.read_csv(path)
+        if not path.exists() or path.stat().st_size == 0: return False
+        with path.open("r", encoding="utf-8") as fh:
+            r = csv.reader(fh); _ = next(r, None); return next(r, None) is not None
     except Exception:
-        return pd.DataFrame()
+        return False
 
-def save_df(df: pd.DataFrame, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False)
+def norm_result(x: str | None) -> str | None:
+    if not x: return None
+    s = str(x).strip().lower()
+    if s in ("w","win","won"): return "W"
+    if s in ("l","loss","lost"): return "L"
+    if s in ("push","void","v"): return "V"
+    return None
+
+def parse_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def choose(colnames: list[str], mapping: list[str]) -> str | None:
+    s = {c.lower(): c for c in colnames}
+    for m in mapping:
+        if m in s: return s[m]
+    return None
+
+def settle_row(row: dict, bankroll: float, assume_random: bool) -> tuple[dict, float, bool]:
+    # Map columns flexibly
+    k_odds  = choose(list(row.keys()), ["odds","price","decimal_odds"])
+    k_stake = choose(list(row.keys()), ["stake","amount"])
+    k_res   = choose(list(row.keys()), ["result","outcome"])
+    k_evt   = choose(list(row.keys()), ["event_date","date"])
+    k_tour  = choose(list(row.keys()), ["tournament","event"])
+    k_player= choose(list(row.keys()), ["player","selection","runner","team"])
+
+    odds  = parse_float(row.get(k_odds) if k_odds else None)
+    stake = parse_float(row.get(k_stake) if k_stake else None, 0.0)
+    res   = norm_result(row.get(k_res) if k_res else None)
+
+    # If no explicit result: either skip or (optionally) simulate
+    if res is None:
+        if assume_random and odds and odds > 1.0:
+            p_win = 1.0 / odds
+            res = "W" if random.random() < p_win else "L"
+        else:
+            # no settlement
+            return {}, bankroll, False
+
+    # Compute payout & delta
+    payout = stake * odds if res == "W" else (stake if res == "V" else 0.0)
+    delta  = payout - stake  # void => 0
+
+    before = bankroll
+    after  = bankroll + delta
+
+    settled = {
+        "event_date": row.get(k_evt) or "",
+        "tournament": row.get(k_tour) or "",
+        "player":     row.get(k_player) or "",
+        "odds":       round(odds or 0.0, 3),
+        "stake":      round(stake, 2),
+        "result":     res,
+        "payout":     round(payout, 2),
+        "delta":      round(delta, 2),
+        "bankroll_before": round(before, 2),
+        "bankroll_after":  round(after, 2),
+        "source":     "trade_log",
+    }
+    return settled, after, True
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--log", required=True, help="state/trade_log.csv")
-    ap.add_argument("--close-odds", required=False, default="", help="live_results/close_odds.csv")
-    ap.add_argument("--state-dir", default="state")
-    # YAML-safe explicit value (matches the workflow style)
-    ap.add_argument("--assume-random-if-missing", type=parse_bool, default=True,
-                    help="true/false; simulate random outcome if result is missing")
-    # optional output (not required by workflow, but supported)
-    ap.add_argument("--out", default="", help="optional out CSV for settled rows")
+    ap = argparse.ArgumentParser(description="Settle trades and update bankroll (safe defaults)")
+    ap.add_argument("--log", help="Trade log CSV", default=str(DEFAULT_LOG))
+    ap.add_argument("--close-odds", help="Optional: path to close odds CSV", default="")
+    ap.add_argument("--state-dir", help="Directory to store bankroll.json", default=str(DEFAULT_STATE_DIR))
+    ap.add_argument("--assume-random-if-missing", type=str, default="false",
+                    help="If true, simulate result when missing (p≈1/odds)")
+    ap.add_argument("--out", help="Settlements output CSV", default=str(DEFAULT_OUT))
     args = ap.parse_args()
 
-    state = args.state_dir
-    os.makedirs(state, exist_ok=True)
+    log_csv  = Path(args.log)
+    state_dir= Path(args.state_dir)
+    out_csv  = Path(args.out)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
 
-    log_df = load_df(args.log)
-    if log_df.empty:
-        print("No trades to settle.")
-        return 0
-
-    # Normalize columns we rely on
-    for col in ["match_id","selection","odds","stake_eur","p","ts"]:
-        if col not in log_df.columns:
-            log_df[col] = None
-
-    # Ensure numeric odds/stake/p
-    for col in ["odds","stake_eur","p"]:
-        log_df[col] = pd.to_numeric(log_df[col], errors="coerce")
-
-    # Attach closing odds (for CLV) if provided
-    clv = pd.Series(0.0, index=log_df.index, name="clv")
-    if args.close_odds and os.path.isfile(args.close_odds):
-        close_df = load_df(args.close_odds)
-        # Expect columns: match_id, odds_close (or odds)
-        close_df = close_df.copy()
-        if "odds_close" not in close_df.columns:
-            # fall back to "odds"
-            if "odds" in close_df.columns:
-                close_df = close_df.rename(columns={"odds": "odds_close"})
-            else:
-                close_df["odds_close"] = pd.NA
-
-        merged = log_df.merge(close_df[["match_id","odds_close"]], on="match_id", how="left")
-        # clv = (close_odds - open_odds) / open_odds
-        with pd.option_context("mode.use_inf_as_na", True):
-            clv = (pd.to_numeric(merged["odds_close"], errors="coerce") - merged["odds"]) / merged["odds"]
-            clv = clv.fillna(0.0)
-    log_df["clv"] = clv
-
-    # Determine win/loss. If we don’t have a result, optionally simulate fair coin (biased by p)
-    # Expected result column: "pr" (profit result) or "result" (W/L)
-    if "result" not in log_df.columns:
-        log_df["result"] = pd.NA
-
-    have_result_mask = log_df["result"].astype(str).str.lower().isin({"w","l","win","loss","1","0","true","false"})
-    if args.assume_random_if_missing:
-        import numpy as np
-        rng = np.random.default_rng(int(time.time()) % (2**32 - 1))
-        miss = ~have_result_mask
-        # use probability p (already 0..1) if available, else 0.5
-        probs = pd.to_numeric(log_df.loc[miss, "p"], errors="coerce").fillna(0.5).clip(0,1)
-        draws = rng.random(len(probs))
-        sim_w = (draws < probs).map({True:"W", False:"L"})
-        log_df.loc[miss, "result"] = sim_w.values
-        have_result_mask = log_df["result"].astype(str).str.lower().isin({"w","l","win","loss","1","0","true","false"})
+    # If --close-odds is empty, try detect latest (optional, not required)
+    if not args.close_odds:
+        lo = latest_close_odds()
+        if lo: log(f"using latest close odds: {lo.name}")
     else:
-        # leave missing results; they won't be settled
-        pass
+        lo = Path(args.close_odds)
+        if lo.exists(): log(f"using provided close odds: {lo.name}")
+        else: log(f"provided close odds not found: {lo}")
 
-    # Compute PnL only for rows with result now available
-    settle = log_df.loc[have_result_mask].copy()
-    if not settle.empty:
-        res = settle["result"].astype(str).str.lower().map(
-            {"w":1,"win":1,"1":1,"true":1,"l":0,"loss":0,"0":0,"false":0}
-        ).fillna(0).astype(int)
-        pnl = res * (settle["odds"] - 1.0) * settle["stake_eur"] - (1 - res) * settle["stake_eur"]
-        settle["pnl"] = pnl
-        # clv already attached
+    # Always write header first
+    headers = ["event_date","tournament","player","odds","stake","result","payout","delta",
+               "bankroll_before","bankroll_after","source"]
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
 
-    # Update bankroll.json and append bankroll_history.csv
-    bk_path = os.path.join(state, "bankroll.json")
-    hist_path = os.path.join(state, "bankroll_history.csv")
+    if not csv_has_rows(log_csv):
+        log(f"no trade log rows at {log_csv}; wrote header-only {out_csv.name}")
+        return
 
-    bankroll = float(os.environ.get("START_BANKROLL", "1000"))
-    if os.path.isfile(bk_path):
-        try:
-            bankroll = float(json.load(open(bk_path)).get("bankroll", bankroll))
-        except Exception:
-            pass
+    rows = list(csv.DictReader(log_csv.open("r", encoding="utf-8")))
+    assume_random = str(args.assume_random_if_missing).strip().lower() in ("1","true","yes","y")
+    br = read_bankroll(state_dir)
 
-    if not settle.empty:
-        total_pnl = float(settle["pnl"].sum())
-        bankroll += total_pnl
+    settled_any = False
+    with out_csv.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        for r in rows:
+            s, br, ok = settle_row(r, br, assume_random)
+            if ok:
+                w.writerow(s)
+                settled_any = True
 
-    # Persist
-    json.dump({"bankroll": round(bankroll, 2)}, open(bk_path, "w"))
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    if os.path.isfile(hist_path):
-        hist = pd.read_csv(hist_path)
+    if settled_any:
+        write_bankroll(state_dir, br)
+        log(f"settled trades written → {out_csv.name}; bankroll updated to {br:.2f}")
     else:
-        hist = pd.DataFrame(columns=["ts","bankroll"])
-    hist = pd.concat([hist, pd.DataFrame([{"ts": now, "bankroll": round(bankroll, 2)}])], ignore_index=True)
-    save_df(hist, hist_path)
-
-    # Write settled report (optional file OR default inside state)
-    out_path = args.out or os.path.join(state, "settled_trades.csv")
-    if not settle.empty:
-        # stamp settle time
-        settle["settled_ts"] = now
-        # append or create
-        prev = load_df(out_path)
-        all_rows = pd.concat([prev, settle], ignore_index=True) if not prev.empty else settle
-        save_df(all_rows, out_path)
-
-    print(f"Settled rows: {0 if settle.empty else len(settle)} | bankroll: €{bankroll:.2f}")
-    return 0
+        log(f"no trades settled; bankroll unchanged ({br:.2f})")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
