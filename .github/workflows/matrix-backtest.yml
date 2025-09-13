@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "CSV with oa,ob,pa,pb (pre or post enrichment)"
+        description: "CSV with odds+probs (defaults to outputs/prob_enriched.csv; falls back if missing)"
         default: "outputs/prob_enriched.csv"
         required: true
       bands:
@@ -41,33 +41,60 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: >-
-            ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install -U pip wheel
           pip install -r requirements.txt
 
-      # ⬇️ NEW: normalize & inject edges so backtest has something to chew on
+      # Resolve a dataset that actually exists on this runner.
+      # Priority:
+      #   1) user-provided path
+      #   2) outputs/prob_enriched.csv
+      #   3) data/raw/vigfree_matches.csv  (has odds_a/odds_b + prob_a_vigfree/prob_b_vigfree)
+      #   4) data/raw/odds/sample_odds.csv (last resort demo)
+      - name: Resolve dataset path
+        id: ds
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${{ github.event.inputs.dataset }}"
+          candidates=(
+            "$want"
+            "outputs/prob_enriched.csv"
+            "data/raw/vigfree_matches.csv"
+            "data/raw/odds/sample_odds.csv"
+          )
+
+          for p in "${candidates[@]}"; do
+            if [[ -f "$p" ]]; then
+              echo "dataset=$p" >> "$GITHUB_OUTPUT"
+              echo "[resolve] Using dataset: $p"
+              exit 0
+            fi
+          done
+
+          echo "::error::No dataset found. Checked: ${candidates[*]}"
+          exit 1
+
+      # Enrich to canonical columns + edges so the backtest always has what it needs.
       - name: Enrich edges (EdgeSmith)
         run: |
           python scripts/edge_smith_enrich.py \
-            --input  "${{ github.workspace }}/${{ github.event.inputs.dataset }}" \
-            --output "${{ github.workspace }}/${{ github.event.inputs.dataset }}"
+            --input  "${{ steps.ds.outputs.dataset }}" \
+            --output "outputs/prob_enriched.csv"
 
       - name: Run matrix backtest
         env:
-          DATASET: ${{ github.event.inputs.dataset }}
           BANDS:   ${{ github.event.inputs.bands }}
           STAKE:   ${{ github.event.inputs.staking }}
           KSCALE:  ${{ github.event.inputs.kelly_scale }}
           BANK:    ${{ github.event.inputs.bankroll }}
         run: |
           python scripts/matrix_backtest.py \
-            --input   "${DATASET}" \
+            --input   "outputs/prob_enriched.csv" \
             --bands   "${BANDS}" \
             --staking "${STAKE}" \
             --kelly-scale "${KSCALE}" \
@@ -77,12 +104,13 @@ jobs:
       - name: Summarize
         run: |
           echo "Matrix Backtest — Summary"
-          echo "Dataset: ${{ github.event.inputs.dataset }}"
+          echo "Dataset used: outputs/prob_enriched.csv"
           echo "Bands:   ${{ github.event.inputs.bands }}"
           echo "Staking: ${{ github.event.inputs.staking }} | Kelly scale: ${{ github.event.inputs.kelly_scale }}"
           echo "Bankroll: ${{ github.event.inputs.bankroll }} units"
           echo ""
           ls -lah backtests || true
+          test -f backtests/index.html && echo "::notice title=Report::backtests/index.html generated"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -90,7 +118,7 @@ jobs:
           name: matrix-backtest-${{ github.run_id }}
           path: |
             backtests/**
-            docs/backtests/**
+            outputs/prob_enriched.csv
           if-no-files-found: warn
 
 
