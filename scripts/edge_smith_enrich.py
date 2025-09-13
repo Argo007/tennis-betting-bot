@@ -1,125 +1,165 @@
 #!/usr/bin/env python3
 """
-Enrich matches with TrueEdge8 proxy scores + EV edges.
+EdgeSmith — enrich probability file for backtesting.
 
-Default I/O:
-    IN  = outputs/prob_enriched.csv
-    OUT = outputs/edge_enriched.csv
+Inputs
+------
+A CSV that *must* contain odds and probabilities for both sides with one of
+these column name sets (case-insensitive):
+
+- Required (canonical):
+    oa, ob, pa, pb
+
+- Accepted aliases (will be mapped to canonical):
+    odds_a, odds_b, prob_a, prob_b
+    implied_prob_a, implied_prob_b
+    prob_a_vigfree, prob_b_vigfree
+
+The script will:
+- Normalize columns to (oa, ob, pa, pb)
+- Compute edge_a = pa - 1/oa
+         edge_b = pb - 1/ob
+- true_edge  = max(edge_a, edge_b)
+- sel        = 'A' if edge_a >= edge_b else 'B'
+- sel_player = player_a or player_b if present
+- fair_odds_a = 1/pa ; fair_odds_b = 1/pb
+
+Output
+------
+Writes a fully enriched CSV to --output (can overwrite the input path).
+Returns nonzero exit if no usable rows.
+
+Usage
+-----
+python scripts/edge_smith_enrich.py \
+  --input outputs/prob_enriched.csv \
+  --output outputs/prob_enriched.csv
 """
-
-import csv
-import os
-from pathlib import Path
+from __future__ import annotations
 import argparse
-from math import isfinite
+import sys
+import math
+from pathlib import Path
+import pandas as pd
 
-# ---------- Paths ----------
-REPO_ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR   = REPO_ROOT / "outputs"
-INFILE    = OUT_DIR / "prob_enriched.csv"
-OUTFILE   = OUT_DIR / "edge_enriched.csv"
+CANON = ("oa", "ob", "pa", "pb")
 
-# ---------- Logging ----------
-def log(msg: str):
-    print(f"[edge_enrich] {msg}", flush=True)
-
-# ---------- Safe Float ----------
-def safe_float(x):
-    try:
-        v = float(x)
-        return v if isfinite(v) else None
-    except:
-        return None
-
-# ---------- Weights from Env ----------
-def w(name, default):
-    try:
-        return float(os.getenv(name, default))
-    except:
-        return default
-
-WEIGHTS = {
-    "SURFACE":      w("WEIGHT_SURFACE_BOOST", 0.18),
-    "RECENT":       w("WEIGHT_RECENT_FORM", 0.22),
-    "ELO":          w("WEIGHT_ELO_CORE", 0.28),
-    "SERVE_RETURN": w("WEIGHT_SERVE_RETURN_SPLIT", 0.10),
-    "H2H":          w("WEIGHT_HEAD2HEAD", 0.06),
-    "TRAVEL":       w("WEIGHT_TRAVEL_FATIGUE", -0.05),
-    "INJURY":       w("WEIGHT_INJURY_PENALTY", -0.07),
-    "DRIFT":        w("WEIGHT_MARKET_DRIFT", 0.08),
+ALIASES = {
+    "oa": ["oa", "odds_a", "oddsA", "odds_a_close", "odd_a", "o_a"],
+    "ob": ["ob", "odds_b", "oddsB", "odds_b_close", "odd_b", "o_b"],
+    "pa": ["pa", "prob_a", "probA", "implied_prob_a", "prob_a_vigfree", "p_a"],
+    "pb": ["pb", "prob_b", "probB", "implied_prob_b", "prob_b_vigfree", "p_b"],
 }
 
-# ---------- TrueEdge8 Proxy Score ----------
-def compute_trueedge8(row):
-    pa = safe_float(row.get("prob_a_vigfree")) or 0.5
-    pb = safe_float(row.get("prob_b_vigfree")) or 0.5
-    oa = safe_float(row.get("odds_a")) or 2.0
-    ob = safe_float(row.get("odds_b")) or 2.0
+def _first_present(cols, options):
+    for name in options:
+        if name in cols:
+            return name
+        # allow case-insensitive match
+        for c in cols:
+            if c.lower() == name.lower():
+                return c
+    return None
 
-    features = {
-        "SURFACE":      0.0,
-        "RECENT":       0.0,
-        "ELO":          (pa - pb),
-        "SERVE_RETURN": (1/oa - 1/ob),
-        "H2H":          0.0,
-        "TRAVEL":       0.0,
-        "INJURY":       0.0,
-        "DRIFT":        (pb - pa),
-    }
-    score = sum(features[k] * WEIGHTS[k] for k in WEIGHTS)
-    return score
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = set(df.columns)
+    mapping = {}
+    for tgt in CANON:
+        found = _first_present(cols, ALIASES[tgt])
+        if not found:
+            raise KeyError(f"Missing required column for '{tgt}'. "
+                           f"Looked for any of: {ALIASES[tgt]}")
+        mapping[tgt] = found
 
-# ---------- Main ----------
+    # Reassign canonical views without losing originals
+    out = df.copy()
+    for tgt, src in mapping.items():
+        out[tgt] = pd.to_numeric(out[src], errors="coerce")
+
+    return out
+
+def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # sanity: positive odds and 0<prob<1
+    valid = (
+        (out["oa"] > 1e-9) &
+        (out["ob"] > 1e-9) &
+        (out["pa"] > 0) & (out["pa"] < 1) &
+        (out["pb"] > 0) & (out["pb"] < 1)
+    )
+    before = len(out)
+    out = out.loc[valid].copy()
+    dropped = before - len(out)
+
+    if len(out) == 0:
+        raise RuntimeError("No usable rows after sanity checks (odds/prob bounds).")
+
+    # compute
+    out["fair_odds_a"] = 1.0 / out["pa"]
+    out["fair_odds_b"] = 1.0 / out["pb"]
+
+    out["edge_a"] = out["pa"] - (1.0 / out["oa"])
+    out["edge_b"] = out["pb"] - (1.0 / out["ob"])
+
+    # choose side with higher edge (ties -> A)
+    out["true_edge"] = out[["edge_a", "edge_b"]].max(axis=1)
+    out["sel"] = (out["edge_a"] >= out["edge_b"]).map({True: "A", False: "B"})
+
+    # friendly selection label if players present
+    if "player_a" in out.columns and "player_b" in out.columns:
+        out["sel_player"] = out.apply(
+            lambda r: r["player_a"] if r["sel"] == "A" else r["player_b"], axis=1
+        )
+
+    # deterministic column order: keep existing, then append our metrics at the end
+    metric_cols = ["fair_odds_a", "fair_odds_b", "edge_a", "edge_b", "true_edge", "sel"]
+    if "sel_player" in out.columns:
+        metric_cols.append("sel_player")
+
+    # ensure no duplicate columns in final order
+    base_cols = [c for c in df.columns if c not in metric_cols]
+    final_cols = base_cols + metric_cols
+
+    # info line to stdout (visible in Actions logs)
+    print(f"[enrich] input rows={before}, dropped_invalid={dropped}, kept={len(out)}")
+    pos = (out["true_edge"] > 0).sum()
+    print(f"[enrich] positive edges={pos} ({pos/len(out):.0%})")
+
+    return out[final_cols]
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default=str(INFILE))
-    ap.add_argument("--output", default=str(OUTFILE))
+    ap.add_argument("--input", required=True, help="Path to prob_enriched.csv (pre-enrichment).")
+    ap.add_argument("--output", required=True, help="Path to write enriched CSV (may overwrite input).")
     args = ap.parse_args()
 
     inp = Path(args.input)
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    # If no input → write header-only CSV
+    outp = Path(args.output)
     if not inp.exists():
-        with out.open("w", newline="", encoding="utf-8") as f:
-            f.write("event_date,tournament,player_a,player_b,odds_a,odds_b,prob_a_vigfree,prob_b_vigfree,trueedge8,edge_a,edge_b\n")
-        log(f"missing input; wrote header-only → {out}")
-        return
+        print(f"[enrich] ERROR: input not found: {inp}", file=sys.stderr)
+        sys.exit(2)
 
-    # Read data
-    rows = list(csv.DictReader(inp.open("r", encoding="utf-8")))
-    enriched = []
-    for r in rows:
-        pa = safe_float(r.get("prob_a_vigfree"))
-        pb = safe_float(r.get("prob_b_vigfree"))
-        oa = safe_float(r.get("odds_a"))
-        ob = safe_float(r.get("odds_b"))
-        if None in (pa, pb, oa, ob):
-            continue
+    df = pd.read_csv(inp)
+    if df.shape[0] == 0:
+        print(f"[enrich] WARNING: input has zero rows: {inp}", file=sys.stderr)
+        # still write back the header + our fields for traceability
+        df["oa"] = pd.NA; df["ob"] = pd.NA; df["pa"] = pd.NA; df["pb"] = pd.NA
+        df["fair_odds_a"] = pd.NA; df["fair_odds_b"] = pd.NA
+        df["edge_a"] = pd.NA; df["edge_b"] = pd.NA; df["true_edge"] = pd.NA; df["sel"] = pd.NA
+        df.to_csv(outp, index=False)
+        sys.exit(0)
 
-        te8 = compute_trueedge8(r)
-        ev_a = pa * oa - 1.0
-        ev_b = pb * ob - 1.0
+    try:
+        norm = normalize_columns(df)
+        enr = compute_edges(norm)
+    except Exception as e:
+        print(f"[enrich] FATAL: {e}", file=sys.stderr)
+        sys.exit(1)
 
-        r["trueedge8"] = round(te8, 6)
-        r["edge_a"] = round(ev_a, 6)
-        r["edge_b"] = round(ev_b, 6)
-        enriched.append(r)
-
-    # If no rows → write header-only CSV
-    if not enriched:
-        with out.open("w", newline="", encoding="utf-8") as f:
-            f.write("event_date,tournament,player_a,player_b,odds_a,odds_b,prob_a_vigfree,prob_b_vigfree,trueedge8,edge_a,edge_b\n")
-        log(f"no enriched rows; wrote header-only → {out}")
-        return
-
-    # Write enriched dataset
-    with out.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=enriched[0].keys())
-        w.writeheader()
-        w.writerows(enriched)
-    log(f"wrote {len(enriched)} rows → {out}")
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    enr.to_csv(outp, index=False)
+    print(f"[enrich] wrote -> {outp} with columns: {', '.join([c for c in enr.columns if c in ('oa','ob','pa','pb','edge_a','edge_b','true_edge','sel')])}")
 
 if __name__ == "__main__":
     main()
