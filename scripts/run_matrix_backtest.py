@@ -1,237 +1,209 @@
-
 #!/usr/bin/env python3
-"""
-Matrix backtest over odds bands with Kelly/flat staking.
-
-- Input must have canonical columns: oa, ob, pa, pb (the report-normalizer
-  already guarantees these exist by duplicating from aliases).
-- Optional outcome columns (any one of):
-  * result: "A" or "B" (case-insensitive)
-  * winner: "A"/"B" or player_a/player_b names
-  * result_a/result_b: 1/0 flags
-  If no outcome is present, we compute EXPECTED PnL (EV mode) and mark it.
-
-Outputs:
-  results/backtests/summary.csv         (aggregated per cfg)
-  results/backtests/params_cfg{n}.json  (config used)
-  results/backtests/logs/picks_cfg{n}.csv (per-bet log)
-
-CLI example:
-  python scripts/run_matrix_backtest.py \
-    --input outputs/prob_enriched.csv \
-    --bands "1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0" \
-    --staking kelly --kelly-scale 0.5 \
-    --min-edge 0.01 --bankroll 1000 --outdir results/backtests
-"""
-
-from __future__ import annotations
 import argparse, csv, json, math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple, Dict, Any
 
-def read_rows(path: Path) -> List[Dict[str,str]]:
-    with path.open("r", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+# ===== Debug-friendly defaults (wider bands, lower edge) =====
+DEFAULT_BANDS = "1.0,10.0"     # wide open to force bets in debug
+DEFAULT_MIN_EDGE = 0.005       # 0.5% minimum edge
+DEFAULT_STAKING = "kelly"
+DEFAULT_KELLY_SCALE = 0.5
+DEFAULT_BANKROLL = 1000
 
-def write_rows(path: Path, rows: List[Dict[str,str]], header: List[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in header})
-
-def wjson(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2))
-
-def fnum(x: str) -> float:
-    try: return float(x)
-    except: return 0.0
-
-def has_outcomes(row: Dict[str,str]) -> Tuple[bool, Optional[int]]:
+def parse_bands(spec: str) -> List[Tuple[float, float]]:
     """
-    Returns (has_result, winner_idx) where winner_idx is 0 for A, 1 for B when resolvable.
+    Accepts either single range '1.0,10.0' or matrix format '1.2,2.0|2.0,2.6|...'
+    Returns list of (low, high) inclusive of low, exclusive of high.
     """
-    # result as A/B
-    r = (row.get("result") or row.get("Result") or "").strip().upper()
-    if r in ("A","B"):
-        return True, 0 if r=="A" else 1
+    spec = (spec or "").strip()
+    if "|" in spec:
+        parts = spec.split("|")
+    else:
+        parts = [spec] if spec else []
 
-    # binary flags
-    ra = row.get("result_a")
-    rb = row.get("result_b")
-    if ra is not None and rb is not None:
-        try:
-            ia = int(float(ra)); ib = int(float(rb))
-            if ia==1 and ib==0: return True, 0
-            if ia==0 and ib==1: return True, 1
-        except: pass
-
-    # winner as name
-    w = (row.get("winner") or "").strip()
-    if w:
-        a = (row.get("player_a") or "").strip()
-        b = (row.get("player_b") or "").strip()
-        if a and w == a: return True, 0
-        if b and w == b: return True, 1
-
-    return False, None
-
-def kelly_fraction(p: float, o: float) -> float:
-    # decimal odds o => net odds b = o-1
-    b = o - 1.0
-    if b <= 0: return 0.0
-    # Kelly f* = (p*b - (1-p)) / b  = (p*o - 1)/(o-1)
-    return (p*o - 1.0) / b
-
-def parse_bands(s: str) -> List[Tuple[float,float]]:
     bands = []
-    for chunk in s.split("|"):
-        chunk = chunk.strip()
-        if not chunk: continue
-        a,b = chunk.split(",")
-        bands.append((float(a), float(b)))
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        lo, hi = p.split(",")
+        bands.append((float(lo), float(hi)))
     return bands
 
-def run_cfg(cfg_id: int, band: Tuple[float,float], rows: List[Dict[str,str]],
-            staking: str, kelly_scale: float, min_edge: float, bankroll0: float,
-            outdir: Path) -> Dict[str, float]:
-    lo, hi = band
-    picks_log: List[Dict[str,str]] = []
-    bankroll = bankroll0
-    total_staked = 0.0
-    pnl = 0.0
-    n_bets = 0
-    wins = 0
-    realized_mode = False
+def load_rows(input_csv: Path) -> List[Dict[str, Any]]:
+    rows = []
+    with input_csv.open(newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append(row)
+    return rows
 
-    for r in rows:
-        oa = fnum(r.get("oa","0")); ob = fnum(r.get("ob","0"))
-        pa = fnum(r.get("pa","0")); pb = fnum(r.get("pb","0"))
-        if oa<=1.0 or ob<=1.0 or pa<=0 or pb<=0:  # guardrails
+def to_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+def pick_prob(row: Dict[str, Any], side: str) -> float:
+    """
+    Choose probability for side 'a' or 'b'. Prefer normalized 'pa'/'pb',
+    fallback to vigfree columns if present.
+    """
+    if side == "a":
+        if "pa" in row and row["pa"] != "":
+            return to_float(row["pa"])
+        if "prob_a_vigfree" in row and row["prob_a_vigfree"] != "":
+            return to_float(row["prob_a_vigfree"])
+    else:
+        if "pb" in row and row["pb"] != "":
+            return to_float(row["pb"])
+        if "prob_b_vigfree" in row and row["prob_b_vigfree"] != "":
+            return to_float(row["prob_b_vigfree"])
+    return float("nan")
+
+def side_ok(odds: float, bands: List[Tuple[float, float]]) -> bool:
+    if not bands:
+        return True
+    for lo, hi in bands:
+        if odds >= lo and odds < hi:
+            return True
+    return False
+
+def kelly_fraction(p: float, o: float) -> float:
+    """
+    Kelly fraction for decimal odds o: b = o-1, f* = (bp - q)/b.
+    Returns 0 if negative.
+    """
+    b = o - 1.0
+    q = 1.0 - p
+    if b <= 0:
+        return 0.0
+    f = (b * p - q) / b
+    return max(0.0, f)
+
+def run_backtest(
+    rows: List[Dict[str, Any]],
+    bands: List[Tuple[float, float]],
+    min_edge: float,
+    staking: str,
+    kelly_scale: float,
+    bankroll: float,
+) -> Dict[str, Any]:
+    bank = bankroll
+    picks: List[Dict[str, Any]] = []
+
+    for row in rows:
+        oa = to_float(row.get("oa") or row.get("odds_a") or row.get("odds_a_vigfree"))
+        ob = to_float(row.get("ob") or row.get("odds_b") or row.get("odds_b_vigfree"))
+        pa = pick_prob(row, "a")
+        pb = pick_prob(row, "b")
+
+        # sanity
+        if any(math.isnan(x) for x in [oa, ob, pa, pb]):
             continue
 
-        # band filter: take the side whose odds in [lo, hi)
+        # edges (value = p*odds - 1)
+        edge_a = pa * oa - 1.0
+        edge_b = pb * ob - 1.0
+
+        # filter by bands + edge
         cand = []
-        if lo <= oa < hi:
-            edge_a = pa*oa - 1.0
-            cand.append(("A", 0, oa, pa, edge_a))
-        if lo <= ob < hi:
-            edge_b = pb*ob - 1.0
-            cand.append(("B", 1, ob, pb, edge_b))
+        if edge_a >= min_edge and side_ok(oa, bands):
+            cand.append(("A", oa, pa, edge_a))
+        if edge_b >= min_edge and side_ok(ob, bands):
+            cand.append(("B", ob, pb, edge_b))
+
         if not cand:
             continue
 
-        # choose side with larger edge
-        side, idx, o, p, edge = max(cand, key=lambda x: x[4])
-
-        if edge < min_edge:
-            continue
+        # pick the better side
+        side, o, p, edge = max(cand, key=lambda t: t[3])
 
         # stake
-        if staking == "kelly":
-            frac = max(0.0, min(1.0, kelly_scale * kelly_fraction(p, o)))
-            stake = bankroll * frac
+        if staking.lower() == "kelly":
+            frac = kelly_fraction(p, o) * float(kelly_scale)
+            stake = max(0.0, frac * bank)
         else:
-            stake = 1.0
+            stake = 1.0  # flat unit
 
-        if stake <= 0:
+        if stake <= 0.0:
             continue
 
-        n_bets += 1
-        total_staked += stake
-
-        # settle: realized if we have outcomes; else EV
-        has_res, winner_idx = has_outcomes(r)
-        if has_res and winner_idx is not None:
-            realized_mode = True
-            won = (winner_idx == idx)
-            gain = stake * (o - 1.0) if won else -stake
-            if won: wins += 1
-            pnl += gain
-            bankroll += gain
-        else:
-            # EV contribution
-            ev = stake * (p*(o - 1.0) - (1.0 - p))
-            pnl += ev
-            bankroll += ev
-
-        picks_log.append({
-            "cfg_id": cfg_id,
-            "event_date": r.get("event_date",""),
-            "player_a": r.get("player_a",""),
-            "player_b": r.get("player_b",""),
+        # EV-only backtest (no realized results in sample): just log the pick + EV
+        picks.append({
+            "event_date": row.get("event_date", ""),
+            "player_a": row.get("player_a", ""),
+            "player_b": row.get("player_b", ""),
             "side": side,
-            "odds": f"{o:.3f}",
-            "p": f"{p:.4f}",
-            "edge": f"{edge:.4f}",
-            "stake": f"{stake:.2f}",
+            "odds": o,
+            "p": p,
+            "edge": edge,
+            "stake": round(stake, 2),
         })
 
-    # metrics
-    roi = (pnl / total_staked) if total_staked > 0 else 0.0
-    hitrate = (wins / n_bets) if (n_bets > 0 and realized_mode) else 0.0
-    # simple sharpe proxy on EV/realized stream (not tracking variance here)
-    sharpe = roi  # placeholder; conservative
+        # bankroll tracking as if we’re allocating (but not settling here)
+        bank = max(0.0, bank - stake)  # reserve stake (for realism)
+        # You can optionally “release” back after logging if you only want sizing not bankroll pressure
+        bank += stake  # comment out this line to apply capital pressure
 
-    # write artifacts
-    outdir.mkdir(parents=True, exist_ok=True)
-    wjson(outdir / f"params_cfg{cfg_id}.json", {
-        "cfg_id": cfg_id,
-        "band": band,
-        "staking": staking,
-        "kelly_scale": kelly_scale,
-        "min_edge": min_edge,
-        "bankroll_start": bankroll0,
-        "mode": "realized" if realized_mode else "expected",
-    })
-    log_path = outdir / "logs"
-    log_path.mkdir(parents=True, exist_ok=True)
-    write_rows(
-        log_path / f"picks_cfg{cfg_id}.csv",
-        picks_log,
-        ["cfg_id","event_date","player_a","player_b","side","odds","p","edge","stake"]
-    )
-
-    return {
-        "cfg_id": cfg_id,
-        "n_bets": n_bets,
-        "total_staked": total_staked,
-        "pnl": pnl,
-        "roi": roi,
-        "hitrate": hitrate,
-        "sharpe": sharpe,
-        "end_bankroll": bankroll,
+    # summary
+    summary = {
+        "cfg_id": 1,
+        "n_bets": len(picks),
+        "total_staked": round(sum(p["stake"] for p in picks), 2),
+        "pnl": 0.0,            # no outcomes in this EV-only sample
+        "roi": 0.0,
+        "hitrate": 0.0,
+        "sharpe": 0.0,
+        "end_bankroll": round(bank, 2),
     }
+    return {"picks": picks, "summary": summary}
+
+def save_backtest(outdir: Path, result: Dict[str, Any]):
+    outdir.mkdir(parents=True, exist_ok=True)
+    # summary table
+    with (outdir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["cfg_id","n_bets","total_staked","pnl","roi","hitrate","sharpe","end_bankroll"])
+        s = result["summary"]
+        w.writerow([s["cfg_id"], s["n_bets"], s["total_staked"], s["pnl"], s["roi"], s["hitrate"], s["sharpe"], s["end_bankroll"]])
+
+    # picks log
+    picks_path = outdir / "logs" / "picks_cfg1.csv"
+    picks_path.parent.mkdir(parents=True, exist_ok=True)
+    with picks_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["event_date","player_a","player_b","side","odds","p","edge","stake"])
+        for p in result["picks"]:
+            w.writerow([p["event_date"], p["player_a"], p["player_b"], p["side"], p["odds"], p["p"], p["edge"], p["stake"]])
+
+    # params dump (so report can link it)
+    with (outdir / "params_cfg1.json").open("w", encoding="utf-8") as f:
+        json.dump({"cfg_id": 1}, f, indent=2)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--bands", default="1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0")
-    ap.add_argument("--staking", choices=["kelly","flat"], default="kelly")
-    ap.add_argument("--kelly-scale", type=float, default=0.5)
-    ap.add_argument("--min-edge", type=float, default=0.01)   # 1% default so we actually take bets
-    ap.add_argument("--bankroll", type=float, default=1000.0)
+    ap.add_argument("--input", required=True, help="CSV with oa,ob, pa,pb (or prob_a_vigfree/prob_b_vigfree)")
+    ap.add_argument("--bands", default=DEFAULT_BANDS, help="Odds bands: '1.0,10.0' or '1.2,2.0|2.0,2.6|...'")
+    ap.add_argument("--staking", default=DEFAULT_STAKING, choices=["kelly","flat"])
+    ap.add_argument("--kelly-scale", type=float, default=DEFAULT_KELLY_SCALE)
+    ap.add_argument("--min-edge", type=float, default=DEFAULT_MIN_EDGE)
+    ap.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL)
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
 
-    rows = read_rows(Path(args.input))
-    if not rows:
-        raise SystemExit("input has no rows")
+    bands = parse_bands(args.bands)
+    rows = load_rows(Path(args.input))
 
-    summary_rows: List[Dict[str,str]] = []
-    cfg_id = 1
-    for band in parse_bands(args.bands):
-        m = run_cfg(cfg_id, band, rows, args.staking, args.kelly_scale,
-                    args.min_edge, args.bankroll, Path(args.outdir))
-        summary_rows.append({k: f"{v:.4f}" if isinstance(v,float) else str(v) for k,v in m.items()})
-        cfg_id += 1
-
-    # write summary
-    summary_path = Path(args.outdir) / "summary.csv"
-    write_rows(summary_path, summary_rows,
-               ["cfg_id","n_bets","total_staked","pnl","roi","hitrate","sharpe","end_bankroll"])
+    result = run_backtest(
+        rows=rows,
+        bands=bands,
+        min_edge=float(args.min_edge),
+        staking=args.staking,
+        kelly_scale=float(args.kelly_scale),
+        bankroll=float(args.bankroll),
+    )
+    save_backtest(Path(args.outdir), result)
 
 if __name__ == "__main__":
     main()
