@@ -4,29 +4,43 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "CSV with odds+probs (defaults to outputs/prob_enriched.csv; falls back if missing)"
-        default: "outputs/prob_enriched.csv"
-        required: true
+        description: "CSV to backtest (leave blank to auto-detect)"
+        required: false
+        default: ""
       bands:
-        description: "Bands like 2.0,2.6|2.6,3.2|3.2,4.0"
+        description: "Odds bands (pipe-separated groups)"
+        required: true
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
-        required: true
       staking:
-        description: "kelly or flat"
+        description: "Staking method (kelly|flat)"
+        required: true
         default: "kelly"
-        required: true
       kelly_scale:
-        description: "Kelly scaler (0.5 = half-kelly)"
-        default: "0.5"
+        description: "Kelly scale (e.g., 0.5 for half-Kelly)"
         required: true
+        default: "0.5"
       bankroll:
         description: "Starting bankroll (units)"
-        default: "1000"
         required: true
+        default: "1000"
+      min_edge:
+        description: "Minimum edge required (e.g., 0.02 = 2%)"
+        required: true
+        default: "0.02"
+      vig_method:
+        description: "Vig removal method (shin|wpe|none)"
+        required: true
+        default: "shin"
+
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -41,84 +55,92 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
-          python -m pip install -U pip wheel
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          mkdir -p outputs docs/backtests results/backtests
 
-      # Resolve a dataset that actually exists on this runner.
-      # Priority:
-      #   1) user-provided path
-      #   2) outputs/prob_enriched.csv
-      #   3) data/raw/vigfree_matches.csv  (has odds_a/odds_b + prob_a_vigfree/prob_b_vigfree)
-      #   4) data/raw/odds/sample_odds.csv (last resort demo)
+      # ---------------------------
+      # DATASET RESOLUTION
+      # ---------------------------
       - name: Resolve dataset path
-        id: ds
-        shell: bash
+        id: dataset
         run: |
-          set -euo pipefail
-          want="${{ github.event.inputs.dataset }}"
-          candidates=(
-            "$want"
-            "outputs/prob_enriched.csv"
-            "data/raw/vigfree_matches.csv"
-            "data/raw/odds/sample_odds.csv"
-          )
-
-          for p in "${candidates[@]}"; do
-            if [[ -f "$p" ]]; then
-              echo "dataset=$p" >> "$GITHUB_OUTPUT"
-              echo "[resolve] Using dataset: $p"
-              exit 0
-            fi
-          done
-
-          echo "::error::No dataset found. Checked: ${candidates[*]}"
+          set -e
+          # 1) explicit input
+          if [ -n "${{ inputs.dataset }}" ] && [ -f "${{ inputs.dataset }}" ]; then
+            echo "file=${{ inputs.dataset }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 2) common locations (new first, then legacy)
+          if [ -f "outputs/prob_enriched.csv" ]; then
+            echo "file=outputs/prob_enriched.csv" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -f "data/raw/vigfree_matches.csv" ]; then
+            echo "file=data/raw/vigfree_matches.csv" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ERROR: No usable dataset found (tried inputs.dataset, outputs/prob_enriched.csv, data/raw/vigfree_matches.csv)" >&2
           exit 1
 
-      # Enrich to canonical columns + edges so the backtest always has what it needs.
+      # ---------------------------
+      # EDGESMITH ENRICHMENT
+      # ---------------------------
       - name: Enrich edges (EdgeSmith)
         run: |
+          set -e
           python scripts/edge_smith_enrich.py \
-            --input  "${{ steps.ds.outputs.dataset }}" \
-            --output "outputs/prob_enriched.csv"
+            --input  "${{ steps.dataset.outputs.file }}" \
+            --output outputs/edge_enriched.csv \
+            --min-edge "${{ inputs.min_edge }}" \
+            --vig-method "${{ inputs.vig_method }}"
+          echo "✅ Enriched -> outputs/edge_enriched.csv"
 
+      # ---------------------------
+      # MATRIX BACKTEST
+      # ---------------------------
+      # NOTE: if your repo uses a different backtest driver, just replace the script name below.
       - name: Run matrix backtest
-        env:
-          BANDS:   ${{ github.event.inputs.bands }}
-          STAKE:   ${{ github.event.inputs.staking }}
-          KSCALE:  ${{ github.event.inputs.kelly_scale }}
-          BANK:    ${{ github.event.inputs.bankroll }}
         run: |
+          set -e
           python scripts/matrix_backtest.py \
-            --input   "outputs/prob_enriched.csv" \
-            --bands   "${BANDS}" \
-            --staking "${STAKE}" \
-            --kelly-scale "${KSCALE}" \
-            --bankroll "${BANK}" \
-            --outdir  "backtests"
+            --input outputs/edge_enriched.csv \
+            --bands "${{ inputs.bands }}" \
+            --staking "${{ inputs.staking }}" \
+            --kelly-scale "${{ inputs.kelly_scale }}" \
+            --bankroll "${{ inputs.bankroll }}" \
+            --logs-dir results/backtests/logs \
+            --summary-csv results/backtests/summary.csv
+          echo "✅ Backtest summary -> results/backtests/summary.csv"
 
+      # ---------------------------
+      # REPORT
+      # ---------------------------
       - name: Summarize
         run: |
-          echo "Matrix Backtest — Summary"
-          echo "Dataset used: outputs/prob_enriched.csv"
-          echo "Bands:   ${{ github.event.inputs.bands }}"
-          echo "Staking: ${{ github.event.inputs.staking }} | Kelly scale: ${{ github.event.inputs.kelly_scale }}"
-          echo "Bankroll: ${{ github.event.inputs.bankroll }} units"
-          echo ""
-          ls -lah backtests || true
-          test -f backtests/index.html && echo "::notice title=Report::backtests/index.html generated"
+          set -e
+          python scripts/generate_report.py \
+            --mode backtest \
+            --input outputs/edge_enriched.csv \
+            --summary results/backtests/summary.csv \
+            --logs-dir results/backtests/logs \
+            --out docs/backtests/index.html
+          echo "✅ Report -> docs/backtests/index.html"
 
+      # ---------------------------
+      # ARTIFACTS
+      # ---------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
           path: |
-            backtests/**
-            outputs/prob_enriched.csv
-          if-no-files-found: warn
-
-
+            outputs/edge_enriched.csv
+            results/backtests/**
+            docs/backtests/index.html
