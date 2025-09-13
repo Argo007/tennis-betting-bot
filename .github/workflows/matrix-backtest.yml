@@ -3,97 +3,94 @@ name: Matrix Backtest (Kelly + TE)
 on:
   workflow_dispatch:
     inputs:
-      dataset_path:
-        description: "CSV to backtest"
-        required: false
+      dataset:
+        description: "CSV with oa,ob,pa,pb (pre or post enrichment)"
         default: "outputs/prob_enriched.csv"
+        required: true
       bands:
-        description: "Odds bands like 1.0,10.0 (wide for debug)"
-        required: false
-        default: "1.0,10.0"
+        description: "Bands like 2.0,2.6|2.6,3.2|3.2,4.0"
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+        required: true
       staking:
         description: "kelly or flat"
-        required: false
         default: "kelly"
+        required: true
       kelly_scale:
-        description: "Kelly scaler (0.5 = half-Kelly)"
-        required: false
+        description: "Kelly scaler (0.5 = half-kelly)"
         default: "0.5"
-      min_edge:
-        description: "Minimum edge threshold (e.g., 0.005 = 0.5%)"
-        required: false
-        default: "0.005"
-      bankroll_units:
+        required: true
+      bankroll:
         description: "Starting bankroll (units)"
-        required: false
         default: "1000"
+        required: true
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          key: >-
+            ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install -U pip wheel
+          pip install -r requirements.txt
 
-      # Ensure the dataset exists & is enriched in CI (hermetic)
-      - name: Prepare backtest input
+      # ⬇️ NEW: normalize & inject edges so backtest has something to chew on
+      - name: Enrich edges (EdgeSmith)
         run: |
-          python scripts/prepare_backtest_input.py
-
-      - name: Peek dataset (first 5 rows)
-        run: |
-          echo "::group::head outputs/prob_enriched.csv"
-          head -n 5 outputs/prob_enriched.csv || true
-          echo "::endgroup::"
+          python scripts/edge_smith_enrich.py \
+            --input  "${{ github.workspace }}/${{ github.event.inputs.dataset }}" \
+            --output "${{ github.workspace }}/${{ github.event.inputs.dataset }}"
 
       - name: Run matrix backtest
         env:
-          DATASET_PATH: ${{ github.event.inputs.dataset_path || 'outputs/prob_enriched.csv' }}
-          BANDS:        ${{ github.event.inputs.bands || '1.0,10.0' }}
-          STAKING:      ${{ github.event.inputs.staking || 'kelly' }}
-          KELLY_SCALE:  ${{ github.event.inputs.kelly_scale || '0.5' }}
-          MIN_EDGE:     ${{ github.event.inputs.min_edge || '0.005' }}
-          BANKROLL:     ${{ github.event.inputs.bankroll_units || '1000' }}
+          DATASET: ${{ github.event.inputs.dataset }}
+          BANDS:   ${{ github.event.inputs.bands }}
+          STAKE:   ${{ github.event.inputs.staking }}
+          KSCALE:  ${{ github.event.inputs.kelly_scale }}
+          BANK:    ${{ github.event.inputs.bankroll }}
         run: |
-          python scripts/run_matrix_backtest.py \
-            --input "${DATASET_PATH}" \
-            --bands "${BANDS}" \
-            --staking "${STAKING}" \
-            --kelly-scale "${KELLY_SCALE}" \
-            --min-edge "${MIN_EDGE}" \
-            --bankroll "${BANKROLL}" \
-            --outdir results/backtests
+          python scripts/matrix_backtest.py \
+            --input   "${DATASET}" \
+            --bands   "${BANDS}" \
+            --staking "${STAKE}" \
+            --kelly-scale "${KSCALE}" \
+            --bankroll "${BANK}" \
+            --outdir  "backtests"
 
-      - name: Generate backtest report
+      - name: Summarize
         run: |
-          python scripts/generate_report.py
+          echo "Matrix Backtest — Summary"
+          echo "Dataset: ${{ github.event.inputs.dataset }}"
+          echo "Bands:   ${{ github.event.inputs.bands }}"
+          echo "Staking: ${{ github.event.inputs.staking }} | Kelly scale: ${{ github.event.inputs.kelly_scale }}"
+          echo "Bankroll: ${{ github.event.inputs.bankroll }} units"
+          echo ""
+          ls -lah backtests || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
-          if-no-files-found: warn
           path: |
-            outputs/prob_enriched.csv
-            outputs/edge_enriched.csv
-            results/backtests/**
-            docs/backtests/index.html
+            backtests/**
+            docs/backtests/**
+          if-no-files-found: warn
+
 
