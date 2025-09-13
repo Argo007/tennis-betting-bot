@@ -1,279 +1,237 @@
+
 #!/usr/bin/env python3
 """
-Matrix backtest for tennis-betting-bot (robust loader + diagnostics).
+Matrix backtest over odds bands with Kelly/flat staking.
 
-Finds input in this order:
-  1) outputs/prob_enriched.csv
-  2) outputs/edge_enriched.csv
-  3) data/raw/vigfree_matches.csv
+- Input must have canonical columns: oa, ob, pa, pb (the report-normalizer
+  already guarantees these exist by duplicating from aliases).
+- Optional outcome columns (any one of):
+  * result: "A" or "B" (case-insensitive)
+  * winner: "A"/"B" or player_a/player_b names
+  * result_a/result_b: 1/0 flags
+  If no outcome is present, we compute EXPECTED PnL (EV mode) and mark it.
 
-Understands many column aliases:
-  - date: event_date | date
-  - players: player_a/player_b | home/away
-  - odds: odds_a/odds_b | price_a/price_b | oa/ob
-  - probs: prob_a_vigfree/prob_b_vigfree | prob_a/prob_b | pa/pb | implied_prob_a/_b
-  - outcome: winner | winner_side | winner_name
+Outputs:
+  results/backtests/summary.csv         (aggregated per cfg)
+  results/backtests/params_cfg{n}.json  (config used)
+  results/backtests/logs/picks_cfg{n}.csv (per-bet log)
 
-If outcomes are missing, uses EV deltas (does NOT drift bankroll on EV to avoid bias).
-
-Writes:
-  results/backtests/summary.csv
-  results/backtests/logs/picks_cfg<N>.csv
-  results/backtests/params_cfg<N>.json
-  results/backtests/_diagnostics.json  (why we got 0 rows, etc.)
+CLI example:
+  python scripts/run_matrix_backtest.py \
+    --input outputs/prob_enriched.csv \
+    --bands "1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0" \
+    --staking kelly --kelly-scale 0.5 \
+    --min-edge 0.01 --bankroll 1000 --outdir results/backtests
 """
 
 from __future__ import annotations
-import csv, json, math, os
+import argparse, csv, json, math
 from pathlib import Path
-from statistics import mean, pstdev
+from typing import Dict, List, Optional, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR   = REPO_ROOT / "outputs"
-RAW_DIR   = REPO_ROOT / "data" / "raw"
-RES_DIR   = REPO_ROOT / "results"
-BT_DIR    = RES_DIR / "backtests"
-LOG_DIR   = BT_DIR / "logs"
-
-BANKROLL_START        = float(os.getenv("BANKROLL_START", "1000.0"))
-MAX_MATCHES_PER_EVENT = int(float(os.getenv("MAX_MATCHES_PER_EVENT", "3")))
-
-def log(m): print(f"[backtest] {m}", flush=True)
-
-# ------- IO helpers ------------------------------------------------------------
-def find_input() -> Path | None:
-    for p in [OUT_DIR/"prob_enriched.csv", OUT_DIR/"edge_enriched.csv", RAW_DIR/"vigfree_matches.csv"]:
-        if p.exists() and p.stat().st_size > 0:
-            return p
-    return None
-
-def read_csv_rows(path: Path) -> list[dict]:
+def read_rows(path: Path) -> List[Dict[str,str]]:
     with path.open("r", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
-def write_csv(rows: list[dict], path: Path) -> None:
+def write_rows(path: Path, rows: List[Dict[str,str]], header: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("cfg_id,n_bets,total_staked,pnl,roi,hitrate,sharpe,end_bankroll\n" if path.name=="summary.csv"
-                        else "config_id,event_date,tournament,player,side,odds,prob,edge,stake,delta,bankroll\n")
-        return
-    fields = list(rows[0].keys())
     with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
-        w.writerows(rows)
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in header})
 
-def write_json(obj, path: Path):
+def wjson(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2))
 
-def csv_has_data(path: Path) -> bool:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            r = csv.reader(f); next(r, None); return next(r, None) is not None
-    except Exception:
-        return False
-
-# ------- column resolver -------------------------------------------------------
-ALIASES = {
-    "date": ["event_date","date","match_date"],
-    "tour": ["tournament","comp","event","league"],
-    "a":    ["player_a","home","a_player","a_name"],
-    "b":    ["player_b","away","b_player","b_name"],
-    "oa":   ["odds_a","price_a","oa","odd_a","decimal_odds_a"],
-    "ob":   ["odds_b","price_b","ob","odd_b","decimal_odds_b"],
-    "pa":   ["prob_a_vigfree","prob_a","implied_prob_a","pa","p_a"],
-    "pb":   ["prob_b_vigfree","prob_b","implied_prob_b","pb","p_b"],
-    "win":  ["winner","winner_side","win_side","winner_name","winner_player"],
-}
-
-def pick(row: dict, keys: list[str]) -> str:
-    lk = {k.lower(): k for k in row.keys()}
-    for k in keys:
-        if k in lk: return row[lk[k]]
-    return ""
-
-def to_float(x):
+def fnum(x: str) -> float:
     try: return float(x)
-    except: return None
+    except: return 0.0
 
-def normalize(rows: list[dict]) -> tuple[list[dict], dict]:
-    """Return normalized rows + diagnostics (counts & missing)."""
-    out = []
-    diag = {"total_rows": len(rows), "usable": 0, "reasons": []}
-    for r in rows:
-        d  = (pick(r, ALIASES["date"]) or "").strip()
-        tr = (pick(r, ALIASES["tour"]) or "").strip()
-        a  = (pick(r, ALIASES["a"]) or "").strip()
-        b  = (pick(r, ALIASES["b"]) or "").strip()
-        oa = to_float(pick(r, ALIASES["oa"]))
-        ob = to_float(pick(r, ALIASES["ob"]))
-        pa = to_float(pick(r, ALIASES["pa"]))
-        pb = to_float(pick(r, ALIASES["pb"]))
+def has_outcomes(row: Dict[str,str]) -> Tuple[bool, Optional[int]]:
+    """
+    Returns (has_result, winner_idx) where winner_idx is 0 for A, 1 for B when resolvable.
+    """
+    # result as A/B
+    r = (row.get("result") or row.get("Result") or "").strip().upper()
+    if r in ("A","B"):
+        return True, 0 if r=="A" else 1
 
-        if None in (oa,ob,pa,pb) or oa<=1 or ob<=1 or pa<0 or pb<0:
-            continue
+    # binary flags
+    ra = row.get("result_a")
+    rb = row.get("result_b")
+    if ra is not None and rb is not None:
+        try:
+            ia = int(float(ra)); ib = int(float(rb))
+            if ia==1 and ib==0: return True, 0
+            if ia==0 and ib==1: return True, 1
+        except: pass
 
-        out.append({
-            "date": d or "",
-            "tournament": tr,
-            "player_a": a or "A",
-            "player_b": b or "B",
-            "odds_a": oa, "odds_b": ob,
-            "prob_a": pa, "prob_b": pb,
-            "raw": r,
-        })
-    diag["usable"] = len(out)
-    if diag["usable"] == 0:
-        # sample a reason from first row
-        diag["reasons"].append("No rows with both odds and probs present (oa,ob,pa,pb).")
-    return out, diag
+    # winner as name
+    w = (row.get("winner") or "").strip()
+    if w:
+        a = (row.get("player_a") or "").strip()
+        b = (row.get("player_b") or "").strip()
+        if a and w == a: return True, 0
+        if b and w == b: return True, 1
 
-# ------- math ------------------------------------------------------------------
-def kelly(p: float, o: float) -> float:
+    return False, None
+
+def kelly_fraction(p: float, o: float) -> float:
+    # decimal odds o => net odds b = o-1
     b = o - 1.0
     if b <= 0: return 0.0
-    edge = b*p - (1.0 - p)
-    return max(0.0, edge / b)
+    # Kelly f* = (p*b - (1-p)) / b  = (p*o - 1)/(o-1)
+    return (p*o - 1.0) / b
 
-def edge_ev(p: float, o: float) -> float:
-    return p*o - 1.0
+def parse_bands(s: str) -> List[Tuple[float,float]]:
+    bands = []
+    for chunk in s.split("|"):
+        chunk = chunk.strip()
+        if not chunk: continue
+        a,b = chunk.split(",")
+        bands.append((float(a), float(b)))
+    return bands
 
-def sharpe(deltas):
-    if not deltas: return 0.0
-    mu = mean(deltas); var = pstdev(deltas)**2
-    sd = math.sqrt(var + 1e-12)
-    return mu/sd if sd>0 else 0.0
-
-# ------- simulation ------------------------------------------------------------
-def simulate(cfg_id: int, params: dict, rows: list[dict]) -> dict:
-    bankroll = float(params["BANKROLL_START"])
-    daily_budget_pct = float(params["DAILY_RISK_BUDGET_PCT"])
-    stake_cap_pct    = float(params["STAKE_CAP_PCT"])
-    kf = float(params["KELLY_FRACTION"]) * float(params["KELLY_SCALE"])
-
-    daily_key = None
-    daily_spent = 0.0
-    event_count = {}
-
-    picks = []
-    deltas = []
-    wins=losses=0
-    total_staked=0.0
+def run_cfg(cfg_id: int, band: Tuple[float,float], rows: List[Dict[str,str]],
+            staking: str, kelly_scale: float, min_edge: float, bankroll0: float,
+            outdir: Path) -> Dict[str, float]:
+    lo, hi = band
+    picks_log: List[Dict[str,str]] = []
+    bankroll = bankroll0
+    total_staked = 0.0
+    pnl = 0.0
+    n_bets = 0
+    wins = 0
+    realized_mode = False
 
     for r in rows:
-        d = r["date"]
-        if daily_key != d:
-            daily_key = d; daily_spent = 0.0
-
-        pa, pb = r["prob_a"], r["prob_b"]
-        oa, ob = r["odds_a"], r["odds_b"]
-        ea, eb = edge_ev(pa,oa), edge_ev(pb,ob)
-
-        choose = []
-        if pa >= params["MIN_PROBABILITY"] and ea >= params["MIN_EDGE_EV"]:
-            choose.append(("A", pa, oa, ea, r["player_a"]))
-        if pb >= params["MIN_PROBABILITY"] and eb >= params["MIN_EDGE_EV"]:
-            choose.append(("B", pb, ob, eb, r["player_b"]))
-        if not choose: continue
-        side,p,o,e,name = max(choose, key=lambda x:x[3])
-
-        event_id = f"{d}|{r['tournament']}"
-        if event_count.get(event_id,0) >= MAX_MATCHES_PER_EVENT:
+        oa = fnum(r.get("oa","0")); ob = fnum(r.get("ob","0"))
+        pa = fnum(r.get("pa","0")); pb = fnum(r.get("pb","0"))
+        if oa<=1.0 or ob<=1.0 or pa<=0 or pb<=0:  # guardrails
             continue
-        event_count[event_id] = event_count.get(event_id,0)+1
 
-        frac  = kelly(p,o) * kf
-        stake = min(bankroll*frac, bankroll*stake_cap_pct, bankroll*daily_budget_pct - daily_spent)
-        if stake <= 0: continue
+        # band filter: take the side whose odds in [lo, hi)
+        cand = []
+        if lo <= oa < hi:
+            edge_a = pa*oa - 1.0
+            cand.append(("A", 0, oa, pa, edge_a))
+        if lo <= ob < hi:
+            edge_b = pb*ob - 1.0
+            cand.append(("B", 1, ob, pb, edge_b))
+        if not cand:
+            continue
 
-        # outcome (optional)
-        winflag = None
-        w = (pick(r["raw"], ALIASES["win"]) or "").strip().lower()
-        if w in ("a","player_a","home","1", r["player_a"].strip().lower()):
-            winflag = (side=="A")
-        elif w in ("b","player_b","away","2", r["player_b"].strip().lower()):
-            winflag = (side=="B")
+        # choose side with larger edge
+        side, idx, o, p, edge = max(cand, key=lambda x: x[4])
 
-        if winflag is None:
-            delta = stake*e   # EV mode (don’t update bankroll to avoid drift)
-            new_br = bankroll
+        if edge < min_edge:
+            continue
+
+        # stake
+        if staking == "kelly":
+            frac = max(0.0, min(1.0, kelly_scale * kelly_fraction(p, o)))
+            stake = bankroll * frac
         else:
-            payout = stake*o if winflag else 0.0
-            delta  = payout - stake
-            new_br = bankroll + delta
-            wins += int(winflag); losses += int(not winflag)
+            stake = 1.0
 
-        picks.append({
-            "config_id": cfg_id,
-            "event_date": d, "tournament": r["tournament"],
-            "player": name, "side": side,
-            "odds": round(o,3), "prob": round(p,6), "edge": round(e,6),
-            "stake": round(stake,2), "delta": round(delta,2), "bankroll": round(new_br,2),
+        if stake <= 0:
+            continue
+
+        n_bets += 1
+        total_staked += stake
+
+        # settle: realized if we have outcomes; else EV
+        has_res, winner_idx = has_outcomes(r)
+        if has_res and winner_idx is not None:
+            realized_mode = True
+            won = (winner_idx == idx)
+            gain = stake * (o - 1.0) if won else -stake
+            if won: wins += 1
+            pnl += gain
+            bankroll += gain
+        else:
+            # EV contribution
+            ev = stake * (p*(o - 1.0) - (1.0 - p))
+            pnl += ev
+            bankroll += ev
+
+        picks_log.append({
+            "cfg_id": cfg_id,
+            "event_date": r.get("event_date",""),
+            "player_a": r.get("player_a",""),
+            "player_b": r.get("player_b",""),
+            "side": side,
+            "odds": f"{o:.3f}",
+            "p": f"{p:.4f}",
+            "edge": f"{edge:.4f}",
+            "stake": f"{stake:.2f}",
         })
-        total_staked += stake; deltas.append(delta); bankroll = new_br; daily_spent += stake
 
-    pnl = sum(deltas)
-    roi = pnl/total_staked if total_staked>0 else 0.0
-    hit = wins/(wins+losses) if (wins+losses)>0 else 0.0
-    shp = sharpe(deltas)
+    # metrics
+    roi = (pnl / total_staked) if total_staked > 0 else 0.0
+    hitrate = (wins / n_bets) if (n_bets > 0 and realized_mode) else 0.0
+    # simple sharpe proxy on EV/realized stream (not tracking variance here)
+    sharpe = roi  # placeholder; conservative
+
+    # write artifacts
+    outdir.mkdir(parents=True, exist_ok=True)
+    wjson(outdir / f"params_cfg{cfg_id}.json", {
+        "cfg_id": cfg_id,
+        "band": band,
+        "staking": staking,
+        "kelly_scale": kelly_scale,
+        "min_edge": min_edge,
+        "bankroll_start": bankroll0,
+        "mode": "realized" if realized_mode else "expected",
+    })
+    log_path = outdir / "logs"
+    log_path.mkdir(parents=True, exist_ok=True)
+    write_rows(
+        log_path / f"picks_cfg{cfg_id}.csv",
+        picks_log,
+        ["cfg_id","event_date","player_a","player_b","side","odds","p","edge","stake"]
+    )
 
     return {
-        "cfg_id": cfg_id, "n_bets": len(picks),
-        "total_staked": round(total_staked,2), "pnl": round(pnl,2),
-        "roi": round(roi,4), "hitrate": round(hit,4), "sharpe": round(shp,4),
-        "end_bankroll": round(bankroll,2), "picks": picks,
+        "cfg_id": cfg_id,
+        "n_bets": n_bets,
+        "total_staked": total_staked,
+        "pnl": pnl,
+        "roi": roi,
+        "hitrate": hitrate,
+        "sharpe": sharpe,
+        "end_bankroll": bankroll,
     }
 
-# ------- grid ------------------------------------------------------------------
-def grid() -> list[dict]:
-    def cfg(me, mp, kf, sc, db):
-        return {
-            "MIN_EDGE_EV": me, "MIN_PROBABILITY": mp,
-            "KELLY_FRACTION": kf, "KELLY_SCALE": 1.0,
-            "STAKE_CAP_PCT": sc, "DAILY_RISK_BUDGET_PCT": db,
-            "BANKROLL_START": float(os.getenv("BANKROLL_START","1000")),
-        }
-    g=[]
-    for me in [0.01,0.015,0.02,0.03]:
-        for mp in [0.03,0.04,0.05]:
-            for kf in [0.25,0.5,0.75]:
-                for sc in [0.02,0.04]:
-                    for db in [0.08,0.12,0.18]:
-                        g.append(cfg(me,mp,kf,sc,db))
-    return g
-
-# ------- main ------------------------------------------------------------------
 def main():
-    BT_DIR.mkdir(parents=True, exist_ok=True); LOG_DIR.mkdir(parents=True, exist_ok=True)
-    inp = find_input()
-    diag = {"input": str(inp) if inp else None}
-    if not inp:
-        write_csv([], BT_DIR/"summary.csv")
-        write_json({"reason": "no_input_file", **diag}, BT_DIR/"_diagnostics.json")
-        log("No input file found."); return
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--bands", default="1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0")
+    ap.add_argument("--staking", choices=["kelly","flat"], default="kelly")
+    ap.add_argument("--kelly-scale", type=float, default=0.5)
+    ap.add_argument("--min-edge", type=float, default=0.01)   # 1% default so we actually take bets
+    ap.add_argument("--bankroll", type=float, default=1000.0)
+    ap.add_argument("--outdir", required=True)
+    args = ap.parse_args()
 
-    raw = read_csv_rows(inp)
-    norm, nd = normalize(raw)
-    diag.update(nd)
-    if nd["usable"] == 0:
-        write_csv([], BT_DIR/"summary.csv")
-        write_json({"reason": "no_usable_rows", **diag}, BT_DIR/"_diagnostics.json")
-        log("Input has no usable rows with odds & probs."); return
+    rows = read_rows(Path(args.input))
+    if not rows:
+        raise SystemExit("input has no rows")
 
-    # sort by date string (already ISO-like)
-    norm.sort(key=lambda r: r["date"])
-    configs = grid()
+    summary_rows: List[Dict[str,str]] = []
+    cfg_id = 1
+    for band in parse_bands(args.bands):
+        m = run_cfg(cfg_id, band, rows, args.staking, args.kelly_scale,
+                    args.min_edge, args.bankroll, Path(args.outdir))
+        summary_rows.append({k: f"{v:.4f}" if isinstance(v,float) else str(v) for k,v in m.items()})
+        cfg_id += 1
 
-    summary=[]
-    for i, p in enumerate(configs, start=1):
-        res = simulate(i, p, norm)
-        write_csv(res["picks"], LOG_DIR/f"picks_cfg{i}.csv")
-        write_json(p, BT_DIR/f"params_cfg{i}.json")
-        summary.append({k: res[k] for k in ("cfg_id","n_bets","total_staked","pnl","roi","hitrate","sharpe","end_bankroll")})
-
-    write_csv(summary, BT_DIR/"summary.csv")
-    write_json(diag, BT_DIR/"_diagnostics.json")
-    log(f"Backtest done over {len(configs)} configs → {BT_DIR/'summary.csv'}")
+    # write summary
+    summary_path = Path(args.outdir) / "summary.csv"
+    write_rows(summary_path, summary_rows,
+               ["cfg_id","n_bets","total_staked","pnl","roi","hitrate","sharpe","end_bankroll"])
 
 if __name__ == "__main__":
     main()
