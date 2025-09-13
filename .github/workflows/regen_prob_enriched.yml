@@ -1,0 +1,59 @@
+name: Regen Prob Enriched
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Regenerate prob_enriched.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw data/raw/odds outputs
+          python scripts/fetch_tennis_data.py --outdir data/raw
+          python scripts/fetch_close_odds.py --odds oddsportal --outdir data/raw/odds
+          python scripts/fill_with_synthetic_live.py --outdir data/raw/odds
+          python scripts/build_from_raw.py
+          python scripts/build_dataset.py
+          python scripts/ensure_dataset.py
+          python scripts/compute_prob_vigfree.py \
+            --input data/raw/historical_matches.csv \
+            --output data/raw/vigfree_matches.csv \
+            --method shin
+          python scripts/check_probabilities.py \
+            --input data/raw/vigfree_matches.csv \
+            --output outputs/prob_enriched.csv
+          python scripts/edge_smith_enrich.py \
+            --input outputs/prob_enriched.csv \
+            --output outputs/edge_enriched.csv
+          echo "Wrote:"
+          ls -lh outputs/prob_enriched.csv outputs/edge_enriched.csv data/raw/vigfree_matches.csv || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prob-enriched-${{ github.run_id }}
+          path: |
+            outputs/prob_enriched.csv
+            outputs/edge_enriched.csv
+            data/raw/vigfree_matches.csv
+          if-no-files-found: error
