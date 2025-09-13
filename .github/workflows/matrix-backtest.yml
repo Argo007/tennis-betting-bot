@@ -1,3 +1,4 @@
+
 name: Matrix Backtest (Kelly + TE)
 
 on:
@@ -8,9 +9,9 @@ on:
         required: false
         default: "outputs/prob_enriched.csv"
       bands:
-        description: "Bands like 2.0,2.6|2.6,3.2|3.2,4.0"
+        description: "Odds bands like 1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0"
         required: false
-        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+        default: "1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0"
       staking:
         description: "kelly or flat"
         required: false
@@ -19,6 +20,10 @@ on:
         description: "Kelly scaler (0.5 = half-Kelly)"
         required: false
         default: "0.5"
+      min_edge:
+        description: "Minimum edge threshold (e.g., 0.01 = 1%)"
+        required: false
+        default: "0.01"
       bankroll_units:
         description: "Starting bankroll (units)"
         required: false
@@ -51,25 +56,24 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # 🔑 NEW: Always prepare dataset in CI so the job is self-contained
+      # 🔑 Build/refresh inputs so the backtest is hermetic in CI
       - name: Prepare backtest input
         run: |
           python scripts/prepare_backtest_input.py
 
-      # Optional: echo the first lines so we can see it has rows
-      - name: Peek dataset
+      - name: Peek dataset (first 5 rows)
         run: |
           echo "::group::head outputs/prob_enriched.csv"
           head -n 5 outputs/prob_enriched.csv || true
           echo "::endgroup::"
 
-      # Your existing matrix sweep (use your repo’s script/args)
       - name: Run matrix backtest
         env:
           DATASET_PATH: ${{ github.event.inputs.dataset_path || 'outputs/prob_enriched.csv' }}
-          BANDS:        ${{ github.event.inputs.bands || '2.0,2.6|2.6,3.2|3.2,4.0' }}
+          BANDS:        ${{ github.event.inputs.bands || '1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0' }}
           STAKING:      ${{ github.event.inputs.staking || 'kelly' }}
           KELLY_SCALE:  ${{ github.event.inputs.kelly_scale || '0.5' }}
+          MIN_EDGE:     ${{ github.event.inputs.min_edge || '0.01' }}
           BANKROLL:     ${{ github.event.inputs.bankroll_units || '1000' }}
         run: |
           python scripts/run_matrix_backtest.py \
@@ -77,11 +81,11 @@ jobs:
             --bands "${BANDS}" \
             --staking "${STAKING}" \
             --kelly-scale "${KELLY_SCALE}" \
+            --min-edge "${MIN_EDGE}" \
             --bankroll "${BANKROLL}" \
             --outdir results/backtests
 
-      # Normalize + render HTML report (the robust version you installed)
-      - name: Generate report
+      - name: Generate backtest report
         run: |
           python scripts/generate_report.py
 
@@ -89,11 +93,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
+          if-no-files-found: warn
           path: |
             outputs/prob_enriched.csv
             outputs/edge_enriched.csv
-            outputs/*.csv
             results/backtests/**
             docs/backtests/index.html
-          if-no-files-found: warn
-
