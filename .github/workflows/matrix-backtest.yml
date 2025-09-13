@@ -1,17 +1,16 @@
-
 name: Matrix Backtest (Kelly + TE)
 
 on:
   workflow_dispatch:
     inputs:
       dataset_path:
-        description: "CSV to backtest (defaults to outputs/prob_enriched.csv)"
+        description: "CSV to backtest"
         required: false
         default: "outputs/prob_enriched.csv"
       bands:
-        description: "Odds bands like 1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0"
+        description: "Odds bands like 1.0,10.0 (wide for debug)"
         required: false
-        default: "1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0"
+        default: "1.0,10.0"
       staking:
         description: "kelly or flat"
         required: false
@@ -21,9 +20,9 @@ on:
         required: false
         default: "0.5"
       min_edge:
-        description: "Minimum edge threshold (e.g., 0.01 = 1%)"
+        description: "Minimum edge threshold (e.g., 0.005 = 0.5%)"
         required: false
-        default: "0.01"
+        default: "0.005"
       bankroll_units:
         description: "Starting bankroll (units)"
         required: false
@@ -37,13 +36,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+        with: { fetch-depth: 1 }
 
       - name: Setup Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -56,7 +53,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # 🔑 Build/refresh inputs so the backtest is hermetic in CI
+      # Ensure the dataset exists & is enriched in CI (hermetic)
       - name: Prepare backtest input
         run: |
           python scripts/prepare_backtest_input.py
@@ -70,10 +67,10 @@ jobs:
       - name: Run matrix backtest
         env:
           DATASET_PATH: ${{ github.event.inputs.dataset_path || 'outputs/prob_enriched.csv' }}
-          BANDS:        ${{ github.event.inputs.bands || '1.2,2.0|2.0,2.6|2.6,3.2|3.2,4.0' }}
+          BANDS:        ${{ github.event.inputs.bands || '1.0,10.0' }}
           STAKING:      ${{ github.event.inputs.staking || 'kelly' }}
           KELLY_SCALE:  ${{ github.event.inputs.kelly_scale || '0.5' }}
-          MIN_EDGE:     ${{ github.event.inputs.min_edge || '0.01' }}
+          MIN_EDGE:     ${{ github.event.inputs.min_edge || '0.005' }}
           BANKROLL:     ${{ github.event.inputs.bankroll_units || '1000' }}
         run: |
           python scripts/run_matrix_backtest.py \
@@ -99,3 +96,4 @@ jobs:
             outputs/edge_enriched.csv
             results/backtests/**
             docs/backtests/index.html
+
