@@ -4,34 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       dataset_path:
-        description: "CSV with odds+prob (+result optional)"
+        description: "CSV to backtest (defaults to outputs/prob_enriched.csv)"
         required: false
-        default: outputs/prob_enriched.csv
+        default: "outputs/prob_enriched.csv"
       bands:
-        description: "Odds bands like 2.0,2.6|2.6,3.2|3.2,4.0 (display only)"
+        description: "Bands like 2.0,2.6|2.6,3.2|3.2,4.0"
         required: false
-        default: 2.0,2.6|2.6,3.2|3.2,4.0
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
       staking:
-        description: "kelly or flat (display only)"
+        description: "kelly or flat"
         required: false
-        default: kelly
-      true_edge:
-        description: "Display-only TE (e.g., 0.08 = TE8)"
-        required: false
-        default: "0.08"
+        default: "kelly"
       kelly_scale:
-        description: "Kelly scaler (0.5 = half-Kelly, display only)"
+        description: "Kelly scaler (0.5 = half-Kelly)"
         required: false
         default: "0.5"
       bankroll_units:
-        description: "Starting bankroll units (display only)"
+        description: "Starting bankroll (units)"
         required: false
         default: "1000"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -39,7 +35,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -55,135 +51,49 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Prep dataset (use input or fallbacks)
-        id: dataset
-        shell: bash
+      # 🔑 NEW: Always prepare dataset in CI so the job is self-contained
+      - name: Prepare backtest input
         run: |
-          set -euo pipefail
-          mkdir -p outputs data/raw results/backtests docs/backtests
-          IN="${{ github.event.inputs.dataset_path }}"
-          if [ -n "$IN" ] && [ -f "$IN" ]; then
-            echo "Using provided dataset: $IN"
-            cp -f "$IN" outputs/prob_enriched.csv
-          elif [ -f outputs/prob_enriched.csv ]; then
-            echo "Using existing outputs/prob_enriched.csv"
-          elif [ -f data/raw/vigfree_matches.csv ]; then
-            echo "Using fallback data/raw/vigfree_matches.csv"
-            cp -f data/raw/vigfree_matches.csv outputs/prob_enriched.csv
-          else
-            echo "WARN: No dataset found. Creating empty placeholder."
-            printf "event_date,tournament,player_a,player_b,odds_a,odds_b,prob_a_vigfree,prob_b_vigfree\n" > outputs/prob_enriched.csv
-          fi
-          ls -l outputs/prob_enriched.csv || true
+          python scripts/prepare_backtest_input.py
 
+      # Optional: echo the first lines so we can see it has rows
+      - name: Peek dataset
+        run: |
+          echo "::group::head outputs/prob_enriched.csv"
+          head -n 5 outputs/prob_enriched.csv || true
+          echo "::endgroup::"
+
+      # Your existing matrix sweep (use your repo’s script/args)
       - name: Run matrix backtest
+        env:
+          DATASET_PATH: ${{ github.event.inputs.dataset_path || 'outputs/prob_enriched.csv' }}
+          BANDS:        ${{ github.event.inputs.bands || '2.0,2.6|2.6,3.2|3.2,4.0' }}
+          STAKING:      ${{ github.event.inputs.staking || 'kelly' }}
+          KELLY_SCALE:  ${{ github.event.inputs.kelly_scale || '0.5' }}
+          BANKROLL:     ${{ github.event.inputs.bankroll_units || '1000' }}
         run: |
-          set -euo pipefail
-          python scripts/run_matrix_backtest.py
+          python scripts/run_matrix_backtest.py \
+            --input "${DATASET_PATH}" \
+            --bands "${BANDS}" \
+            --staking "${STAKING}" \
+            --kelly-scale "${KELLY_SCALE}" \
+            --bankroll "${BANKROLL}" \
+            --outdir results/backtests
 
-      - name: Generate HTML report
+      # Normalize + render HTML report (the robust version you installed)
+      - name: Generate report
         run: |
-          set -euo pipefail
           python scripts/generate_report.py
 
-      - name: Export classic outputs (matrix_rankings/results/kelly_summary)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import csv, json, os
-          from pathlib import Path
-
-          repo = Path(__file__).resolve().parents[2]
-          bt_dir = repo/"results"/"backtests"
-          out_dir = repo/"outputs"
-          out_dir.mkdir(parents=True, exist_ok=True)
-
-          summary = bt_dir/"summary.csv"
-          if not summary.exists() or summary.stat().st_size == 0:
-              # Write empty placeholders so downstream never breaks
-              (out_dir/"matrix_rankings.csv").write_text("cfg_id,n_bets,total_staked,pnl,roi,hitrate,sharpe,end_bankroll\n")
-              (out_dir/"results.csv").write_text("config_id,event_date,tournament,player,side,odds,prob,edge,stake,delta,bankroll\n")
-              (out_dir/"kelly_summary.csv").write_text("cfg_id,KELLY_FRACTION,KELLY_SCALE,STAKE_CAP_PCT,DAILY_RISK_BUDGET_PCT,MIN_EDGE_EV,MIN_PROBABILITY\n")
-              raise SystemExit(0)
-
-          # Copy matrix rankings
-          (out_dir/"matrix_rankings.csv").write_text(summary.read_text())
-
-          # Pick best config by Sharpe -> ROI -> n_bets
-          def num(x):
-              try: return float(x)
-              except: return 0.0
-
-          with summary.open("r", encoding="utf-8") as f:
-              rows = list(csv.DictReader(f))
-          rows2 = []
-          for r in rows:
-              r2 = dict(r)
-              r2["cfg_id"] = int(float(r.get("cfg_id",0)))
-              r2["roi"] = num(r.get("roi"))
-              r2["sharpe"] = num(r.get("sharpe"))
-              r2["n_bets"] = int(float(r.get("n_bets",0)))
-              rows2.append(r2)
-          rows2.sort(key=lambda r:(r["sharpe"], r["roi"], r["n_bets"]), reverse=True)
-          if not rows2:
-              raise SystemExit(0)
-          best = rows2[0]
-          cfg_id = best["cfg_id"]
-
-          # Export picks of best config to outputs/results.csv
-          picks = bt_dir/"logs"/f"picks_cfg{cfg_id}.csv"
-          if picks.exists():
-              (out_dir/"results.csv").write_text(picks.read_text())
-          else:
-              (out_dir/"results.csv").write_text("config_id,event_date,tournament,player,side,odds,prob,edge,stake,delta,bankroll\n")
-
-          # Export best params to outputs/kelly_summary.csv
-          params = bt_dir/f"params_cfg{cfg_id}.json"
-          header = ["cfg_id","KELLY_FRACTION","KELLY_SCALE","STAKE_CAP_PCT","DAILY_RISK_BUDGET_PCT","MIN_EDGE_EV","MIN_PROBABILITY"]
-          line = [str(cfg_id)]*1 + [""]*6
-          vals = {}
-          if params.exists():
-              vals = json.loads(params.read_text())
-          def get(k, d=""):
-              v = vals.get(k, d)
-              try: return str(v)
-              except: return d
-          line = [
-              str(cfg_id),
-              get("KELLY_FRACTION",""),
-              get("KELLY_SCALE",""),
-              get("STAKE_CAP_PCT",""),
-              get("DAILY_RISK_BUDGET_PCT",""),
-              get("MIN_EDGE_EV",""),
-              get("MIN_PROBABILITY",""),
-          ]
-          with (out_dir/"kelly_summary.csv").open("w", encoding="utf-8", newline="") as f:
-              f.write(",".join(header)+"\n")
-              f.write(",".join(line)+"\n")
-          PY
-
-      - name: Job summary
-        run: |
-          echo "### Matrix Backtest — Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Dataset:** \`${{ github.event.inputs.dataset_path || 'outputs/prob_enriched.csv' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Bands:** \`${{ github.event.inputs.bands }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Staking:** \`${{ github.event.inputs.staking }}\`  |  **Kelly scale:** \`${{ github.event.inputs.kelly_scale }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Bankroll:** \`${{ github.event.inputs.bankroll_units }}\` units" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Artifacts written to **outputs/** and **docs/backtests/**." >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload artifacts (classic + report)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
           path: |
-            outputs/matrix_rankings.csv
-            outputs/results.csv
-            outputs/kelly_summary.csv
-            results/backtests/summary.csv
-            results/backtests/logs/**
-            results/backtests/params_cfg*.json
+            outputs/prob_enriched.csv
+            outputs/edge_enriched.csv
+            outputs/*.csv
+            results/backtests/**
             docs/backtests/index.html
           if-no-files-found: warn
+
