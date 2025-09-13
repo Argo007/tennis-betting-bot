@@ -1,165 +1,172 @@
+
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-EdgeSmith — enrich probability file for backtesting.
+EdgeSmith — enrich a prob+odds CSV with EV/edge metrics and a recommended pick.
 
-Inputs
-------
-A CSV that *must* contain odds and probabilities for both sides with one of
-these column name sets (case-insensitive):
+Inputs can use several alias column names; we normalize to:
+  oa, ob  -> decimal odds for sides A/B
+  pa, pb  -> win probabilities for sides A/B (already vig-free or fair)
 
-- Required (canonical):
-    oa, ob, pa, pb
-
-- Accepted aliases (will be mapped to canonical):
-    odds_a, odds_b, prob_a, prob_b
-    implied_prob_a, implied_prob_b
-    prob_a_vigfree, prob_b_vigfree
-
-The script will:
-- Normalize columns to (oa, ob, pa, pb)
-- Compute edge_a = pa - 1/oa
-         edge_b = pb - 1/ob
-- true_edge  = max(edge_a, edge_b)
-- sel        = 'A' if edge_a >= edge_b else 'B'
-- sel_player = player_a or player_b if present
-- fair_odds_a = 1/pa ; fair_odds_b = 1/pb
-
-Output
-------
-Writes a fully enriched CSV to --output (can overwrite the input path).
-Returns nonzero exit if no usable rows.
-
-Usage
------
-python scripts/edge_smith_enrich.py \
-  --input outputs/prob_enriched.csv \
-  --output outputs/prob_enriched.csv
+Output includes:
+  ev_a, ev_b     -> expected value (pa*oa - 1, pb*ob - 1)
+  te_a, te_b     -> true edge in probability space (pa - 1/oa, pb - 1/ob)
+  pick, pick_prob, pick_odds, pick_ev, pick_te  -> best positive edge (if any)
 """
+
 from __future__ import annotations
 import argparse
 import sys
-import math
 from pathlib import Path
+import math
 import pandas as pd
 
-CANON = ("oa", "ob", "pa", "pb")
 
+# --------- helpers ---------
 ALIASES = {
-    "oa": ["oa", "odds_a", "oddsA", "odds_a_close", "odd_a", "o_a"],
-    "ob": ["ob", "odds_b", "oddsB", "odds_b_close", "odd_b", "o_b"],
-    "pa": ["pa", "prob_a", "probA", "implied_prob_a", "prob_a_vigfree", "p_a"],
-    "pb": ["pb", "prob_b", "probB", "implied_prob_b", "prob_b_vigfree", "p_b"],
+    # odds
+    "oa": ["oa", "odds_a", "price_a", "dec_odds_a", "o_a", "oddsa"],
+    "ob": ["ob", "odds_b", "price_b", "dec_odds_b", "o_b", "oddsb"],
+    # probs
+    "pa": [
+        "pa", "prob_a", "probA", "p_a",
+        "implied_prob_a", "implied_pa",
+        "prob_a_vigfree", "prob_a_vig_free", "pa_vigfree", "pavf"
+    ],
+    "pb": [
+        "pb", "prob_b", "probB", "p_b",
+        "implied_prob_b", "implied_pb",
+        "prob_b_vigfree", "prob_b_vig_free", "pb_vigfree", "pbvf"
+    ],
 }
 
-def _first_present(cols, options):
-    for name in options:
-        if name in cols:
-            return name
-        # allow case-insensitive match
-        for c in cols:
-            if c.lower() == name.lower():
-                return c
+def _find_col(df: pd.DataFrame, canonical: str) -> str | None:
+    """Return the first matching column alias present in df for canonical name."""
+    for alias in ALIASES[canonical]:
+        if alias in df.columns:
+            return alias
     return None
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = set(df.columns)
-    mapping = {}
-    for tgt in CANON:
-        found = _first_present(cols, ALIASES[tgt])
-        if not found:
-            raise KeyError(f"Missing required column for '{tgt}'. "
-                           f"Looked for any of: {ALIASES[tgt]}")
-        mapping[tgt] = found
-
-    # Reassign canonical views without losing originals
-    out = df.copy()
-    for tgt, src in mapping.items():
-        out[tgt] = pd.to_numeric(out[src], errors="coerce")
-
-    return out
-
-def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    # sanity: positive odds and 0<prob<1
-    valid = (
-        (out["oa"] > 1e-9) &
-        (out["ob"] > 1e-9) &
-        (out["pa"] > 0) & (out["pa"] < 1) &
-        (out["pb"] > 0) & (out["pb"] < 1)
-    )
-    before = len(out)
-    out = out.loc[valid].copy()
-    dropped = before - len(out)
-
-    if len(out) == 0:
-        raise RuntimeError("No usable rows after sanity checks (odds/prob bounds).")
-
-    # compute
-    out["fair_odds_a"] = 1.0 / out["pa"]
-    out["fair_odds_b"] = 1.0 / out["pb"]
-
-    out["edge_a"] = out["pa"] - (1.0 / out["oa"])
-    out["edge_b"] = out["pb"] - (1.0 / out["ob"])
-
-    # choose side with higher edge (ties -> A)
-    out["true_edge"] = out[["edge_a", "edge_b"]].max(axis=1)
-    out["sel"] = (out["edge_a"] >= out["edge_b"]).map({True: "A", False: "B"})
-
-    # friendly selection label if players present
-    if "player_a" in out.columns and "player_b" in out.columns:
-        out["sel_player"] = out.apply(
-            lambda r: r["player_a"] if r["sel"] == "A" else r["player_b"], axis=1
+def _require_cols(df: pd.DataFrame, required=("oa", "ob", "pa", "pb")):
+    missing = []
+    for canon in required:
+        if _find_col(df, canon) is None:
+            missing.append(canon)
+    if missing:
+        # Build helpful message listing aliases we looked for
+        parts = []
+        for canon in missing:
+            parts.append(f"{canon}: {ALIASES[canon]}")
+        msg = " | ".join(parts)
+        raise SystemExit(
+            f"[enrich] FATAL: Missing required columns.\n"
+            f"Looked for these aliases -> {msg}\n"
+            f"Available columns: {list(df.columns)}"
         )
 
-    # deterministic column order: keep existing, then append our metrics at the end
-    metric_cols = ["fair_odds_a", "fair_odds_b", "edge_a", "edge_b", "true_edge", "sel"]
-    if "sel_player" in out.columns:
-        metric_cols.append("sel_player")
+def _breakeven_p(odds: float) -> float:
+    try:
+        return 1.0 / float(odds) if odds and float(odds) > 0 else math.nan
+    except Exception:
+        return math.nan
 
-    # ensure no duplicate columns in final order
-    base_cols = [c for c in df.columns if c not in metric_cols]
-    final_cols = base_cols + metric_cols
 
-    # info line to stdout (visible in Actions logs)
-    print(f"[enrich] input rows={before}, dropped_invalid={dropped}, kept={len(out)}")
-    pos = (out["true_edge"] > 0).sum()
-    print(f"[enrich] positive edges={pos} ({pos/len(out):.0%})")
+# --------- core ---------
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute EV/TE and pick columns; returns a new dataframe."""
+    # Normalize names by creating oa/ob/pa/pb views without losing originals
+    oa_col = _find_col(df, "oa")
+    ob_col = _find_col(df, "ob")
+    pa_col = _find_col(df, "pa")
+    pb_col = _find_col(df, "pb")
 
-    return out[final_cols]
+    # cast to numeric defensively
+    df["_oa"] = pd.to_numeric(df[oa_col], errors="coerce")
+    df["_ob"] = pd.to_numeric(df[ob_col], errors="coerce")
+    df["_pa"] = pd.to_numeric(df[pa_col], errors="coerce")
+    df["_pb"] = pd.to_numeric(df[pb_col], errors="coerce")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to prob_enriched.csv (pre-enrichment).")
-    ap.add_argument("--output", required=True, help="Path to write enriched CSV (may overwrite input).")
-    args = ap.parse_args()
+    # EV = p * odds - 1
+    df["ev_a"] = df["_pa"] * df["_oa"] - 1.0
+    df["ev_b"] = df["_pb"] * df["_ob"] - 1.0
 
-    inp = Path(args.input)
-    outp = Path(args.output)
-    if not inp.exists():
-        print(f"[enrich] ERROR: input not found: {inp}", file=sys.stderr)
+    # True edge = p - 1/odds  (probability advantage vs breakeven)
+    df["te_a"] = df["_pa"] - df["_oa"].map(_breakeven_p)
+    df["te_b"] = df["_pb"] - df["_ob"].map(_breakeven_p)
+
+    # Which side is better by EV?
+    best_is_a = df["ev_a"].fillna(-1e9) >= df["ev_b"].fillna(-1e9)
+    df["pick"] = best_is_a.map({True: "A", False: "B"})
+    df["pick_prob"] = df["_pa"].where(best_is_a, df["_pb"])
+    df["pick_odds"] = df["_oa"].where(best_is_a, df["_ob"])
+    df["pick_ev"]   = df["ev_a"].where(best_is_a, df["ev_b"])
+    df["pick_te"]   = df["te_a"].where(best_is_a, df["te_b"])
+
+    # Keep original columns intact + new metrics (drop temp fields)
+    out_cols = list(df.columns)
+    # temp markers we will remove from the final order (but keep metrics)
+    for c in ["_oa", "_ob", "_pa", "_pb"]:
+        out_cols.remove(c)
+    return df[out_cols]
+
+
+# --------- CLI ---------
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Enrich a prob+odds CSV with EV and edge metrics (EdgeSmith)."
+    )
+    p.add_argument("--input", required=True, help="Input CSV (must have odds+probs).")
+    p.add_argument("--output", required=True, help="Where to write enriched CSV.")
+    p.add_argument(
+        "--min-edge",
+        type=float,
+        default=0.0,
+        help="Optional: minimum pick_ev required to be considered (for info column only).",
+    )
+    # Accept but ignore --method for compatibility with upstream calls
+    p.add_argument("--method", default="", help="Compatibility flag (ignored).")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    in_path = Path(args.input)
+    out_path = Path(args.output)
+
+    if not in_path.exists():
+        print(f"[enrich] ERROR: input not found: {in_path}", file=sys.stderr)
         sys.exit(2)
 
-    df = pd.read_csv(inp)
-    if df.shape[0] == 0:
-        print(f"[enrich] WARNING: input has zero rows: {inp}", file=sys.stderr)
-        # still write back the header + our fields for traceability
-        df["oa"] = pd.NA; df["ob"] = pd.NA; df["pa"] = pd.NA; df["pb"] = pd.NA
-        df["fair_odds_a"] = pd.NA; df["fair_odds_b"] = pd.NA
-        df["edge_a"] = pd.NA; df["edge_b"] = pd.NA; df["true_edge"] = pd.NA; df["sel"] = pd.NA
-        df.to_csv(outp, index=False)
+    df = pd.read_csv(in_path)
+    if df.empty:
+        print("[enrich] ERROR: input has header only or zero rows.", file=sys.stderr)
+        # Still write an empty file with expected headers for downstream robustness
+        pd.DataFrame().to_csv(out_path, index=False)
         sys.exit(0)
 
-    try:
-        norm = normalize_columns(df)
-        enr = compute_edges(norm)
-    except Exception as e:
-        print(f"[enrich] FATAL: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Validate required columns (by aliases), then enrich
+    _require_cols(df, required=("oa", "ob", "pa", "pb"))
+    enriched = enrich(df)
 
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    enr.to_csv(outp, index=False)
-    print(f"[enrich] wrote -> {outp} with columns: {', '.join([c for c in enr.columns if c in ('oa','ob','pa','pb','edge_a','edge_b','true_edge','sel')])}")
+    # (Optional) convenience flag showing whether pick passes EV threshold
+    try:
+        enriched["pick_pass_min_edge"] = (enriched["pick_ev"] >= float(args.min_edge)).astype(int)
+    except Exception:
+        enriched["pick_pass_min_edge"] = 0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_csv(out_path, index=False)
+
+    # Summary
+    n_rows = len(enriched)
+    n_pos = int((enriched["pick_ev"] >= float(args.min_edge)).sum())
+    print(
+        f"[enrich] wrote {n_rows} rows -> {out_path}\n"
+        f"[enrich] picks >= min_edge({args.min_edge}): {n_pos}"
+    )
+
 
 if __name__ == "__main__":
     main()
