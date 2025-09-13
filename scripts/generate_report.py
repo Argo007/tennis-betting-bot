@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Render backtest HTML with graceful empty-state + diagnostics.
+Extended to read enriched outputs if summary.csv is empty.
 """
 
 from __future__ import annotations
@@ -11,49 +12,59 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 BT   = ROOT / "results" / "backtests"
 DOCS = ROOT / "docs" / "backtests"
+OUTPUTS = ROOT / "outputs"
 
 def read_csv_rows(p: Path):
-    if not p.exists() or p.stat().st_size==0:
+    if not p.exists() or p.stat().st_size == 0:
         return []
     with p.open("r", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 def num(x):
-    try: return float(x)
-    except: return 0.0
+    try:
+        return float(x)
+    except:
+        return 0.0
 
 def pick_winner(rows):
-    if not rows: return None
-    rows2=[]
+    if not rows:
+        return None
+    rows2 = []
     for r in rows:
         rows2.append({
             **r,
-            "cfg_id": int(float(r.get("cfg_id",0))),
-            "n_bets": int(float(r.get("n_bets",0))),
+            "cfg_id": int(float(r.get("cfg_id", 0))),
+            "n_bets": int(float(r.get("n_bets", 0))),
             "roi": num(r.get("roi")),
             "sharpe": num(r.get("sharpe")),
         })
-    rows2.sort(key=lambda r:(r["sharpe"], r["roi"], r["n_bets"]), reverse=True)
+    rows2.sort(key=lambda r: (r["sharpe"], r["roi"], r["n_bets"]), reverse=True)
     return rows2[0] if rows2 else None
 
 def render_table(rows):
     if not rows:
         return "<p>No backtest results available.</p>"
-    cols = ["cfg_id","n_bets","total_staked","pnl","roi","hitrate","sharpe","end_bankroll"]
+    cols = ["cfg_id", "n_bets", "total_staked", "pnl", "roi", "hitrate", "sharpe", "end_bankroll"]
     head = "".join(f"<th>{c}</th>" for c in cols)
     body = []
-    rows = sorted(rows, key=lambda r:(num(r.get("sharpe",0)), num(r.get("roi",0))), reverse=True)[:25]
+    rows = sorted(rows, key=lambda r: (num(r.get("sharpe", 0)), num(r.get("roi", 0))), reverse=True)[:25]
     for r in rows:
-        tds = "".join(f"<td>{r.get(c,'')}</td>" for c in cols)
+        tds = "".join(f"<td>{r.get(c, '')}</td>" for c in cols)
         body.append(f"<tr>{tds}</tr>")
     return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
 
 def main():
     DOCS.mkdir(parents=True, exist_ok=True)
-    summary = BT/"summary.csv"
-    diags   = BT/"_diagnostics.json"
+    summary = BT / "summary.csv"
+    enriched = OUTPUTS / "prob_enriched.csv"
+    diags   = BT / "_diagnostics.json"
 
+    # Try summary first, fallback to prob_enriched
     rows = read_csv_rows(summary)
+    if not rows and enriched.exists():
+        print("[report] summary.csv empty, using prob_enriched.csv")
+        rows = read_csv_rows(enriched)
+
     winner = pick_winner(rows)
     diag_text = ""
     if diags.exists():
@@ -84,9 +95,8 @@ pre{{background:#f6f8fa;padding:10px;overflow:auto}}
 <h3>Diagnostics</h3>
 {diag_text or "<p>(none)</p>"}
 </body></html>"""
-    (DOCS/"index.html").write_text(html, encoding="utf-8")
+    (DOCS / "index.html").write_text(html, encoding="utf-8")
     print(f"[report] wrote {DOCS/'index.html'}")
 
 if __name__ == "__main__":
     main()
-
