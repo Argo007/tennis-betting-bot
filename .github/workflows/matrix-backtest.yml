@@ -2,45 +2,10 @@ name: Matrix Backtest (Kelly + TE)
 
 on:
   workflow_dispatch:
-    inputs:
-      dataset:
-        description: "CSV to backtest (leave empty to auto-detect/build)"
-        required: false
-        default: ""
-      bands:
-        description: "Odds bands (pipe-separated groups)"
-        required: true
-        default: "1.2,2.0|2.0,2.6|3.2,4.0"
-      staking:
-        description: "Staking method (kelly|flat)"
-        required: true
-        default: "kelly"
-      kelly_scale:
-        description: "Kelly scale (0.5 = half Kelly)"
-        required: true
-        default: "0.5"
-      bankroll:
-        description: "Starting bankroll (units)"
-        required: true
-        default: "1000"
-      min_edge:
-        description: "Minimum edge threshold (use TE if present)"
-        required: true
-        default: "0.001"
-      vig_method:
-        description: "Vig removal method (shin|wpe|none)"
-        required: true
-        default: "shin"
-
-env:
-  PYTHONUNBUFFERED: "1"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Checkout repo
@@ -49,115 +14,41 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          mkdir -p data/raw/odds outputs results/backtests/logs docs/backtests
+          pip install -r requirements.txt
 
-      # ---------------------------
-      # DATASET RESOLUTION
-      # ---------------------------
-      - name: Resolve dataset
-        id: resolve
-        run: |
-          set -e
-          NEED_SYNTH=0
-          FILE=""
-          if [ -n "${{ inputs.dataset }}" ] && [ -f "${{ inputs.dataset }}" ]; then
-            FILE="${{ inputs.dataset }}"
-          elif [ -f "outputs/edge_enriched.csv" ]; then
-            FILE="outputs/edge_enriched.csv"
-          elif [ -f "outputs/prob_enriched.csv" ]; then
-            FILE="outputs/prob_enriched.csv"
-          elif [ -f "data/raw/vigfree_matches.csv" ]; then
-            FILE="data/raw/vigfree_matches.csv"
-          else
-            NEED_SYNTH=1
-          fi
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-          echo "need_synth=$NEED_SYNTH" >> "$GITHUB_OUTPUT"
-          echo "Resolved file=$FILE need_synth=$NEED_SYNTH"
-
-      - name: Build synthetic dataset (if none found)
-        if: steps.resolve.outputs.need_synth == '1'
-        run: |
-          set -e
-          test -f data/raw/odds/sample_odds.csv || { echo "Missing data/raw/odds/sample_odds.csv"; exit 1; }
-          python scripts/compute_prob_vigfree.py \
-            --input  data/raw/odds/sample_odds.csv \
-            --output data/raw/vigfree_matches.csv \
-            --method "${{ inputs.vig_method }}"
-          python scripts/check_probabilities.py \
-            --input  data/raw/vigfree_matches.csv \
-            --output outputs/prob_enriched.csv
-          echo "Built outputs/prob_enriched.csv"
-
-      # ---------------------------
-      # EDGESMITH ENRICHMENT
-      # ---------------------------
-      - name: Enrich edges (EdgeSmith)
-        run: |
-          set -e
-          SRC="${{ steps.resolve.outputs.file }}"
-          if [ -z "$SRC" ]; then SRC="outputs/prob_enriched.csv"; fi
-          python scripts/edge_smith_enrich.py \
-            --input  "$SRC" \
-            --output outputs/edge_enriched.csv \
-            --min-edge "${{ inputs.min_edge }}" \
-            --method "${{ inputs.vig_method }}"
-          echo "✅ EdgeSmith enriched -> outputs/edge_enriched.csv"
-
-      # ---------------------------
-      # MATRIX BACKTEST
-      # ---------------------------
+      # 🔑 Keep it simple: the script auto-detects input and does everything.
       - name: Run matrix backtest
-        run: |
-          set -e
-          python scripts/run_matrix_backtest.py \
-            --input outputs/edge_enriched.csv \
-            --bands "${{ inputs.bands }}" \
-            --staking "${{ inputs.staking }}" \
-            --kelly-scale "${{ inputs.kelly_scale }}" \
-            --min-edge "${{ inputs.min_edge }}" \
-            --bankroll "${{ inputs.bankroll }}" \
-            --outdir results/backtests
-          echo "✅ Backtest -> results/backtests"
+        run: python scripts/run_matrix_backtest.py
 
-      # ---------------------------
-      # REPORT
-      # ---------------------------
-      - name: Generate HTML report
+      # Optional: show a tiny summary in the job log if present
+      - name: Summarize
+        if: always()
         run: |
-          set -e
-          python scripts/generate_report.py \
-            --mode backtest \
-            --input outputs/edge_enriched.csv \
-            --summary results/backtests/summary.csv \
-            --logs-dir results/backtests/logs \
-            --out docs/backtests/index.html
-          echo "✅ Report -> docs/backtests/index.html"
+          echo "Backtest summary (if generated):"
+          test -f results/backtests/summary.csv && column -s, -t < results/backtests/summary.csv | sed -e 's/^/  /' || echo "  (no summary.csv yet)"
+          test -f results/backtests/_diagnostics.json && echo && echo "Diagnostics:" && cat results/backtests/_diagnostics.json || true
 
-      # ---------------------------
-      # ARTIFACTS
-      # ---------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
+          if-no-files-found: warn
           path: |
-            outputs/edge_enriched.csv
-            outputs/prob_enriched.csv
-            data/raw/vigfree_matches.csv
             results/backtests/**
-            docs/backtests/index.html
+            docs/backtests/**
+            outputs/**
+            results/**
 
