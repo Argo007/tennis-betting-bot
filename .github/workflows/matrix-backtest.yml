@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "CSV to backtest (leave blank to auto-detect)"
+        description: "CSV to backtest (leave empty to auto-detect/build)"
         required: false
         default: ""
       bands:
@@ -16,7 +16,7 @@ on:
         required: true
         default: "kelly"
       kelly_scale:
-        description: "Kelly scale (e.g., 0.5 for half-Kelly)"
+        description: "Kelly scale (0.5 = half Kelly)"
         required: true
         default: "0.5"
       bankroll:
@@ -24,7 +24,7 @@ on:
         required: true
         default: "1000"
       min_edge:
-        description: "Minimum edge required (e.g., 0.02 = 2%)"
+        description: "Minimum edge threshold (e.g., 0.02 = 2%)"
         required: true
         default: "0.02"
       vig_method:
@@ -63,49 +63,103 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          mkdir -p outputs docs/backtests results/backtests
+          mkdir -p data/raw/odds outputs results/backtests/logs docs/backtests
 
-      # ---------------------------
-      # DATASET RESOLUTION
-      # ---------------------------
+      # ------------------------------------------------------------------
+      # 1) Resolve dataset path (do NOT fail; set flags for next steps)
+      # ------------------------------------------------------------------
       - name: Resolve dataset path
-        id: dataset
+        id: resolve
         run: |
           set -e
-          # 1) explicit input
-          if [ -n "${{ inputs.dataset }}" ] && [ -f "${{ inputs.dataset }}" ]; then
-            echo "file=${{ inputs.dataset }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # 2) common locations (new first, then legacy)
-          if [ -f "outputs/prob_enriched.csv" ]; then
-            echo "file=outputs/prob_enriched.csv" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ -f "data/raw/vigfree_matches.csv" ]; then
-            echo "file=data/raw/vigfree_matches.csv" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "ERROR: No usable dataset found (tried inputs.dataset, outputs/prob_enriched.csv, data/raw/vigfree_matches.csv)" >&2
-          exit 1
+          NEED_SYNTH=0
+          CAND=""
 
-      # ---------------------------
-      # EDGESMITH ENRICHMENT
-      # ---------------------------
+          # a) explicit input
+          if [ -n "${{ inputs.dataset }}" ] && [ -f "${{ inputs.dataset }}" ]; then
+            CAND="${{ inputs.dataset }}"
+          fi
+
+          # b) common outputs (new first)
+          if [ -z "$CAND" ] && [ -f "outputs/prob_enriched.csv" ]; then
+            CAND="outputs/prob_enriched.csv"
+          fi
+
+          # c) legacy intermediate
+          if [ -z "$CAND" ] && [ -f "data/raw/vigfree_matches.csv" ]; then
+            CAND="data/raw/vigfree_matches.csv"
+          fi
+
+          # d) if still nothing, mark for synthetic build from sample_odds.csv
+          if [ -z "$CAND" ]; then
+            NEED_SYNTH=1
+          fi
+
+          echo "file=$CAND"        >> "$GITHUB_OUTPUT"
+          echo "need_synth=$NEED_SYNTH" >> "$GITHUB_OUTPUT"
+          echo "Resolved file='$CAND', need_synth=$NEED_SYNTH"
+
+      # ------------------------------------------------------------------
+      # 2) Build minimal dataset if not found (using sample_odds.csv)
+      #    - compute_prob_vigfree -> data/raw/vigfree_matches.csv
+      #    - check_probabilities  -> outputs/prob_enriched.csv
+      # ------------------------------------------------------------------
+      - name: Build synthetic dataset from sample_odds
+        if: steps.resolve.outputs.need_synth == '1'
+        run: |
+          set -e
+          if [ ! -f "data/raw/odds/sample_odds.csv" ]; then
+            echo "FATAL: data/raw/odds/sample_odds.csv is missing." >&2
+            exit 1
+          fi
+
+          echo ">> compute_prob_vigfree.py"
+          python scripts/compute_prob_vigfree.py \
+            --input  data/raw/odds/sample_odds.csv \
+            --output data/raw/vigfree_matches.csv \
+            --method "${{ inputs.vig_method }}"
+
+          echo ">> check_probabilities.py"
+          python scripts/check_probabilities.py \
+            --input  data/raw/vigfree_matches.csv \
+            --output outputs/prob_enriched.csv
+
+          echo "✅ Built outputs/prob_enriched.csv from sample_odds"
+
+      # Make the chosen dataset explicit for downstream steps
+      - name: Choose dataset for enrich/backtest
+        id: choose
+        run: |
+          set -e
+          FILE="${{ steps.resolve.outputs.file }}"
+          if [ -z "$FILE" ]; then
+            FILE="outputs/prob_enriched.csv"
+          fi
+          if [ ! -f "$FILE" ]; then
+            echo "FATAL: Expected dataset '$FILE' not found." >&2
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "Using dataset: $FILE"
+
+      # ------------------------------------------------------------------
+      # 3) EdgeSmith enrichment: normalize+alias probs, compute edge columns
+      #    Output: outputs/edge_enriched.csv
+      # ------------------------------------------------------------------
       - name: Enrich edges (EdgeSmith)
         run: |
           set -e
           python scripts/edge_smith_enrich.py \
-            --input  "${{ steps.dataset.outputs.file }}" \
+            --input  "${{ steps.choose.outputs.file }}" \
             --output outputs/edge_enriched.csv \
             --min-edge "${{ inputs.min_edge }}" \
             --vig-method "${{ inputs.vig_method }}"
           echo "✅ Enriched -> outputs/edge_enriched.csv"
 
-      # ---------------------------
-      # MATRIX BACKTEST
-      # ---------------------------
-      # NOTE: if your repo uses a different backtest driver, just replace the script name below.
+      # ------------------------------------------------------------------
+      # 4) Run matrix backtest
+      #    Writes: results/backtests/summary.csv and logs/
+      # ------------------------------------------------------------------
       - name: Run matrix backtest
         run: |
           set -e
@@ -117,11 +171,11 @@ jobs:
             --bankroll "${{ inputs.bankroll }}" \
             --logs-dir results/backtests/logs \
             --summary-csv results/backtests/summary.csv
-          echo "✅ Backtest summary -> results/backtests/summary.csv"
+          echo "✅ Summary -> results/backtests/summary.csv"
 
-      # ---------------------------
-      # REPORT
-      # ---------------------------
+      # ------------------------------------------------------------------
+      # 5) Generate HTML report
+      # ------------------------------------------------------------------
       - name: Summarize
         run: |
           set -e
@@ -133,14 +187,17 @@ jobs:
             --out docs/backtests/index.html
           echo "✅ Report -> docs/backtests/index.html"
 
-      # ---------------------------
-      # ARTIFACTS
-      # ---------------------------
+      # ------------------------------------------------------------------
+      # 6) Upload artifacts (enriched input + results + report)
+      # ------------------------------------------------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
           path: |
             outputs/edge_enriched.csv
+            outputs/prob_enriched.csv
+            data/raw/vigfree_matches.csv
             results/backtests/**
             docs/backtests/index.html
+
