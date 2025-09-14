@@ -2,11 +2,31 @@ name: Matrix Backtest (Kelly + TE)
 
 on:
   workflow_dispatch:
+    inputs:
+      min_edge:
+        description: "Minimum true edge (e.g. 0.02)"
+        required: false
+        default: "0.02"
+      bands:
+        description: "Odds bands (matrix), e.g. 2.0,2.6|2.6,3.2|3.2,4.0"
+        required: false
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+      kelly_scale:
+        description: "Kelly scale (0.5 = half kelly)"
+        required: false
+        default: "0.5"
+      bankroll:
+        description: "Starting bankroll (units)"
+        required: false
+        default: "1000"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -14,41 +34,75 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install -U pip
           pip install -r requirements.txt
 
-      # 🔑 Keep it simple: the script auto-detects input and does everything.
-      - name: Run matrix backtest
-        run: python scripts/run_matrix_backtest.py
-
-      # Optional: show a tiny summary in the job log if present
-      - name: Summarize
-        if: always()
+      # ---------- Resolve dataset (prefer enriched/outputs, else raw) ----------
+      - name: Resolve dataset
+        id: ds
         run: |
-          echo "Backtest summary (if generated):"
-          test -f results/backtests/summary.csv && column -s, -t < results/backtests/summary.csv | sed -e 's/^/  /' || echo "  (no summary.csv yet)"
-          test -f results/backtests/_diagnostics.json && echo && echo "Diagnostics:" && cat results/backtests/_diagnostics.json || true
+          set -e
+          CANDIDATES=(
+            "outputs/edge_enriched.csv"
+            "outputs/prob_enriched.csv"
+            "data/raw/vigfree_matches.csv"
+            "data/raw/odds/sample_odds.csv"
+          )
+          CHOSEN=""
+          for p in "${CANDIDATES[@]}"; do
+            if [ -s "$p" ]; then
+              CHOSEN="$p"; break
+            fi
+          done
+          echo "chosen=$CHOSEN" >> "$GITHUB_OUTPUT"
+          echo "Resolved dataset -> ${CHOSEN:-NONE}"
+          if [ -z "$CHOSEN" ]; then
+            echo "ERROR: no usable dataset found"; exit 1
+          fi
+
+      # ---------- Enrich edges if we don't already have edge_enriched ----------
+      - name: Enrich edges (EdgeSmith)
+        if: steps.ds.outputs.chosen != 'outputs/edge_enriched.csv'
+        run: |
+          set -e
+          python scripts/edge_smith_enrich.py \
+            --input  "${{ steps.ds.outputs.chosen }}" \
+            --output "outputs/edge_enriched.csv" \
+            --min-edge "${{ github.event.inputs.min_edge || '0.02' }}" \
+            --method  "shin"
+          echo "edge_enriched.csv ready"
+
+      # ---------- Run matrix backtest ----------
+      - name: Run matrix backtest
+        run: |
+          set -e
+          python scripts/run_matrix_backtest.py \
+            --dataset "outputs/edge_enriched.csv" \
+            --min-edge "${{ github.event.inputs.min_edge || '0.02' }}" \
+            --staking  "kelly" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale || '0.5' }}" \
+            --bankroll "${{ github.event.inputs.bankroll || '1000' }}" \
+            --bands   "${{ github.event.inputs.bands || '2.0,2.6|2.6,3.2|3.2,4.0' }}" \
+            --outdir  "results/backtests"
+
+      - name: Generate HTML report
+        run: |
+          python scripts/generate_report.py \
+            --summary "results/backtests/summary.csv" \
+            --params  "results/backtests/params_cfg1.json" \
+            --picks   "results/backtests/logs/picks_cfg1.csv" \
+            --diagnostics "results/backtests/_diagnostics.json" \
+            --output  "docs/backtests/index.html"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
-          if-no-files-found: warn
           path: |
+            docs/backtests/index.html
             results/backtests/**
-            docs/backtests/**
-            outputs/**
-            results/**
-
+            outputs/edge_enriched.csv
