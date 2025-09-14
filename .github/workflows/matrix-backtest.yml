@@ -3,22 +3,26 @@ name: Matrix Backtest (Kelly + TE)
 on:
   workflow_dispatch:
     inputs:
-      min_edge:
-        description: "Minimum true edge (e.g. 0.02)"
-        required: false
-        default: "0.02"
       bands:
-        description: "Odds bands (matrix), e.g. 2.0,2.6|2.6,3.2|3.2,4.0"
+        description: "Bands like 2.0,2.6|2.6,3.2|3.2,4.0"
         required: false
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
+      staking:
+        description: "kelly or flat"
+        required: false
+        default: "kelly"
       kelly_scale:
-        description: "Kelly scale (0.5 = half kelly)"
+        description: "Kelly scale (e.g., 0.5 = half Kelly)"
         required: false
         default: "0.5"
       bankroll:
         description: "Starting bankroll (units)"
         required: false
         default: "1000"
+      min_edge:
+        description: "Minimum edge to consider (e.g., 0.005 = 0.5%)"
+        required: false
+        default: "0.005"
 
 jobs:
   backtest:
@@ -26,7 +30,7 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: .
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -36,73 +40,144 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install deps
         run: |
-          python -m pip install -U pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---------- Resolve dataset (prefer enriched/outputs, else raw) ----------
-      - name: Resolve dataset
-        id: ds
+      # -------- Resolve dataset (prefer prob_enriched -> vigfree -> sample_odds)
+      - name: Resolve dataset path
+        id: resolve
         run: |
-          set -e
-          CANDIDATES=(
-            "outputs/edge_enriched.csv"
-            "outputs/prob_enriched.csv"
-            "data/raw/vigfree_matches.csv"
-            "data/raw/odds/sample_odds.csv"
-          )
+          set -euo pipefail
+          # candidates in priority order
+          CANDIDATES=("outputs/prob_enriched.csv" "data/raw/vigfree_matches.csv" "data/raw/odds/sample_odds.csv")
           CHOSEN=""
-          for p in "${CANDIDATES[@]}"; do
-            if [ -s "$p" ]; then
-              CHOSEN="$p"; break
+          for f in "${CANDIDATES[@]}"; do
+            if [[ -f "$f" ]]; then
+              CHOSEN="$f"
+              break
             fi
           done
-          echo "chosen=$CHOSEN" >> "$GITHUB_OUTPUT"
-          echo "Resolved dataset -> ${CHOSEN:-NONE}"
-          if [ -z "$CHOSEN" ]; then
-            echo "ERROR: no usable dataset found"; exit 1
+          if [[ -z "$CHOSEN" ]]; then
+            echo "ERROR: no usable dataset found." >&2
+            exit 1
           fi
+          echo "dataset=$CHOSEN" >> "$GITHUB_OUTPUT"
+          echo "Resolved dataset: $CHOSEN"
 
-      # ---------- Enrich edges if we don't already have edge_enriched ----------
-      - name: Enrich edges (EdgeSmith)
-        if: steps.ds.outputs.chosen != 'outputs/edge_enriched.csv'
+      # -------- Normalize: ensure we have columns oa, ob, pa, pb
+      - name: Normalize to prob_enriched.csv (adds pa/pb if missing)
         run: |
-          set -e
-          python scripts/edge_smith_enrich.py \
-            --input  "${{ steps.ds.outputs.chosen }}" \
-            --output "outputs/edge_enriched.csv" \
-            --min-edge "${{ github.event.inputs.min_edge || '0.02' }}" \
-            --method  "shin"
-          echo "edge_enriched.csv ready"
+          set -euo pipefail
 
-      # ---------- Run matrix backtest ----------
+          IN="${{ steps.resolve.outputs.dataset }}"
+          OUT="outputs/prob_enriched.csv"
+          mkdir -p outputs
+
+          python - << 'PY'
+          import csv, sys, pandas as pd
+          from pathlib import Path
+
+          src = Path("${{ steps.resolve.outputs.dataset }}")
+          out = Path("outputs/prob_enriched.csv")
+
+          df = pd.read_csv(src)
+
+          # Map possible column names
+          def col(df, names):
+            for n in names:
+              if n in df.columns: return n
+            return None
+
+          oa = col(df, ["oa","odds_a","oddsA","odds_a_vigfree","odds_a_vgf"])
+          ob = col(df, ["ob","odds_b","oddsB","odds_b_vigfree","odds_b_vgf"])
+          pa = col(df, ["pa","prob_a","probA","implied_prob_a","prob_a_vigfree","pa_vigfree"])
+          pb = col(df, ["pb","prob_b","probB","implied_prob_b","prob_b_vigfree","pb_vigfree"])
+
+          # If odds columns missing, bail
+          if oa is None or ob is None:
+            raise SystemExit("Normalize: missing odds columns (oa/ob). Found columns: "+", ".join(df.columns))
+
+          # If probabilities missing, compute fair from odds (normalize 1/oa,1/ob)
+          if pa is None or pb is None:
+            inv_oa = 1.0/df[oa].astype(float)
+            inv_ob = 1.0/df[ob].astype(float)
+            s = inv_oa + inv_ob
+            df["pa"] = inv_oa / s
+            df["pb"] = inv_ob / s
+          else:
+            df = df.rename(columns={pa:"pa", pb:"pb"})
+
+          # Standardize odds as oa/ob
+          ren = {}
+          if oa != "oa": ren[oa] = "oa"
+          if ob != "ob": ren[ob] = "ob"
+          if ren: df = df.rename(columns=ren)
+
+          # Keep input columns + standardized set
+          # Ensure required export cols present
+          for c in ["oa","ob","pa","pb"]:
+            if c not in df.columns:
+              raise SystemExit(f"Normalize: required column {c} not present at save time.")
+
+          df.to_csv(out, index=False)
+          print(f"Normalized -> {out}")
+          PY
+
+          echo "dataset=outputs/prob_enriched.csv" >> "$GITHUB_OUTPUT"
+
+      # -------- Enrich edges (EdgeSmith)
+      - name: Enrich edges (EdgeSmith)
+        run: |
+          set -euo pipefail
+          python scripts/edge_smith_enrich.py \
+            --input outputs/prob_enriched.csv \
+            --output outputs/edge_enriched.csv \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
+            --method shin
+
+      # -------- Run matrix backtest (expects --dataset)
       - name: Run matrix backtest
         run: |
-          set -e
+          set -euo pipefail
           python scripts/run_matrix_backtest.py \
-            --dataset "outputs/edge_enriched.csv" \
-            --min-edge "${{ github.event.inputs.min_edge || '0.02' }}" \
-            --staking  "kelly" \
-            --kelly-scale "${{ github.event.inputs.kelly_scale || '0.5' }}" \
-            --bankroll "${{ github.event.inputs.bankroll || '1000' }}" \
-            --bands   "${{ github.event.inputs.bands || '2.0,2.6|2.6,3.2|3.2,4.0' }}" \
-            --outdir  "results/backtests"
+            --dataset outputs/edge_enriched.csv \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
+            --staking "${{ github.event.inputs.staking }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}" \
+            --bands "${{ github.event.inputs.bands }}" \
+            --outdir results/backtests
+          echo "Backtest complete."
 
+      # -------- Generate HTML report
       - name: Generate HTML report
         run: |
+          set -euo pipefail
+          mkdir -p docs/backtests
           python scripts/generate_report.py \
-            --summary "results/backtests/summary.csv" \
-            --params  "results/backtests/params_cfg1.json" \
-            --picks   "results/backtests/logs/picks_cfg1.csv" \
-            --diagnostics "results/backtests/_diagnostics.json" \
-            --output  "docs/backtests/index.html"
+            --summary results/backtests/summary.csv \
+            --params results/backtests/params_cfg1.json \
+            --picks results/backtests/logs/picks_cfg1.csv \
+            --dataset outputs/prob_enriched.csv \
+            --out docs/backtests/index.html
+          echo "Report written to docs/backtests/index.html"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
           path: |
-            docs/backtests/index.html
-            results/backtests/**
             outputs/edge_enriched.csv
+            outputs/prob_enriched.csv
+            results/backtests/**
+            docs/backtests/index.html
