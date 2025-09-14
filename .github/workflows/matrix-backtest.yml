@@ -10,7 +10,7 @@ on:
       bands:
         description: "Odds bands (pipe-separated groups)"
         required: true
-        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+        default: "1.2,2.0|2.0,2.6|3.2,4.0"
       staking:
         description: "Staking method (kelly|flat)"
         required: true
@@ -24,9 +24,9 @@ on:
         required: true
         default: "1000"
       min_edge:
-        description: "Minimum edge threshold"
+        description: "Minimum edge threshold (use TE if present)"
         required: true
-        default: "0.02"
+        default: "0.001"
       vig_method:
         description: "Vig removal method (shin|wpe|none)"
         required: true
@@ -43,7 +43,7 @@ jobs:
         shell: bash
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -58,35 +58,37 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           mkdir -p data/raw/odds outputs results/backtests/logs docs/backtests
 
-      # 1) Resolve dataset path
-      - name: Resolve dataset path
+      # ---------------------------
+      # DATASET RESOLUTION
+      # ---------------------------
+      - name: Resolve dataset
         id: resolve
         run: |
           set -e
           NEED_SYNTH=0
-          CAND=""
+          FILE=""
           if [ -n "${{ inputs.dataset }}" ] && [ -f "${{ inputs.dataset }}" ]; then
-            CAND="${{ inputs.dataset }}"
+            FILE="${{ inputs.dataset }}"
+          elif [ -f "outputs/edge_enriched.csv" ]; then
+            FILE="outputs/edge_enriched.csv"
+          elif [ -f "outputs/prob_enriched.csv" ]; then
+            FILE="outputs/prob_enriched.csv"
+          elif [ -f "data/raw/vigfree_matches.csv" ]; then
+            FILE="data/raw/vigfree_matches.csv"
+          else
+            NEED_SYNTH=1
           fi
-          if [ -z "$CAND" ] && [ -f "outputs/prob_enriched.csv" ]; then
-            CAND="outputs/prob_enriched.csv"
-          fi
-          if [ -z "$CAND" ] && [ -f "data/raw/vigfree_matches.csv" ]; then
-            CAND="data/raw/vigfree_matches.csv"
-          fi
-          if [ -z "$CAND" ]; then NEED_SYNTH=1; fi
-          echo "file=$CAND" >> "$GITHUB_OUTPUT"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "need_synth=$NEED_SYNTH" >> "$GITHUB_OUTPUT"
-          echo "Resolved file='$CAND' need_synth=$NEED_SYNTH"
+          echo "Resolved file=$FILE need_synth=$NEED_SYNTH"
 
-      # 2) Build minimal dataset if needed
-      - name: Build synthetic dataset from sample_odds
+      - name: Build synthetic dataset (if none found)
         if: steps.resolve.outputs.need_synth == '1'
         run: |
           set -e
@@ -100,43 +102,41 @@ jobs:
             --output outputs/prob_enriched.csv
           echo "Built outputs/prob_enriched.csv"
 
-      - name: Choose dataset for enrich/backtest
-        id: choose
-        run: |
-          set -e
-          FILE="${{ steps.resolve.outputs.file }}"
-          if [ -z "$FILE" ]; then FILE="outputs/prob_enriched.csv"; fi
-          test -f "$FILE" || { echo "Expected dataset '$FILE' not found"; exit 1; }
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-          echo "Using dataset: $FILE"
-
-      # 3) Enrich edges (FIXED arg name: --method)
+      # ---------------------------
+      # EDGESMITH ENRICHMENT
+      # ---------------------------
       - name: Enrich edges (EdgeSmith)
         run: |
           set -e
+          SRC="${{ steps.resolve.outputs.file }}"
+          if [ -z "$SRC" ]; then SRC="outputs/prob_enriched.csv"; fi
           python scripts/edge_smith_enrich.py \
-            --input  "${{ steps.choose.outputs.file }}" \
+            --input  "$SRC" \
             --output outputs/edge_enriched.csv \
             --min-edge "${{ inputs.min_edge }}" \
             --method "${{ inputs.vig_method }}"
-          echo "Enriched -> outputs/edge_enriched.csv"
+          echo "✅ EdgeSmith enriched -> outputs/edge_enriched.csv"
 
-      # 4) Matrix backtest
+      # ---------------------------
+      # MATRIX BACKTEST
+      # ---------------------------
       - name: Run matrix backtest
         run: |
           set -e
-          python scripts/matrix_backtest.py \
+          python scripts/run_matrix_backtest.py \
             --input outputs/edge_enriched.csv \
             --bands "${{ inputs.bands }}" \
             --staking "${{ inputs.staking }}" \
             --kelly-scale "${{ inputs.kelly_scale }}" \
+            --min-edge "${{ inputs.min_edge }}" \
             --bankroll "${{ inputs.bankroll }}" \
-            --logs-dir results/backtests/logs \
-            --summary-csv results/backtests/summary.csv
-          echo "Summary -> results/backtests/summary.csv"
+            --outdir results/backtests
+          echo "✅ Backtest -> results/backtests"
 
-      # 5) HTML report
-      - name: Summarize
+      # ---------------------------
+      # REPORT
+      # ---------------------------
+      - name: Generate HTML report
         run: |
           set -e
           python scripts/generate_report.py \
@@ -145,9 +145,11 @@ jobs:
             --summary results/backtests/summary.csv \
             --logs-dir results/backtests/logs \
             --out docs/backtests/index.html
-          echo "Report -> docs/backtests/index.html"
+          echo "✅ Report -> docs/backtests/index.html"
 
-      # 6) Artifacts
+      # ---------------------------
+      # ARTIFACTS
+      # ---------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -158,3 +160,4 @@ jobs:
             data/raw/vigfree_matches.csv
             results/backtests/**
             docs/backtests/index.html
+
