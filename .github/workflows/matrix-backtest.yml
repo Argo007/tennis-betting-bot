@@ -2,6 +2,31 @@ name: Matrix Backtest (Kelly + TE)
 
 on:
   workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Path to CSV (optional). If missing, we fall back to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv"
+        required: false
+        default: ""
+      bands:
+        description: "Edge bands like 2.0,2.6|2.6,3.2|3.2,4.0"
+        required: true
+        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+      staking:
+        description: "Staking method"
+        required: true
+        default: "kelly"
+      kelly_scale:
+        description: "Kelly scaler (0.5 = half-Kelly)"
+        required: true
+        default: "0.5"
+      bankroll:
+        description: "Starting bankroll (units)"
+        required: true
+        default: "1000"
+      min_edge:
+        description: "Minimum true edge to consider (e.g. 0.00 = none)"
+        required: true
+        default: "0.00"
 
 jobs:
   backtest:
@@ -10,26 +35,9 @@ jobs:
       run:
         shell: bash
 
-    env:
-      # ---- Tunables (safe, slightly loose so bets appear) ----
-      MIN_EDGE: "0.02"          # 2% min edge filter for the backtest
-      STAKING: "kelly"          # {kelly|flat}
-      KELLY_SCALE: "0.5"        # half-Kelly
-      BANKROLL: "1000"          # units
-      BANDS: "1.0,10.0"         # single wide band (inclusive low, exclusive high)
-      #
-      # ---- File layout (don’t change unless you move files) ----
-      OUTDIR: "results/backtests"
-      RAW_VIGFREE: "data/raw/vigfree_matches.csv"
-      RAW_SAMPLE: "data/raw/odds/sample_odds.csv"
-      OUT_PROB: "outputs/prob_enriched.csv"
-      OUT_EDGE: "outputs/edge_enriched.csv"
-
     steps:
-      - name: Checkout repo
+      - name: Post Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,154 +47,125 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      # --------------------------------------------------------------------
-      # 1) Build a guaranteed input (OUT_PROB) from any available source
-      #    - Prefer vigfree_matches.csv
-      #    - Else sample_odds.csv
-      #    - Adds pa/pb if missing (from odds)
-      # --------------------------------------------------------------------
       - name: Prepare dataset -> $OUT_PROB
+        env:
+          INPUT_CLI: "${{ inputs.dataset }}"
+          OUT_PROB: "outputs/prob_enriched.csv"
         run: |
           set -euo pipefail
 
-          mkdir -p outputs
+          # Pick first existing candidate
+          choose_dataset() {
+            for f in "$@"; do
+              if [[ -n "$f" && -f "$f" ]]; then
+                echo "$f"
+                return 0
+              fi
+            done
+            return 1
+          }
 
-          # choose best available raw
-          INPUT=""
-          if [ -f "$RAW_VIGFREE" ]; then
-            INPUT="$RAW_VIGFREE"
-          elif [ -f "$RAW_SAMPLE" ]; then
-            INPUT="$RAW_SAMPLE"
-          else
-            echo "ERROR: no input found ($RAW_VIGFREE nor $RAW_SAMPLE)."
+          DS="$(choose_dataset "$INPUT_CLI" "outputs/prob_enriched.csv" "data/raw/vigfree_matches.csv" "data/raw/odds/sample_odds.csv" || true)"
+          if [[ -z "${DS:-}" ]]; then
+            echo "ERROR: No usable dataset found (tried inputs.dataset, outputs/prob_enriched.csv, data/raw/vigfree_matches.csv, data/raw/odds/sample_odds.csv)"
             exit 1
           fi
 
-          echo "[dataset] Using: $INPUT"
+          echo "[dataset] Using: $DS"
+          mkdir -p "$(dirname "$OUT_PROB")"
+
+          # Export env for the inline Python
+          export INPUT="$DS"
+          export OUT_PROB="$OUT_PROB"
 
           python - <<'PY'
-          import csv, math, sys, pathlib
+          import os, sys
           from pathlib import Path
+          import pandas as pd
+          import numpy as np
 
-          raw_path = Path("${INPUT}")
-          out_path = Path("${OUT_PROB}")
+          inp = Path(os.environ["INPUT"])
+          outp = Path(os.environ["OUT_PROB"])
+          outp.parent.mkdir(parents=True, exist_ok=True)
 
-          # columns we might see
+          df = pd.read_csv(inp)
+
+          # Normalize columns -> date, player_a, player_b, oa, ob, pa, pb
           aliases = {
-              "oa": ["oa","odds_a","odds_a_vigfree","odds_a_vig_free","odds_a_"],
-              "ob": ["ob","odds_b","odds_b_vigfree","odds_b_vig_free","odds_b_"],
-              "pa": ["pa","prob_a","probA","p_a","implied_prob_a","implied_pa","prob_a_vigfree","prob_a_vig_free"],
-              "pb": ["pb","prob_b","probB","p_b","implied_prob_b","implied_pb","prob_b_vigfree","prob_b_vig_free"],
-              "date": ["date","event_date"],
-              "a": ["player_a","team_a","home"],
-              "b": ["player_b","team_b","away"],
+              "date":"date","event_date":"date","match_date":"date","ts":"date",
+              "player_a":"player_a","home":"player_a","a":"player_a",
+              "player_b":"player_b","away":"player_b","b":"player_b",
+              "oa":"oa","odds_a":"oa","odds1":"oa","odds_home":"oa","odds_A":"oa",
+              "ob":"ob","odds_b":"ob","odds2":"ob","odds_away":"ob","odds_B":"ob",
+              "pa":"pa","probA":"pa","prob_a":"pa","implied_prob_a":"pa","p_a":"pa","prob_a_vigfree":"pa",
+              "pb":"pb","probB":"pb","prob_b":"pb","implied_prob_b":"pb","p_b":"pb","prob_b_vigfree":"pb",
           }
+          rename = {}
+          for c in df.columns:
+              k = c.strip()
+              if k in aliases:
+                  rename[c] = aliases[k]
+          if rename:
+              df = df.rename(columns=rename)
 
-          def pick_col(row, keys):
-              for k in keys:
-                  if k in row and row[k] not in (None,""):
-                      return row[k]
-              return None
+          # Compute pa/pb if missing but oa/ob present (de-vig via simple normalization)
+          if not {"pa","pb"}.issubset(df.columns):
+              if {"oa","ob"}.issubset(df.columns):
+                  oa = pd.to_numeric(df["oa"], errors="coerce")
+                  ob = pd.to_numeric(df["ob"], errors="coerce")
+                  pinv = 1/oa + 1/ob
+                  df["pa"] = (1/oa) / pinv
+                  df["pb"] = (1/ob) / pinv
+              else:
+                  print("[prep] ERROR: need oa/ob to compute pa/pb", file=sys.stderr)
+                  sys.exit(2)
 
-          def inv_prob(odds):
-              try:
-                  o = float(odds)
-                  return 0.0 if o<=0 else 1.0/o
-              except:
-                  return None
-
-          with raw_path.open(newline="", encoding="utf-8") as f:
-              reader = csv.DictReader(f)
-              rows = list(reader)
-              if not rows:
-                  print("[prepare] No rows in input.", file=sys.stderr)
-                  sys.exit(1)
-
-              out_cols = ["date","player_a","player_b","oa","ob","pa","pb"]
-              out = []
-
-              for r in rows:
-                  date = pick_col(r, aliases["date"])
-                  a = pick_col(r, aliases["a"])
-                  b = pick_col(r, aliases["b"])
-                  oa = pick_col(r, aliases["oa"])
-                  ob = pick_col(r, aliases["ob"])
-                  pa = pick_col(r, aliases["pa"])
-                  pb = pick_col(r, aliases["pb"])
-
-                  # derive pa/pb from odds if missing
-                  if (pa is None or pb is None) and oa and ob:
-                      ia, ib = inv_prob(oa), inv_prob(ob)
-                      if ia is not None and ib is not None and (ia+ib) > 0:
-                          # normalize to remove vigorish
-                          s = ia + ib
-                          pa = str(ia/s)
-                          pb = str(ib/s)
-
-                  # must have at minimum oa, ob, pa, pb
-                  if not (oa and ob and pa and pb and a and b):
-                      continue
-
-                  out.append({
-                      "date": date or "",
-                      "player_a": a, "player_b": b,
-                      "oa": oa, "ob": ob,
-                      "pa": pa, "pb": pb
-                  })
-
-              if not out:
-                  print("[prepare] No usable rows after normalization.", file=sys.stderr)
-                  sys.exit(1)
-
-              out_path.parent.mkdir(parents=True, exist_ok=True)
-              with out_path.open("w", newline="", encoding="utf-8") as wf:
-                  w = csv.DictWriter(wf, fieldnames=out_cols)
-                  w.writeheader()
-                  w.writerows(out)
-
-              print(f"[prepare] Wrote {len(out)} rows -> {out_path}")
+          keep = [c for c in ["date","player_a","player_b","oa","ob","pa","pb"] if c in df.columns]
+          df = df[keep].copy()
+          df.to_csv(outp, index=False)
+          print(f"[prep] wrote {outp} rows={len(df)}")
           PY
 
-      # --------------------------------------------------------------------
-      # 2) Enrich with EdgeSmith (produces OUT_EDGE); do not filter here
-      # --------------------------------------------------------------------
       - name: Enrich edges (EdgeSmith)
+        env:
+          IN_PROB: "outputs/prob_enriched.csv"
+          OUT_EDGE: "outputs/edge_enriched.csv"
+          MIN_EDGE: "${{ inputs.min_edge }}"
         run: |
           set -euo pipefail
+          echo "[edges] input: $IN_PROB"
           python scripts/edge_smith_enrich.py \
-            --input  "${OUT_PROB}" \
-            --output "${OUT_EDGE}" \
-            --min-edge 0.0
+            --input "$IN_PROB" \
+            --output "$OUT_EDGE" \
+            --min-edge "$MIN_EDGE"
 
-          echo "[enrich] Wrote ${OUT_EDGE}"
-          head -n 3 "${OUT_EDGE}" || true
-
-      # --------------------------------------------------------------------
-      # 3) Backtest (now apply MIN_EDGE and tuned params)
-      # --------------------------------------------------------------------
       - name: Run matrix backtest
+        env:
+          DATASET: "outputs/edge_enriched.csv"
+          BANDS: "${{ inputs.bands }}"
+          STAKING: "${{ inputs.staking }}"
+          KELLY: "${{ inputs.kelly_scale }}"
+          BANKROLL: "${{ inputs.bankroll }}"
+          MIN_EDGE: "${{ inputs.min_edge }}"
         run: |
           set -euo pipefail
-          mkdir -p "${OUTDIR}"
-
           python scripts/run_matrix_backtest.py \
-            --dataset "${OUT_EDGE}" \
-            --min-edge "${MIN_EDGE}" \
-            --staking "${STAKING}" \
-            --kelly-scale "${KELLY_SCALE}" \
-            --bankroll "${BANKROLL}" \
-            --bands "${BANDS}"
+            --dataset "$DATASET" \
+            --min-edge "$MIN_EDGE" \
+            --staking "$STAKING" \
+            --kelly-scale "$KELLY" \
+            --bankroll "$BANKROLL" \
+            --bands "$BANDS"
 
-      # --------------------------------------------------------------------
-      # 4) Generate simple HTML summary (uses existing generate_report.py)
-      # --------------------------------------------------------------------
       - name: Generate HTML report
         run: |
           python scripts/generate_report.py \
-            --dataset "${OUT_EDGE}" \
-            --outdir "${OUTDIR}"
+            --prob-csv outputs/prob_enriched.csv \
+            --edge-csv outputs/edge_enriched.csv \
+            --summary-csv results/backtests/summary.csv \
+            --out docs/backtests/index.html || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -194,7 +173,7 @@ jobs:
           name: matrix-backtest-${{ github.run_id }}
           path: |
             outputs/*.csv
-            results/**
-            ${OUTDIR}/**
-          if-no-files-found: warn
+            results/backtests/**
+            docs/backtests/index.html
+
 
