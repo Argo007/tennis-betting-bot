@@ -3,33 +3,43 @@ name: Matrix Backtest (Kelly + TE)
 on:
   workflow_dispatch:
     inputs:
-      bands:
-        description: "Bands like 2.0,2.6|2.6,3.2|3.2,4.0"
+      dataset:
+        description: "CSV path to use (leave blank to auto-pick)"
         required: false
+        default: ""
+      bands:
+        description: "Edge bands e.g. 2.0,2.6|2.6,3.2|3.2,4.0"
+        required: true
         default: "2.0,2.6|2.6,3.2|3.2,4.0"
       staking:
-        description: "kelly or flat"
-        required: false
-        default: "kelly"
+        description: "Staking model"
+        required: true
+        type: choice
+        options: [kelly, flat]
+        default: kelly
       kelly_scale:
-        description: "Kelly scale (e.g., 0.5 = half Kelly)"
-        required: false
+        description: "Kelly scaler (0.5 = half Kelly)"
+        required: true
         default: "0.5"
       bankroll:
         description: "Starting bankroll (units)"
-        required: false
+        required: true
         default: "1000"
       min_edge:
-        description: "Minimum edge to consider (e.g., 0.005 = 0.5%)"
-        required: false
+        description: "Minimum true edge to include (e.g., 0.005)"
+        required: true
         default: "0.005"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-backtest-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Checkout repo
@@ -44,108 +54,124 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-            ${{ runner.os }}-pip-
+            pip-${{ runner.os }}-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # -------- Resolve dataset (prefer prob_enriched -> vigfree -> sample_odds)
+      # Decide which dataset to use, in priority order.
+      # 1) user input (if provided)
+      # 2) outputs/edge_enriched.csv
+      # 3) outputs/prob_enriched.csv
+      # 4) data/raw/vigfree_matches.csv
+      # 5) data/raw/odds/sample_odds.csv (synthetic demo)
       - name: Resolve dataset path
-        id: resolve
+        id: ds
+        shell: bash
         run: |
           set -euo pipefail
-          # candidates in priority order
-          CANDIDATES=("outputs/prob_enriched.csv" "data/raw/vigfree_matches.csv" "data/raw/odds/sample_odds.csv")
-          CHOSEN=""
-          for f in "${CANDIDATES[@]}"; do
-            if [[ -f "$f" ]]; then
-              CHOSEN="$f"
-              break
-            fi
+          pick_if_exists () { [ -n "${1:-}" ] && [ -f "$1" ] && echo "$1"; }
+
+          CANDIDATES=()
+
+          # From user input (if any)
+          if [ -n "${{ github.event.inputs.dataset }}" ]; then
+            CANDIDATES+=("${{ github.event.inputs.dataset }}")
+          fi
+
+          # Auto candidates
+          CANDIDATES+=(
+            "outputs/edge_enriched.csv"
+            "outputs/prob_enriched.csv"
+            "data/raw/vigfree_matches.csv"
+            "data/raw/odds/sample_odds.csv"
+          )
+
+          DATASET=""
+          for c in "${CANDIDATES[@]}"; do
+            if [ -f "$c" ]; then DATASET="$c"; break; fi
           done
-          if [[ -z "$CHOSEN" ]]; then
-            echo "ERROR: no usable dataset found." >&2
+
+          if [ -z "$DATASET" ]; then
+            echo "ERROR: No usable dataset found." >&2
             exit 1
           fi
-          echo "dataset=$CHOSEN" >> "$GITHUB_OUTPUT"
-          echo "Resolved dataset: $CHOSEN"
 
-      # -------- Normalize: ensure we have columns oa, ob, pa, pb
+          echo "dataset=$DATASET" >> "$GITHUB_OUTPUT"
+          echo "Resolved dataset: $DATASET"
+
+      # Ensure we have a file with columns: oa, ob, pa, pb.
+      # If the chosen dataset already has pa/pb -> copy to outputs/prob_enriched.csv
+      # Else if it has vigfree probs (prob_a_vigfree/prob_b_vigfree) -> rename to pa/pb
+      # Else if it only has oa/ob -> derive pa/pb from implied probs (no vig removal)
       - name: Normalize to prob_enriched.csv (adds pa/pb if missing)
         run: |
           set -euo pipefail
-
-          IN="${{ steps.resolve.outputs.dataset }}"
-          OUT="outputs/prob_enriched.csv"
-          mkdir -p outputs
-
           python - << 'PY'
-          import csv, sys, pandas as pd
-          from pathlib import Path
-
-          src = Path("${{ steps.resolve.outputs.dataset }}")
-          out = Path("outputs/prob_enriched.csv")
-
+          import pandas as pd, sys, os
+          src = r"""${{ steps.ds.outputs.dataset }}"""
           df = pd.read_csv(src)
 
-          # Map possible column names
-          def col(df, names):
-            for n in names:
-              if n in df.columns: return n
-            return None
+          def has(cols): return all(c in df.columns for c in cols)
 
-          oa = col(df, ["oa","odds_a","oddsA","odds_a_vigfree","odds_a_vgf"])
-          ob = col(df, ["ob","odds_b","oddsB","odds_b_vigfree","odds_b_vgf"])
-          pa = col(df, ["pa","prob_a","probA","implied_prob_a","prob_a_vigfree","pa_vigfree"])
-          pb = col(df, ["pb","prob_b","probB","implied_prob_b","prob_b_vigfree","pb_vigfree"])
+          # Ensure odds columns are named oa/ob
+          rename_map = {
+              'odds_a':'oa','odds_b':'ob','oa':'oa','ob':'ob'
+          }
+          df.rename(columns=rename_map, inplace=True)
 
-          # If odds columns missing, bail
-          if oa is None or ob is None:
-            raise SystemExit("Normalize: missing odds columns (oa/ob). Found columns: "+", ".join(df.columns))
+          # Case 1: already has pa/pb
+          if has(['pa','pb']):
+              out = 'outputs/prob_enriched.csv'
+              os.makedirs(os.path.dirname(out), exist_ok=True)
+              df.to_csv(out, index=False)
+              print(out)
+              sys.exit(0)
 
-          # If probabilities missing, compute fair from odds (normalize 1/oa,1/ob)
-          if pa is None or pb is None:
-            inv_oa = 1.0/df[oa].astype(float)
-            inv_ob = 1.0/df[ob].astype(float)
-            s = inv_oa + inv_ob
-            df["pa"] = inv_oa / s
-            df["pb"] = inv_ob / s
-          else:
-            df = df.rename(columns={pa:"pa", pb:"pb"})
+          # Case 2: vigfree prob columns present -> map to pa/pb
+          for ca in ['prob_a_vigfree','prob_a_vig_free','pa_vigfree','p_a']:
+              if ca in df.columns:
+                  df['pa'] = df[ca]; break
+          for cb in ['prob_b_vigfree','prob_b_vig_free','pb_vigfree','p_b']:
+              if cb in df.columns:
+                  df['pb'] = df[cb]; break
 
-          # Standardize odds as oa/ob
-          ren = {}
-          if oa != "oa": ren[oa] = "oa"
-          if ob != "ob": ren[ob] = "ob"
-          if ren: df = df.rename(columns=ren)
+          if 'pa' in df.columns and 'pb' in df.columns:
+              out = 'outputs/prob_enriched.csv'
+              os.makedirs(os.path.dirname(out), exist_ok=True)
+              df.to_csv(out, index=False)
+              print(out)
+              sys.exit(0)
 
-          # Keep input columns + standardized set
-          # Ensure required export cols present
-          for c in ["oa","ob","pa","pb"]:
-            if c not in df.columns:
-              raise SystemExit(f"Normalize: required column {c} not present at save time.")
+          # Case 3: derive pa/pb from odds if available (fair = 1/odds)
+          if has(['oa','ob']):
+              df['pa'] = 1.0/df['oa']
+              df['pb'] = 1.0/df['ob']
+              # Normalize to sum to 1 when both present
+              s = df[['pa','pb']].sum(axis=1)
+              df.loc[s>0, ['pa','pb']] = df.loc[s>0, ['pa','pb']].div(s[s>0], axis=0)
 
-          df.to_csv(out, index=False)
-          print(f"Normalized -> {out}")
+              out = 'outputs/prob_enriched.csv'
+              os.makedirs(os.path.dirname(out), exist_ok=True)
+              df.to_csv(out, index=False)
+              print(out)
+              sys.exit(0)
+
+          raise SystemExit("No way to obtain pa/pb from the selected dataset.")
           PY
 
-          echo "dataset=outputs/prob_enriched.csv" >> "$GITHUB_OUTPUT"
-
-      # -------- Enrich edges (EdgeSmith)
       - name: Enrich edges (EdgeSmith)
         run: |
           set -euo pipefail
           python scripts/edge_smith_enrich.py \
             --input outputs/prob_enriched.csv \
             --output outputs/edge_enriched.csv \
-            --min-edge "${{ github.event.inputs.min_edge }}" \
-            --method shin
+            --min-edge "${{ github.event.inputs.min_edge }}"
 
-      # -------- Run matrix backtest (expects --dataset)
       - name: Run matrix backtest
         run: |
           set -euo pipefail
@@ -155,29 +181,47 @@ jobs:
             --staking "${{ github.event.inputs.staking }}" \
             --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
             --bankroll "${{ github.event.inputs.bankroll }}" \
-            --bands "${{ github.event.inputs.bands }}" \
-            --outdir results/backtests
-          echo "Backtest complete."
+            --bands "${{ github.event.inputs.bands }}"
 
-      # -------- Generate HTML report
-      - name: Generate HTML report
+          # Collect outputs in a single folder for upload
+          mkdir -p results/backtests
+          for p in \
+            backtests/summary.csv \
+            backtests/params_cfg1.json \
+            backtests/logs/picks_cfg1.csv \
+            backtests/_diagnostics.json \
+            outputs/prob_enriched.csv \
+            outputs/edge_enriched.csv
+          do
+            [ -f "$p" ] && cp --parents "$p" results/backtests/ 2>/dev/null || true
+          done
+          if [ -d backtests/logs ]; then
+            mkdir -p results/backtests/logs
+            cp -r backtests/logs/* results/backtests/logs/ || true
+          fi
+
+      - name: Generate HTML report (if available)
         run: |
           set -euo pipefail
-          mkdir -p docs/backtests
-          python scripts/generate_report.py \
-            --summary results/backtests/summary.csv \
-            --params results/backtests/params_cfg1.json \
-            --picks results/backtests/logs/picks_cfg1.csv \
-            --dataset outputs/prob_enriched.csv \
-            --out docs/backtests/index.html
-          echo "Report written to docs/backtests/index.html"
+          if [ -f scripts/generate_report.py ]; then
+            python scripts/generate_report.py \
+              --summary backtests/summary.csv \
+              --params backtests/params_cfg1.json \
+              --dataset outputs/prob_enriched.csv \
+              --out docs/backtests/index.html || true
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
           path: |
-            outputs/edge_enriched.csv
-            outputs/prob_enriched.csv
             results/backtests/**
+            backtests/summary.csv
+            backtests/params_cfg1.json
+            backtests/logs/**
+            outputs/prob_enriched.csv
+            outputs/edge_enriched.csv
             docs/backtests/index.html
+          if-no-files-found: warn
+
