@@ -1,337 +1,257 @@
 #!/usr/bin/env python3
-"""
-All-in-one backtest for the tennis bot.
-
-What it does (end-to-end):
-1) Picks a dataset (user path or fallbacks)
-2) Normalizes columns → computes pa/pb if only odds present
-3) Computes EV/edge, selects side (A/B), filters by edge/odds bands
-4) Runs matrix backtest (Kelly or flat). Two settle modes:
-   - Expected Value ("ev") — deterministic & fast (default)
-   - Monte-Carlo  ("sim") — random settle across N trials (optional)
-5) Writes:
-   - outputs/prob_enriched.csv
-   - outputs/edge_enriched.csv
-   - results/backtests/summary.csv
-   - results/backtests/params_cfg1.json
-   - results/backtests/logs/picks_cfg1.csv (best band)
-   - results/backtests/_diagnostics.json
-   - docs/backtests/index.html  ← Open this
-
-Usage (all args optional):
-  python scripts/all_in_one_backtest.py \
-    --dataset results/tennis_data.csv \
-    --bands "1.2,2.0|2.0,3.2|3.2,4.0" \
-    --staking kelly \
-    --kelly-scale 0.5 \
-    --bankroll 1000 \
-    --min-edge 0.00 \
-    --settle ev \
-    --n-sims 1000
-"""
-import argparse, json, math, os, random, statistics, sys
+import argparse, json, math, os
 from pathlib import Path
-from typing import List, Tuple, Optional
-
 import pandas as pd
 
-# ------- paths -------
+# ---------- constants / paths ----------
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "outputs"
-RES = ROOT / "results" / "backtests"
-DOC = ROOT / "docs" / "backtests"
-for p in (OUT, RES, DOC, RES / "logs"):
-    p.mkdir(parents=True, exist_ok=True)
+OUT_DIR = ROOT / "outputs"
+RES_DIR = ROOT / "results" / "backtests"
+LOG_DIR = RES_DIR / "logs"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+RES_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 FALLBACKS = [
-    OUT / "prob_enriched.csv",
+    OUT_DIR / "prob_enriched.csv",
     ROOT / "data" / "raw" / "vigfree_matches.csv",
     ROOT / "data" / "raw" / "odds" / "sample_odds.csv",
 ]
 
-# ------- helpers -------
-def parse_bands(spec: str, df_odds: Optional[pd.Series]=None) -> List[Tuple[float, float]]:
-    """
-    Accepts explicit spec "1.2,2.0|2.0,3.2|3.2,4.0".
-    If empty, auto-build 3 quantile bands from pick_odds distribution (if provided),
-    else default single wide band.
-    """
-    if spec:
-        bands = []
-        for part in spec.split("|"):
-            lo, hi = [float(x.strip()) for x in part.split(",")]
-            bands.append((lo, hi))
-        return bands
+HTML_REPORT = RES_DIR / "index.html"        # still produced, but optional to open
+SUMMARY_CSV = RES_DIR / "summary.csv"
+SUMMARY_MD  = RES_DIR / "summary.md"        # <- NEW: job-summary friendly
+PARAMS_JSON = RES_DIR / "params_cfg1.json"
+PICKS_CSV   = LOG_DIR / "picks_cfg1.csv"
+PROB_ENRICHED = OUT_DIR / "prob_enriched.csv"
+EDGE_ENRICHED = OUT_DIR / "edge_enriched.csv"
 
-    if df_odds is not None and len(df_odds) >= 10:
-        qs = df_odds.quantile([0.0, 1/3, 2/3, 1.0]).tolist()
-        return [(qs[0], qs[1]), (qs[1], qs[2]), (qs[2], qs[3])]
-    return [(1.0, 10.0)]
-
-def choose_existing(path_str: Optional[str]) -> Path:
-    if path_str:
-        p = (ROOT / path_str).resolve() if not path_str.startswith("/") else Path(path_str)
-        if p.exists():
-            print(f"[dataset] Using: {p}")
-            return p
-        print(f"[dataset] WARN: {p} not found, falling back.")
-    for fb in FALLBACKS:
-        if fb.exists():
-            print(f"[dataset] Using: {fb}")
-            return fb
-    raise FileNotFoundError("No usable dataset found (user path + fallbacks all missing).")
-
-def first_of(df: pd.DataFrame, names: List[str]) -> Optional[str]:
-    for n in names:
-        if n in df.columns:
-            return n
+# ---------- helpers ----------
+def alias(df, want, aliases):
+    for a in aliases:
+        if a in df.columns:
+            return a
+    if want in df.columns:
+        return want
     return None
 
-def ensure_prob_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure pa/pb (probabilities) and oa/ob (decimal odds).
-    If pa/pb missing but oa/ob present → compute vig-free pa/pb.
-    If only pa present → pb = 1-pa (and vice-versa).
-    """
+def ensure_probs_and_odds(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee columns: date?, player_a, player_b, oa, ob, pa, pb."""
     df = df.copy()
 
-    oa_col = first_of(df, ["oa","odds_a","oddsA","odds_a_close","odds_a_open","odds_a"])
-    ob_col = first_of(df, ["ob","odds_b","oddsB","odds_b_close","odds_b_open","odds_b"])
-    pa_col = first_of(df, ["pa","prob_a","probA","implied_prob_a","prob_a_vigfree","p_a"])
-    pb_col = first_of(df, ["pb","prob_b","probB","implied_prob_b","prob_b_vigfree","p_b"])
+    pa_col = alias(df, "pa", ["pa","prob_a","probA","p_a","implied_prob_a","prob_a_vigfree","pA"])
+    pb_col = alias(df, "pb", ["pb","prob_b","probB","p_b","implied_prob_b","prob_b_vigfree","pB"])
+    oa_col = alias(df, "oa", ["oa","odds_a","oddsA","a_odds"])
+    ob_col = alias(df, "ob", ["ob","odds_b","oddsB","b_odds"])
 
-    if oa_col: df["oa"] = pd.to_numeric(df[oa_col], errors="coerce")
-    if ob_col: df["ob"] = pd.to_numeric(df[ob_col], errors="coerce")
+    if pa_col and pb_col and (oa_col is None or ob_col is None):
+        df["oa"] = 1.0 / df[pa_col].astype(float)
+        df["ob"] = 1.0 / df[pb_col].astype(float)
+        oa_col, ob_col = "oa","ob"
 
-    if pa_col: df["pa"] = pd.to_numeric(df[pa_col], errors="coerce")
-    if pb_col: df["pb"] = pd.to_numeric(df[pb_col], errors="coerce")
+    if oa_col and ob_col and (pa_col is None or pb_col is None):
+        ia = 1.0/df[oa_col].astype(float)
+        ib = 1.0/df[ob_col].astype(float)
+        s = ia + ib
+        df["pa"] = (ia/s).astype(float)
+        df["pb"] = (ib/s).astype(float)
+        pa_col, pb_col = "pa","pb"
 
-    if "pa" not in df or df["pa"].isna().all():
-        if "pb" in df and df["pb"].notna().any():
-            df["pa"] = 1.0 - df["pb"]
-    if "pb" not in df or df["pb"].isna().all():
-        if "pa" in df and df["pa"].notna().any():
-            df["pb"] = 1.0 - df["pa"]
+    if oa_col != "oa" and oa_col is not None:
+        df["oa"] = df[oa_col].astype(float)
+    if ob_col != "ob" and ob_col is not None:
+        df["ob"] = df[ob_col].astype(float)
+    if pa_col != "pa" and pa_col is not None:
+        df["pa"] = df[pa_col].astype(float)
+    if pb_col != "pb" and pb_col is not None:
+        df["pb"] = df[pb_col].astype(float)
 
-    # If both still missing but odds exist → compute vig-free from odds.
-    need_probs = ("pa" not in df) or ("pb" not in df) or df["pa"].isna().all() or df["pb"].isna().all()
-    have_odds  = ("oa" in df and df["oa"].notna().any()) and ("ob" in df and df["ob"].notna().any())
-    if need_probs and have_odds:
-        inv_a = 1.0 / df["oa"]
-        inv_b = 1.0 / df["ob"]
-        s = inv_a + inv_b
-        df["pa"] = (inv_a / s).clip(0,1)
-        df["pb"] = (inv_b / s).clip(0,1)
+    a_name = alias(df, "player_a", ["player_a","home","a","team_a"])
+    b_name = alias(df, "player_b", ["player_b","away","b","team_b"])
+    date_col = alias(df, "date", ["date","event_date","match_date"])
 
-    # Final guard
-    if ("pa" not in df) or ("pb" not in df) or df["pa"].isna().all() or df["pb"].isna().all():
-        raise ValueError("Need pa/pb OR odds oa/ob to compute probabilities.")
+    if a_name and a_name != "player_a": df["player_a"] = df[a_name]
+    if b_name and b_name != "player_b": df["player_b"] = df[b_name]
+    if date_col and date_col != "date": df["date"] = df[date_col]
 
-    # Keep common context columns if present
-    keep_head = [c for c in ["date","event_date","tournament","player_a","player_b"] if c in df.columns]
-    tidy = df[keep_head + ["oa","ob","pa","pb"]].copy()
-    return tidy
+    need = {"oa","ob","pa","pb"}
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise ValueError(f"Dataset still missing {missing}. Provide odds or probabilities for both sides.")
 
-def enrich_edges(df: pd.DataFrame) -> pd.DataFrame:
+    keep = [c for c in ["date","player_a","player_b","oa","ob","pa","pb"] if c in df.columns]
+    return df[keep].reset_index(drop=True)
+
+def enrich_edges(df: pd.DataFrame, min_edge: float) -> pd.DataFrame:
     df = df.copy()
-    df["ev_a"] = df["pa"] * df["oa"] - 1.0
-    df["ev_b"] = df["pb"] * df["ob"] - 1.0
-    df["pick"] = (df["ev_a"] >= df["ev_b"]).map({True:"A", False:"B"})
-    df["pick_prob"] = df["pa"].where(df["pick"]=="A", df["pb"])
-    df["pick_odds"] = df["oa"].where(df["pick"]=="A", df["ob"])
-    df["true_edge"] = df["ev_a"].where(df["pick"]=="A", df["ev_b"])
-    return df
+    df["ev_a"] = df["pa"]*df["oa"] - 1.0
+    df["ev_b"] = df["pb"]*df["ob"] - 1.0
+    df["pick"] = df.apply(lambda r: "A" if r["ev_a"] >= r["ev_b"] else "B", axis=1)
+    df["pick_prob"] = df.apply(lambda r: r["pa"] if r["pick"]=="A" else r["pb"], axis=1)
+    df["pick_odds"] = df.apply(lambda r: r["oa"] if r["pick"]=="A" else r["ob"], axis=1)
+    df["true_edge"] = df["pick_prob"]*df["pick_odds"] - 1.0
+    return df[df["true_edge"] >= float(min_edge)].reset_index(drop=True)
 
-def kelly_fraction(p: float, odds: float, scale: float) -> float:
-    b = max(0.0, odds - 1.0)
-    f = (p*(b+1) - 1)/b if b > 0 else 0.0
-    return max(0.0, f) * scale
+def kelly_fraction(p, o, kscale):
+    b = o - 1.0
+    edge = p*o - 1.0
+    f = edge / b if b > 0 else 0.0
+    return max(0.0, kscale * f)
 
-def settle_expected(p: float, stake: float, odds: float) -> float:
-    return p*stake*(odds-1.0) - (1.0-p)*stake
+def run_backtest(df_edges: pd.DataFrame, staking: str, kelly_scale: float, bankroll: float) -> dict:
+    bank = float(bankroll)
+    n_bets = 0
+    results = df_edges["result"].astype(float) if "result" in df_edges.columns else None
 
-def settle_simulated(p: float, stake: float, odds: float, rng: random.Random) -> float:
-    win = rng.random() < p
-    return stake*(odds-1.0) if win else -stake
+    stakes = []
+    for i, row in df_edges.iterrows():
+        p = float(row["pick_prob"]); o = float(row["pick_odds"])
+        f = kelly_fraction(p, o, kelly_scale) if staking=="kelly" else 0.01
+        stake = bank * f
+        stakes.append(stake)
+        if results is not None and not math.isnan(results.iloc[i]):
+            n_bets += 1
+            bank = bank + stake*(o-1.0) if results.iloc[i] > 0.5 else bank - stake
 
-def run_matrix(
-    df: pd.DataFrame,
-    bands: List[Tuple[float, float]],
-    bankroll: float,
-    staking: str,
-    kelly_scale: float,
-    min_edge: float,
-    settle: str,
-    n_sims: int,
-    seed: int = 7,
-):
-    rows = []
-    rng = random.Random(seed)
+    total_staked = sum(stakes)
+    pnl = bank - bankroll
+    roi = (pnl / total_staked) if total_staked > 0 else 0.0
+    return {
+        "cfg_id": 1,
+        "n_bets": n_bets,
+        "total_staked": round(total_staked, 4),
+        "pnl": round(pnl, 4),
+        "roi": round(roi, 4),
+        "hitrate": 0.0,
+        "sharpe": 0.0,
+        "end_bankroll": round(bank, 4),
+    }
 
-    for i,(lo,hi) in enumerate(bands, start=1):
-        subset = df[(df["true_edge"] >= min_edge) & (df["pick_odds"].between(lo, hi, inclusive="left"))].copy()
-        if subset.empty:
-            rows.append({"cfg_id": i, "n_bets": 0, "total_staked": 0.0, "pnl": 0.0,
-                         "roi": 0.0, "hitrate": 0.0, "sharpe": 0.0, "end_bankroll": bankroll})
-            continue
+def write_html(params, summary_row, src_path, sample_df):
+    HTML_REPORT.write_text(f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Tennis Bot — Backtest Report</title>
+<style>
+ body {{ font-family: -apple-system, Segoe UI, Roboto, Arial; margin:20px; }}
+ table {{ border-collapse: collapse; }}
+ th, td {{ border:1px solid #ccc; padding:6px 10px; text-align:right; }}
+ th:first-child, td:first-child {{ text-align:left; }}
+ code {{ background:#f6f8fa; padding:2px 4px; }}
+</style></head><body>
+<h1>Tennis Bot — Backtest Report</h1>
+<h3>Recommended Config (cfg 1)</h3>
+<pre>{json.dumps(summary_row | {k:v for k,v in params.items()}, indent=2)}</pre>
+<p><b>Params:</b> <code>{PARAMS_JSON.as_posix()}</code><br>
+<b>Picks:</b> <code>{PICKS_CSV.as_posix()}</code></p>
+<h3>Top Backtest Results</h3>
+{pd.DataFrame([summary_row]).to_html(index=False)}
+<h3>Diagnostics</h3>
+<pre>{json.dumps({{
+  "source": Path(src_path).as_posix(),
+  "total_rows": int(len(sample_df)),
+  "usable_rows": int(len(sample_df)),
+  "skipped_missing": 0,
+  "notes": []
+}}, indent=2)}</pre>
+<h4>Normalized Input Preview (first 20)</h4>
+{sample_df.head(20).to_html(index=False)}
+</body></html>""")
 
-        if staking == "kelly":
-            frac = kelly_fraction
-        else:
-            def frac(p, odds, scale):  # flat 1%
-                return 0.01
+def write_markdown(params, summary_row, src_path, df_norm, df_edges):
+    """Job-summary friendly markdown (also printed to stdout)."""
+    # save CSVs for downstream use
+    pd.DataFrame([summary_row]).to_csv(SUMMARY_CSV, index=False)
+    PARAMS_JSON.write_text(json.dumps(params, indent=2))
 
-        # Expected-value path (fast & deterministic)
-        if settle == "ev":
-            bk = bankroll
-            total_staked = pnl = 0.0
-            for _,r in subset.iterrows():
-                f = frac(float(r["pick_prob"]), float(r["pick_odds"]), kelly_scale)
-                stake = max(0.0, f) * bk
-                if stake == 0: continue
-                total_staked += stake
-                gain = settle_expected(float(r["pick_prob"]), stake, float(r["pick_odds"]))
-                pnl += gain
-                bk  += gain
+    top_picks = df_edges.sort_values("true_edge", ascending=False).head(10)
+    # lightweight markdown (no extra deps)
+    def md_table(df: pd.DataFrame, max_rows=10):
+        df = df.head(max_rows).copy()
+        cols = list(df.columns)
+        lines = ["|" + "|".join(cols) + "|",
+                 "|" + "|".join(["---"]*len(cols)) + "|"]
+        for _, r in df.iterrows():
+            lines.append("|" + "|".join(str(r[c]) for c in cols) + "|")
+        return "\n".join(lines)
 
-            roi = (pnl/total_staked) if total_staked>0 else 0.0
-            best_picks = subset.assign(stake=0.0, expected_pnl=0.0)
-            rows.append({"cfg_id": i, "n_bets": len(subset), "total_staked": round(total_staked,4),
-                         "pnl": round(pnl,4), "roi": round(roi,4), "hitrate": 0.0,
-                         "sharpe": 0.0, "end_bankroll": round(bk,4)})
+    md = []
+    md.append("# Tennis Bot — Backtest Summary\n")
+    md.append("## Config")
+    md.append("```json\n" + json.dumps(params, indent=2) + "\n```")
+    md.append("## Results")
+    md.append(md_table(pd.DataFrame([summary_row])))
+    md.append("\n## Diagnostics")
+    md.append("```json\n" + json.dumps({
+        "source": Path(src_path).as_posix(),
+        "total_rows": int(len(df_norm)),
+        "usable_rows": int(len(df_norm)),
+        "skipped_missing": 0,
+        "notes": []
+    }, indent=2) + "\n```")
+    md.append("## Top picks (by true_edge)")
+    show_cols = [c for c in ["date","player_a","player_b","pick","pick_prob","pick_odds","true_edge"] if c in top_picks.columns]
+    md.append(md_table(top_picks[show_cols]))
+    md.append("\n## Files")
+    md.append(f"- Summary CSV: `{SUMMARY_CSV.as_posix()}`")
+    md.append(f"- Picks CSV: `{PICKS_CSV.as_posix()}`")
+    md.append(f"- Prob file: `{PROB_ENRICHED.as_posix()}`")
+    md.append(f"- Edge file: `{EDGE_ENRICHED.as_posix()}`")
+    content = "\n\n".join(md)
 
-        else:
-            # Monte-Carlo: take median end_bankroll & pnl across n_sims
-            end_bks, pnls = [], []
-            for _ in range(n_sims):
-                bk = bankroll
-                total_staked = pnl_one = 0.0
-                for _,r in subset.iterrows():
-                    f = frac(float(r["pick_prob"]), float(r["pick_odds"]), kelly_scale)
-                    stake = max(0.0, f) * bk
-                    if stake == 0: continue
-                    total_staked += stake
-                    gain = settle_simulated(float(r["pick_prob"]), stake, float(r["pick_odds"]), rng)
-                    pnl_one += gain
-                    bk      += gain
-                end_bks.append(bk); pnls.append(pnl_one)
-            med_bk = statistics.median(end_bks); med_pnl = statistics.median(pnls)
-            roi = (med_pnl/total_staked) if total_staked>0 else 0.0
-            rows.append({"cfg_id": i, "n_bets": len(subset), "total_staked": round(total_staked,4),
-                         "pnl": round(med_pnl,4), "roi": round(roi,4), "hitrate": 0.0,
-                         "sharpe": 0.0, "end_bankroll": round(med_bk,4)})
+    SUMMARY_MD.write_text(content)
+    # Also print to STDOUT so you see it in logs
+    print("\n" + content + "\n")
 
-    summary = pd.DataFrame(rows)
-    best = summary.sort_values(["end_bankroll","roi"], ascending=[False,False]).iloc[0].to_dict()
-    return summary, best
-
-def write_html(src: Path, norm: pd.DataFrame, summary: pd.DataFrame, best_cfg: dict):
-    html = []
-    html += [
-        "<html><head><meta charset='utf-8'><title>Tennis Bot — Backtest Report</title>",
-        "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}"
-        "table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px}"
-        "pre{background:#f6f8fa;padding:10px;border-radius:6px}</style></head><body>",
-        "<h1>Tennis Bot — Backtest Report</h1>",
-        "<h3>Recommended Config (cfg 1)</h3>",
-        "<pre>" + json.dumps({
-            "cfg_id": 1,
-            "n_bets": int(best_cfg.get("n_bets",0)),
-            "total_staked": f"{best_cfg.get('total_staked',0.0):.4f}",
-            "pnl": f"{best_cfg.get('pnl',0.0):.4f}",
-            "roi": f"{best_cfg.get('roi',0.0):.4f}",
-            "hitrate": f"{best_cfg.get('hitrate',0.0):.4f}",
-            "sharpe": f"{best_cfg.get('sharpe',0.0):.4f}",
-            "end_bankroll": f"{best_cfg.get('end_bankroll',0.0):.4f}",
-        }, indent=2) + "</pre>",
-        "<p><b>Params:</b> results/backtests/params_cfg1.json<br>"
-        "<b>Picks:</b> results/backtests/logs/picks_cfg1.csv</p>",
-        "<h3>Top Backtest Results</h3>",
-        summary.to_html(index=False),
-        "<h3>Diagnostics</h3>",
-        "<pre>"+json.dumps({
-            "source": str(src),
-            "total_rows": int(norm.shape[0]),
-            "usable_rows": int(norm.shape[0]),
-            "skipped_missing": 0,
-            "notes": []
-        }, indent=2)+"</pre>",
-        "<h3>Normalized Input Preview (first 20)</h3>",
-        norm.head(20).to_html(index=False),
-        "</body></html>"
-    ]
-    (DOC / "index.html").write_text("\n".join(html), encoding="utf-8")
+    # If running in GitHub Actions, also append to the Job Summary
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        with open(step_summary, "a", encoding="utf-8") as f:
+            f.write(content + "\n")
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="", help="CSV path (optional). Falls back automatically.")
-    ap.add_argument("--bands", default="", help='Odds bands "lo,hi|lo,hi|..." (auto if empty)')
+    ap = argparse.ArgumentParser(description="All-in-one local backtest runner")
+    ap.add_argument("--dataset", default="", help="Path to CSV (optional). Falls back to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv")
+    ap.add_argument("--min-edge", type=float, default=0.00, help="Minimum true edge to keep")
     ap.add_argument("--staking", choices=["kelly","flat"], default="kelly")
-    ap.add_argument("--kelly-scale", type=float, default=0.5)
-    ap.add_argument("--bankroll", type=float, default=1000)
-    ap.add_argument("--min-edge", type=float, default=0.00)
-    ap.add_argument("--settle", choices=["ev","sim"], default="ev")
-    ap.add_argument("--n-sims", type=int, default=1000)
+    ap.add_argument("--kelly-scale", type=float, default=0.5, help="0.5 = half Kelly")
+    ap.add_argument("--bankroll", type=float, default=1000.0)
     args = ap.parse_args()
 
-    src = choose_existing(args.dataset)
-    raw = pd.read_csv(src)
-    # friendly renames if present
-    raw = raw.rename(columns={
-        "event_date":"date",
-        "odds_a":"oa", "oddsA":"oa",
-        "odds_b":"ob", "oddsB":"ob",
-    })
+    # 1) Choose dataset
+    candidates = [Path(args.dataset)] if args.dataset else []
+    candidates += FALLBACKS
+    src = next((c for c in candidates if c and c.exists()), None)
+    if src is None:
+        raise FileNotFoundError(f"No usable dataset found. Tried: {', '.join(p.as_posix() for p in candidates)}")
 
-    norm = ensure_prob_cols(raw)
-    # Persist prob/edge CSVs
-    prob_csv = OUT / "prob_enriched.csv"
-    norm.to_csv(prob_csv, index=False)
+    # 2) Normalize
+    df_raw = pd.read_csv(src)
+    df_norm = ensure_probs_and_odds(df_raw)
+    df_norm.to_csv(PROB_ENRICHED, index=False)
 
-    edged = enrich_edges(norm)
-    edge_csv = OUT / "edge_enriched.csv"
-    edged.to_csv(edge_csv, index=False)
+    # 3) Enrich edges + write picks
+    df_edges = enrich_edges(df_norm, args.min_edge)
+    df_edges.to_csv(EDGE_ENRICHED, index=False)
+    picks = (df_edges[["date","player_a","player_b","pick","pick_odds","pick_prob","true_edge"]]
+             if "date" in df_edges.columns else
+             df_edges[["player_a","player_b","pick","pick_odds","pick_prob","true_edge"]])
+    picks.to_csv(PICKS_CSV, index=False)
 
-    # Build bands (auto if none provided)
-    bands = parse_bands(args.bands, edged["pick_odds"])
+    # 4) Backtest
+    summary = run_backtest(df_edges, args.staking, args.kelly_scale, args.bankroll)
 
-    # Run matrix
-    summary, best = run_matrix(
-        edged, bands, args.bankroll, args.staking, args.kelly_scale,
-        args.min_edge, args.settle, args.n_sims
-    )
-    summary.to_csv(RES / "summary.csv", index=False)
-    # Write picks for best cfg only (cfg 1 = best after sort)
-    best_lo, best_hi = bands[0] if bands else (1.0, 10.0)
-    best_mask = (edged["true_edge"] >= args.min_edge) & (edged["pick_odds"].between(best_lo, best_hi, inclusive="left"))
-    edged.loc[best_mask, ["pick","pick_prob","pick_odds","true_edge"]].to_csv(RES/"logs"/"picks_cfg1.csv", index=False)
-
-    # Params + diagnostics
-    (RES / "params_cfg1.json").write_text(json.dumps({
-        "bands": bands if bands else "auto",
+    # 5) Params + reports
+    params = {
+        "cfg_id": 1,
         "staking": args.staking,
         "kelly_scale": args.kelly_scale,
-        "bankroll": args.bankroll,
         "min_edge": args.min_edge,
-        "settle": args.settle,
-        "n_sims": args.n_sims
-    }, indent=2))
-    (RES / "_diagnostics.json").write_text(json.dumps({
-        "source": str(src),
-        "columns": list(raw.columns),
-        "rows_in": int(raw.shape[0]),
-        "rows_used": int(norm.shape[0]),
-    }, indent=2))
+        "bankroll": args.bankroll,
+        "dataset": Path(src).as_posix()
+    }
 
-    # HTML
-    write_html(src, norm, summary, best)
-
-    print("\n=== DONE ===")
-    print(f"Open report  : {DOC/'index.html'}")
-    print(f"Summary CSV  : {RES/'summary.csv'}")
-    print(f"Picks (best) : {RES/'logs'/'picks_cfg1.csv'}")
-    print(f"Prob CSV     : {prob_csv}")
-    print(f"Edge CSV     : {edge_csv}")
+    # HTML for local viewing (kept), plus Markdown for console/Actions
+    write_html(params, summary, src, df_norm)
+    write_markdown(params, summary, src, df_norm, df_edges)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
