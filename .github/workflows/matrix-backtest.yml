@@ -4,19 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "Path to CSV with odds + model p (optional). If empty we try results/tennis_data.csv, then outputs/prob_enriched.csv, then data/raw/odds/sample_odds.csv."
+        description: "Path to CSV (optional). Defaults to outputs/edge_enriched.csv → outputs/prob_enriched.csv → data/raw/vigfree_matches.csv → data/raw/odds/sample_odds.csv"
         required: false
         default: ""
       bands:
-        description: "Edge bands e.g. 1.2,2.0|2.0,3.2|3.2,4.0"
+        description: "Edge bands like 1.0,2.0|2.0,3.0|3.0,5.0"
         required: true
-        default: "1.2,2.0|2.0,3.2|3.2,4.0"
+        default: "1.0,2.0|2.0,3.0|3.0,5.0"
       staking:
         description: "Staking method"
-        required: true
+        type: choice
+        options: ["kelly","flat"]
         default: "kelly"
       kelly_scale:
-        description: "Kelly scaler (0.5 = half Kelly)"
+        description: "Kelly scaler (0.5 = half-Kelly)"
         required: true
         default: "0.5"
       bankroll:
@@ -24,7 +25,7 @@ on:
         required: true
         default: "1000"
       min_edge:
-        description: "Minimum true edge to consider (0.00 = none)"
+        description: "Minimum true edge to consider (e.g. 0.00 = none)"
         required: true
         default: "0.00"
 
@@ -34,7 +35,6 @@ jobs:
     defaults:
       run:
         shell: bash
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -47,57 +47,81 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas jinja2
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Resolve dataset path
         id: resolve
         run: |
           set -euo pipefail
-          CAND="${{ inputs.dataset }}"
-          if [[ -z "${CAND}" ]]; then
-            for p in results/tennis_data.csv outputs/prob_enriched.csv data/raw/odds/sample_odds.csv; do
-              if [[ -f "$p" ]]; then CAND="$p"; break; fi
-            done
-          fi
-          if [[ -z "${CAND}" ]]; then
-            echo "[resolve] ERROR: no usable dataset file." >&2
-            exit 2
-          fi
-          echo "[resolve] Using: $CAND"
-          echo "path=$CAND" >> "$GITHUB_OUTPUT"
+          # Order of preference (most informative first):
+          CANDIDATES=()
+          if [ -n "${{ inputs.dataset }}" ]; then CANDIDATES+=("${{ inputs.dataset }}"); fi
+          CANDIDATES+=("outputs/edge_enriched.csv" "outputs/prob_enriched.csv" "data/raw/vigfree_matches.csv" "data/raw/odds/sample_odds.csv")
 
-      - name: Prepare -> outputs/prob_enriched.csv (use model p if present)
+          PICK=""
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then PICK="$f"; break; fi
+          done
+
+          if [ -z "$PICK" ]; then
+            echo "ERROR: No usable dataset found (tried: ${CANDIDATES[*]})" >&2
+            exit 1
+          fi
+
+          echo "dataset=$PICK" >> "$GITHUB_OUTPUT"
+          echo "[dataset] Using: $PICK"
+
+      - name: Ensure pa/pb exist (compute if necessary)
         run: |
           set -euo pipefail
-          python scripts/prepare_backtest_input.py \
-            --input  "${{ steps.resolve.outputs.path }}" \
-            --output outputs/prob_enriched.csv
+          IN="${{ steps.resolve.outputs.dataset }}"
+          # If pa/pb missing but oa/ob exist, compute implied probs.
+          python - << 'PY'
+          import pandas as pd, sys
+          from pathlib import Path
+          p = Path("${{ steps.resolve.outputs.dataset }}")
+          df = pd.read_csv(p)
+          cols = {c.lower(): c for c in df.columns}
 
-      - name: Enrich edges (EdgeSmith)
-        run: |
-          set -euo pipefail
-          python scripts/edge_smith_enrich.py \
-            --input outputs/prob_enriched.csv \
-            --output outputs/edge_enriched.csv \
-            --min-edge "${{ inputs.min_edge }}"
+          have_pa = 'pa' in cols or 'prob_a' in cols or 'probA' in cols
+          have_pb = 'pb' in cols or 'prob_b' in cols or 'probB' in cols
+
+          if not (have_pa and have_pb):
+              # look for decimal odds columns
+              oa = cols.get('oa') or cols.get('odds_a') or cols.get('oddsA')
+              ob = cols.get('ob') or cols.get('odds_b') or cols.get('oddsB')
+              if not (oa and ob):
+                  print("[prep] pa/pb absent and no odds columns to derive from; skipping.", file=sys.stderr)
+              else:
+                  df['pa'] = 1.0 / df[oa].astype(float)
+                  df['pb'] = 1.0 / df[ob].astype(float)
+                  out = p.parent / p.name  # in-place overwrite
+                  df.to_csv(out, index=False)
+                  print("[prep] Added pa/pb from oa/ob and saved:", out)
+          else:
+              print("[prep] pa/pb present; nothing to do.")
+          PY
 
       - name: Run matrix backtest
         run: |
           set -euo pipefail
           python scripts/run_matrix_backtest.py \
-            --dataset outputs/edge_enriched.csv \
+            --dataset "${{ steps.resolve.outputs.dataset }}" \
             --staking "${{ inputs.staking }}" \
             --kelly-scale "${{ inputs.kelly_scale }}" \
             --bankroll "${{ inputs.bankroll }}" \
+            --min-edge "${{ inputs.min_edge }}" \
             --bands "${{ inputs.bands }}"
 
       - name: Generate HTML report
         run: |
           set -euo pipefail
           python scripts/generate_report.py \
-            --input outputs/prob_enriched.csv \
-            --backtests results/backtests \
-            --output results/backtests/index.html
+            --dataset "${{ steps.resolve.outputs.dataset }}" \
+            --summary results/backtests/summary.csv \
+            --params results/backtests/params_cfg1.json \
+            --picks results/backtests/logs/picks_cfg1.csv \
+            --out results/backtests/index.html
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -107,6 +131,5 @@ jobs:
             results/backtests/index.html
             results/backtests/summary.csv
             results/backtests/params_cfg1.json
-            results/backtests/logs/picks_cfg1.csv
-            outputs/prob_enriched.csv
-            outputs/edge_enriched.csv
+            results/backtests/logs/
+
