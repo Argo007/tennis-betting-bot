@@ -1,80 +1,63 @@
 #!/usr/bin/env python3
-"""
-Normalize a tennis odds CSV so it always contains:
-  - oa, ob : decimal odds for A and B
-  - pa, pb : implied win probabilities (vig-agnostic)
-
-Input column flexibility:
-  - Already has pa/pb  -> pass through
-  - oa/ob              -> compute pa/pb
-  - odds_a/odds_b      -> treated as oa/ob
-  - a_odds/b_odds      -> treated as oa/ob
-"""
-
+# scripts/prepare_dataset.py
 import argparse
+import pandas as pd
 import sys
 from pathlib import Path
-import pandas as pd
 
-
-CANDIDATES_A = ["oa", "odds_a", "a_odds"]
-CANDIDATES_B = ["ob", "odds_b", "b_odds"]
-
-
-def find_col(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def ensure_pa_pb(df: pd.DataFrame) -> pd.DataFrame:
-    # If pa/pb already there, trust and return
-    if "pa" in df.columns and "pb" in df.columns:
-        return df
-
-    # Map odds columns to oa/ob if needed
-    col_oa = find_col(df, CANDIDATES_A)
-    col_ob = find_col(df, CANDIDATES_B)
-
-    if col_oa is None or col_ob is None:
-        raise ValueError(
-            "need oa/ob (or odds_a/odds_b or a_odds/b_odds) to compute pa/pb"
-        )
-
-    # Create canonical oa/ob if not present
-    if "oa" not in df.columns:
-        df["oa"] = df[col_oa]
-    if "ob" not in df.columns:
-        df["ob"] = df[col_ob]
-
-    inv_a = 1.0 / df["oa"].astype(float)
-    inv_b = 1.0 / df["ob"].astype(float)
-    total = inv_a + inv_b
-    df["pa"] = inv_a / total
-    df["pb"] = inv_b / total
-    return df
-
+def normalize_implied(oa, ob):
+    # implied probabilities from decimal odds
+    ia = 1.0 / oa
+    ib = 1.0 / ob
+    s = ia + ib
+    return ia / s, ib / s
 
 def main():
-    ap = argparse.ArgumentParser(description="Prepare dataset with pa/pb.")
-    ap.add_argument("--input", required=True, help="Input CSV path")
-    ap.add_argument("--output", required=True, help="Output CSV path")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", default="outputs/prob_enriched.csv", help="input CSV (optional)")
+    p.add_argument("--out", default="results/prob_enriched.csv", help="output csv")
+    args = p.parse_args()
 
-    inp = Path(args.input)
-    out = Path(args.output)
+    input_path = Path(args.input)
+    fallback_paths = [
+        Path("outputs/prob_enriched.csv"),
+        Path("data/raw/vigfree_matches.csv"),
+        Path("data/raw/odds/sample_odds.csv")
+    ]
+    df = None
+    if input_path.exists():
+        df = pd.read_csv(input_path)
+    else:
+        for fp in fallback_paths:
+            if fp.exists():
+                df = pd.read_csv(fp)
+                break
+
+    if df is None:
+        print("ERROR: no input CSV found. looked for:", args.input, fallback_paths, file=sys.stderr)
+        sys.exit(1)
+
+    # Expect columns: either pa/pb exist, or oa/ob exist. We'll compute pa/pb from oa/ob if needed.
+    if "oa" not in df.columns or "ob" not in df.columns:
+        print("ERROR: need 'oa' and 'ob' columns to compute probabilities", file=sys.stderr)
+        sys.exit(2)
+
+    df = df.copy()
+    df["oa"] = df["oa"].astype(float)
+    df["ob"] = df["ob"].astype(float)
+    pa_vals = []
+    pb_vals = []
+    for oa, ob in zip(df["oa"].values, df["ob"].values):
+        pa, pb = normalize_implied(oa, ob)
+        pa_vals.append(pa)
+        pb_vals.append(pb)
+    df["pa"] = pa_vals
+    df["pb"] = pb_vals
+
+    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    df = pd.read_csv(inp)
-    df = ensure_pa_pb(df)
     df.to_csv(out, index=False)
-    print(f"[prepare_dataset] Saved -> {out}")
-
+    print("Wrote", out)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[prepare_dataset][ERROR]: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
