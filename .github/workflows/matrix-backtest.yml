@@ -1,130 +1,75 @@
-name: Matrix Backtest (Kelly + TE)
+name: Matrix Backtest (simple debug)
 
 on:
   workflow_dispatch:
     inputs:
-      dataset:
-        description: "Path to CSV (optional). Falls back to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv"
+      csv_path:
+        description: "Optional path to csv (defaults to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv)"
         required: false
-        default: ""
       bands:
-        description: "Edge bands like 1.2,2.0|2.0,3.2|3.2,4.0"
-        required: true
-        default: "1.2,2.0|2.0,3.2|3.2,4.0"
+        description: "Edge bands like 1.0,2.0|2.0,3.0"
+        required: false
+        default: "1.0,2.0|2.0,3.0"
       staking:
-        description: "Staking method"
-        required: true
+        description: "staking method (kelly|flat)"
+        required: false
         default: "kelly"
       kelly_scale:
-        description: "Kelly scaler (0.5 = half Kelly)"
-        required: true
+        description: "Kelly scaler (0-1)"
+        required: false
         default: "0.5"
       bankroll:
-        description: "Starting bankroll (units)"
-        required: true
+        description: "starting bankroll in units"
+        required: false
         default: "1000"
       min_edge:
-        description: "Minimum true edge to consider (e.g. 0.00 = none)"
-        required: true
-        default: "0.00"
+        description: "minimum true edge to consider (0.00 = none)"
+        required: false
+        default: "0.02"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pandas
+          python -m pip install --upgrade pip
+          pip install pandas numpy
 
-      - name: Resolve dataset path
-        id: ds
+      - name: Prepare dataset -> ${{ github.event.inputs.csv_path || 'outputs/prob_enriched.csv' }}
+        id: prepare
         run: |
-          set -euo pipefail
-
-          INPUT="${{ github.event.inputs.dataset }}"
-          # Ordered fallbacks
-          F1="outputs/prob_enriched.csv"
-          F2="data/raw/vigfree_matches.csv"
-          F3="data/raw/odds/sample_odds.csv"
-
-          pick_first_existing () {
-            for p in "$@"; do
-              if [ -n "$p" ] && [ -f "$p" ]; then
-                echo "$p"; return 0
-              fi
-            done
-            echo ""
-          }
-
-          if [ -n "$INPUT" ]; then
-            SRC="$INPUT"
-          else
-            SRC=$(pick_first_existing "$F1" "$F2" "$F3")
+          mkdir -p results
+          CSV_IN="${{ github.event.inputs.csv_path }}"
+          if [ -z "$CSV_IN" ]; then
+            CSV_IN="outputs/prob_enriched.csv"
           fi
-
-          if [ -z "$SRC" ]; then
-            echo "::error title=dataset::No usable dataset found."
-            exit 1
-          fi
-
-          echo "src=$SRC" >> "$GITHUB_OUTPUT"
-          echo "[dataset] Using: $SRC"
-
-      - name: Prepare dataset -> outputs/prob_enriched.csv
-        run: |
-          set -euo pipefail
-          INP="${{ steps.ds.outputs.src }}"
-          OUT="outputs/prob_enriched.csv"
-
-          # Always normalize so pa/pb exist (idempotent if already present)
-          python scripts/prepare_dataset.py --input "$INP" --output "$OUT"
-
-      - name: Enrich edges (EdgeSmith)
-        run: |
-          set -euo pipefail
-          python scripts/edge_smith_enrich.py \
-            --input outputs/prob_enriched.csv \
-            --output outputs/edge_enriched.csv \
-            --min-edge ${{ inputs.min_edge }}
+          python scripts/prepare_dataset.py --input "$CSV_IN" --out results/prob_enriched.csv
+          echo "prepared=results/prob_enriched.csv" >> $GITHUB_OUTPUT
 
       - name: Run matrix backtest
+        id: backtest_run
         run: |
-          set -euo pipefail
+          mkdir -p results/backtests logs
           python scripts/run_matrix_backtest.py \
-            --dataset outputs/prob_enriched.csv \
-            --min-edge ${{ inputs.min_edge }} \
-            --staking ${{ inputs.staking }} \
-            --kelly-scale ${{ inputs.kelly_scale }} \
-            --bankroll ${{ inputs.bankroll }} \
-            --bands "${{ inputs.bands }}"
+            --dataset results/prob_enriched.csv \
+            --bands "${{ github.event.inputs.bands }}" \
+            --staking "${{ github.event.inputs.staking }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}" \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
+            --outdir results/backtests
 
-      - name: Generate HTML report
-        run: |
-          set -euo pipefail
-          # Your existing report generator – it reads backtests outputs
-          python scripts/generate_report.py
-
-      - name: Upload artifacts
+      - name: Upload results artifact
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
-          path: |
-            outputs/prob_enriched.csv
-            outputs/edge_enriched.csv
-            results/backtests/**
-            docs/backtests/**
-          if-no-files-found: warn
+          path: results/backtests
