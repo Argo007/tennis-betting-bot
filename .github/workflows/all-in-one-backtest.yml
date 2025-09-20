@@ -1,0 +1,78 @@
+name: All-in-One Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Optional CSV path (repo-relative). Leave blank to use fallbacks."
+        required: false
+        default: ""
+      bands:
+        description: 'Odds bands "lo,hi|lo,hi|..." (leave blank = auto bands)'
+        required: false
+        default: ""
+      staking:
+        description: "Staking method"
+        required: false
+        default: "kelly"
+      kelly_scale:
+        description: "Kelly scale (0.5 = half Kelly)"
+        required: false
+        default: "0.5"
+      bankroll:
+        description: "Starting bankroll"
+        required: false
+        default: "1000"
+      min_edge:
+        description: "Minimum true edge (0 = none)"
+        required: false
+        default: "0.00"
+      settle:
+        description: "Settle mode: ev (deterministic) or sim (Monte-Carlo)"
+        required: false
+        default: "ev"
+      n_sims:
+        description: "Monte-Carlo runs (only if settle=sim)"
+        required: false
+        default: "1000"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Run all-in-one backtest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/all_in_one_backtest.py \
+            --dataset "${{ github.event.inputs.dataset }}" \
+            --bands "${{ github.event.inputs.bands }}" \
+            --staking "${{ github.event.inputs.staking }}" \
+            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
+            --bankroll "${{ github.event.inputs.bankroll }}" \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
+            --settle "${{ github.event.inputs.settle }}" \
+            --n-sims "${{ github.event.inputs.n_sims }}"
+
+      - name: Upload report + results
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-in-one-backtest
+          path: |
+            docs/backtests/index.html
+            results/backtests/**
+            outputs/prob_enriched.csv
+            outputs/edge_enriched.csv
