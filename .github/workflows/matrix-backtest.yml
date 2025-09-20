@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "Path to CSV (optional). If missing, we fall back to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv"
+        description: "Path to CSV (optional). Falls back to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv"
         required: false
         default: ""
       bands:
-        description: "Edge bands like 2.0,2.6|2.6,3.2|3.2,4.0"
+        description: "Edge bands like 1.2,2.0|2.0,3.2|3.2,4.0"
         required: true
-        default: "2.0,2.6|2.6,3.2|3.2,4.0"
+        default: "1.2,2.0|2.0,3.2|3.2,4.0"
       staking:
         description: "Staking method"
         required: true
         default: "kelly"
       kelly_scale:
-        description: "Kelly scaler (0.5 = half-Kelly)"
+        description: "Kelly scaler (0.5 = half Kelly)"
         required: true
         default: "0.5"
       bankroll:
@@ -36,7 +36,7 @@ jobs:
         shell: bash
 
     steps:
-      - name: Post Checkout repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -46,132 +46,85 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas
 
-      - name: Prepare dataset -> $OUT_PROB
-        env:
-          INPUT_CLI: "${{ inputs.dataset }}"
-          OUT_PROB: "outputs/prob_enriched.csv"
+      - name: Resolve dataset path
+        id: ds
         run: |
           set -euo pipefail
 
-          # Pick first existing candidate
-          choose_dataset() {
-            for f in "$@"; do
-              if [[ -n "$f" && -f "$f" ]]; then
-                echo "$f"
-                return 0
+          INPUT="${{ github.event.inputs.dataset }}"
+          # Ordered fallbacks
+          F1="outputs/prob_enriched.csv"
+          F2="data/raw/vigfree_matches.csv"
+          F3="data/raw/odds/sample_odds.csv"
+
+          pick_first_existing () {
+            for p in "$@"; do
+              if [ -n "$p" ] && [ -f "$p" ]; then
+                echo "$p"; return 0
               fi
             done
-            return 1
+            echo ""
           }
 
-          DS="$(choose_dataset "$INPUT_CLI" "outputs/prob_enriched.csv" "data/raw/vigfree_matches.csv" "data/raw/odds/sample_odds.csv" || true)"
-          if [[ -z "${DS:-}" ]]; then
-            echo "ERROR: No usable dataset found (tried inputs.dataset, outputs/prob_enriched.csv, data/raw/vigfree_matches.csv, data/raw/odds/sample_odds.csv)"
+          if [ -n "$INPUT" ]; then
+            SRC="$INPUT"
+          else
+            SRC=$(pick_first_existing "$F1" "$F2" "$F3")
+          fi
+
+          if [ -z "$SRC" ]; then
+            echo "::error title=dataset::No usable dataset found."
             exit 1
           fi
 
-          echo "[dataset] Using: $DS"
-          mkdir -p "$(dirname "$OUT_PROB")"
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "[dataset] Using: $SRC"
 
-          # Export env for the inline Python
-          export INPUT="$DS"
-          export OUT_PROB="$OUT_PROB"
-
-          python - <<'PY'
-          import os, sys
-          from pathlib import Path
-          import pandas as pd
-          import numpy as np
-
-          inp = Path(os.environ["INPUT"])
-          outp = Path(os.environ["OUT_PROB"])
-          outp.parent.mkdir(parents=True, exist_ok=True)
-
-          df = pd.read_csv(inp)
-
-          # Normalize columns -> date, player_a, player_b, oa, ob, pa, pb
-          aliases = {
-              "date":"date","event_date":"date","match_date":"date","ts":"date",
-              "player_a":"player_a","home":"player_a","a":"player_a",
-              "player_b":"player_b","away":"player_b","b":"player_b",
-              "oa":"oa","odds_a":"oa","odds1":"oa","odds_home":"oa","odds_A":"oa",
-              "ob":"ob","odds_b":"ob","odds2":"ob","odds_away":"ob","odds_B":"ob",
-              "pa":"pa","probA":"pa","prob_a":"pa","implied_prob_a":"pa","p_a":"pa","prob_a_vigfree":"pa",
-              "pb":"pb","probB":"pb","prob_b":"pb","implied_prob_b":"pb","p_b":"pb","prob_b_vigfree":"pb",
-          }
-          rename = {}
-          for c in df.columns:
-              k = c.strip()
-              if k in aliases:
-                  rename[c] = aliases[k]
-          if rename:
-              df = df.rename(columns=rename)
-
-          # Compute pa/pb if missing but oa/ob present (de-vig via simple normalization)
-          if not {"pa","pb"}.issubset(df.columns):
-              if {"oa","ob"}.issubset(df.columns):
-                  oa = pd.to_numeric(df["oa"], errors="coerce")
-                  ob = pd.to_numeric(df["ob"], errors="coerce")
-                  pinv = 1/oa + 1/ob
-                  df["pa"] = (1/oa) / pinv
-                  df["pb"] = (1/ob) / pinv
-              else:
-                  print("[prep] ERROR: need oa/ob to compute pa/pb", file=sys.stderr)
-                  sys.exit(2)
-
-          keep = [c for c in ["date","player_a","player_b","oa","ob","pa","pb"] if c in df.columns]
-          df = df[keep].copy()
-          df.to_csv(outp, index=False)
-          print(f"[prep] wrote {outp} rows={len(df)}")
-          PY
-
-      - name: Enrich edges (EdgeSmith)
-        env:
-          IN_PROB: "outputs/prob_enriched.csv"
-          OUT_EDGE: "outputs/edge_enriched.csv"
-          MIN_EDGE: "${{ inputs.min_edge }}"
+      - name: Prepare dataset -> outputs/prob_enriched.csv
         run: |
           set -euo pipefail
-          echo "[edges] input: $IN_PROB"
+          INP="${{ steps.ds.outputs.src }}"
+          OUT="outputs/prob_enriched.csv"
+
+          # Always normalize so pa/pb exist (idempotent if already present)
+          python scripts/prepare_dataset.py --input "$INP" --output "$OUT"
+
+      - name: Enrich edges (EdgeSmith)
+        run: |
+          set -euo pipefail
           python scripts/edge_smith_enrich.py \
-            --input "$IN_PROB" \
-            --output "$OUT_EDGE" \
-            --min-edge "$MIN_EDGE"
+            --input outputs/prob_enriched.csv \
+            --output outputs/edge_enriched.csv \
+            --min-edge ${{ inputs.min_edge }}
 
       - name: Run matrix backtest
-        env:
-          DATASET: "outputs/edge_enriched.csv"
-          BANDS: "${{ inputs.bands }}"
-          STAKING: "${{ inputs.staking }}"
-          KELLY: "${{ inputs.kelly_scale }}"
-          BANKROLL: "${{ inputs.bankroll }}"
-          MIN_EDGE: "${{ inputs.min_edge }}"
         run: |
           set -euo pipefail
           python scripts/run_matrix_backtest.py \
-            --dataset "$DATASET" \
-            --min-edge "$MIN_EDGE" \
-            --staking "$STAKING" \
-            --kelly-scale "$KELLY" \
-            --bankroll "$BANKROLL" \
-            --bands "$BANDS"
+            --dataset outputs/prob_enriched.csv \
+            --min-edge ${{ inputs.min_edge }} \
+            --staking ${{ inputs.staking }} \
+            --kelly-scale ${{ inputs.kelly_scale }} \
+            --bankroll ${{ inputs.bankroll }} \
+            --bands "${{ inputs.bands }}"
 
       - name: Generate HTML report
         run: |
-          python scripts/generate_report.py \
-            --prob-csv outputs/prob_enriched.csv \
-            --edge-csv outputs/edge_enriched.csv \
-            --summary-csv results/backtests/summary.csv \
-            --out docs/backtests/index.html || true
+          set -euo pipefail
+          # Your existing report generator – it reads backtests outputs
+          python scripts/generate_report.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: matrix-backtest-${{ github.run_id }}
           path: |
-            outputs/*.csv
+            outputs/prob_enriched.csv
+            outputs/edge_enriched.csv
             results/backtests/**
-            docs/backtests/index.html
+            docs/backtests/**
+          if-no-files-found: warn
