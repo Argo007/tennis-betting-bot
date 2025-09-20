@@ -4,36 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "Optional CSV path (repo-relative). Leave blank to use fallbacks."
+        description: "Path to CSV (optional)"
         required: false
         default: ""
-      bands:
-        description: 'Odds bands "lo,hi|lo,hi|..." (leave blank = auto bands)'
-        required: false
-        default: ""
+      min_edge:
+        description: "Minimum true edge (e.g. 0.00)"
+        required: true
+        default: "0.00"
       staking:
-        description: "Staking method"
-        required: false
+        description: "kelly or flat"
+        required: true
         default: "kelly"
       kelly_scale:
-        description: "Kelly scale (0.5 = half Kelly)"
-        required: false
+        description: "0.5 = half Kelly"
+        required: true
         default: "0.5"
       bankroll:
         description: "Starting bankroll"
-        required: false
-        default: "1000"
-      min_edge:
-        description: "Minimum true edge (0 = none)"
-        required: false
-        default: "0.00"
-      settle:
-        description: "Settle mode: ev (deterministic) or sim (Monte-Carlo)"
-        required: false
-        default: "ev"
-      n_sims:
-        description: "Monte-Carlo runs (only if settle=sim)"
-        required: false
+        required: true
         default: "1000"
 
 jobs:
@@ -53,26 +41,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas
 
-      - name: Run all-in-one backtest
-        shell: bash
+      - name: Run all-in-one (prints summary, writes job summary)
         run: |
-          set -euo pipefail
-          python scripts/all_in_one_backtest.py \
+          python scripts/backtest_all.py \
             --dataset "${{ github.event.inputs.dataset }}" \
-            --bands "${{ github.event.inputs.bands }}" \
+            --min-edge "${{ github.event.inputs.min_edge }}" \
             --staking "${{ github.event.inputs.staking }}" \
             --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-            --bankroll "${{ github.event.inputs.bankroll }}" \
-            --min-edge "${{ github.event.inputs.min_edge }}" \
-            --settle "${{ github.event.inputs.settle }}" \
-            --n-sims "${{ github.event.inputs.n_sims }}"
+            --bankroll "${{ github.event.inputs.bankroll }}"
 
-      - name: Upload report + results
+      - name: Upload artifacts (CSV + HTML + MD)
         uses: actions/upload-artifact@v4
         with:
           name: all-in-one-backtest
           path: |
-            docs/backtests/index.html
-            results/backtests/**
+            results/backtests/summary.csv
+            results/backtests/summary.md
+            results/backtests/index.html
+            results/backtests/logs/picks_cfg1.csv
             outputs/prob_enriched.csv
             outputs/edge_enriched.csv
+
