@@ -175,5 +175,3 @@ jobs:
             outputs/*.csv
             results/backtests/**
             docs/backtests/index.html
-
-
