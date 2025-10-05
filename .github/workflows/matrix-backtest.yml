@@ -37,11 +37,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas
 
-      - name: Ensure enriched sample (demo)
+      - name: Prepare enriched input (demo)
         run: |
           python scripts/prepare_backtest_input.py
 
-      - name: Run backtest
+      - name: Sanity check files
+        run: |
+          echo "PWD=$(pwd)"
+          ls -al
+          echo "---- scripts/"
+          ls -al scripts || true
+          echo "---- data/raw/odds/"
+          ls -al data/raw/odds || true
+
+      - name: Run backtest (matrix combo)
+        env:
+          PYTHONPATH: ./scripts:.
         run: |
           mkdir -p artifacts
           python scripts/backtest_all.py \
@@ -53,6 +64,8 @@ jobs:
             --bankroll 1000 \
             --cfg_id 1 \
             --outdir "artifacts"
+          echo "---- summary.csv"
+          cat artifacts/summary.csv || true
 
       - name: Stamp results with params
         run: |
@@ -78,7 +91,6 @@ jobs:
   merge:
     needs: matrix
     runs-on: ubuntu-latest
-
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -107,17 +119,15 @@ jobs:
           else:
             frames = [pd.read_csv(p) for p in files]
             out = pd.concat(frames, ignore_index=True)
-            # order columns nicely
             cols = ['kelly_scale','min_edge','cfg_id','n_bets','total_staked','pnl','roi','end_bankroll']
             out = out[[c for c in cols if c in out.columns]]
             out.sort_values(['kelly_scale','min_edge'], inplace=True)
             out.to_csv('matrix_summary.csv', index=False)
-            # also write a pretty table to the job summary
             md = out.to_markdown(index=False)
             print(md)
             summ = os.environ.get('GITHUB_STEP_SUMMARY')
             if summ:
-              with open(summ,'a') as f:
+              with open(summ, 'a') as f:
                 f.write("# Matrix Backtest Summary\n\n")
                 f.write(md + "\n")
           PY
@@ -128,4 +138,3 @@ jobs:
           name: matrix-merged-${{ github.run_id }}
           path: matrix_summary.csv
           retention-days: 7
-
