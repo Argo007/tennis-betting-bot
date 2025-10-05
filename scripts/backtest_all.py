@@ -2,9 +2,19 @@
 """
 CLI wrapper around backtest_core.simulate; writes artifacts and job summary.
 """
-import argparse, json, os
+
+import argparse
+import json
+import os
 from pathlib import Path
-from backtest_core import Config, simulate
+import sys
+
+# --- FIRST REPAIR: make sure peer modules in scripts/ are importable ---
+# This lets `from backtest_core import ...` work reliably inside GitHub Actions.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from backtest_core import Config, simulate  # noqa: E402
+
 
 def write_summary_md(cfg: dict, diagnostics: dict, summary_row: dict) -> str:
     md = []
@@ -16,10 +26,13 @@ def write_summary_md(cfg: dict, diagnostics: dict, summary_row: dict) -> str:
     md.append("## Results\n\n")
     md.append("| cfg_id | n_bets | total_staked | pnl | roi | end_bankroll |\n")
     md.append("|---:|---:|---:|---:|---:|---:|\n")
-    md.append(f"| {summary_row['cfg_id']} | {summary_row['n_bets']} | "
-              f"{summary_row['total_staked']:.2f} | {summary_row['pnl']:.2f} | "
-              f"{summary_row['roi']:.4f} | {summary_row['end_bankroll']:.4f} |\n")
+    md.append(
+        f"| {summary_row['cfg_id']} | {summary_row['n_bets']} | "
+        f"{summary_row['total_staked']:.2f} | {summary_row['pnl']:.2f} | "
+        f"{summary_row['roi']:.4f} | {summary_row['end_bankroll']:.4f} |\n"
+    )
     return "".join(md)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -33,7 +46,7 @@ def main():
     ap.add_argument("--outdir", default="artifacts")
     args = ap.parse_args()
 
-    # Build config
+    # Build config dict for logging + a Config object for the simulator
     cfg = {
         "cfg_id": args.cfg_id,
         "dataset": args.dataset,
@@ -43,11 +56,16 @@ def main():
         "kelly_scale": args.kelly_scale,
         "bankroll": args.bankroll,
     }
-    os.makedirs(args.outdir, exist_ok=True)
 
-    # Diagnostics
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Diagnostics (basic file stats)
     src = Path(args.dataset)
-    total_rows = sum(1 for _ in open(src)) - 1 if src.exists() else 0
+    total_rows = 0
+    if src.exists():
+        with open(src, "r", encoding="utf-8") as f:
+            total_rows = sum(1 for _ in f) - 1  # minus header
     diagnostics = {
         "source": str(src),
         "total_rows": total_rows,
@@ -56,7 +74,7 @@ def main():
         "notes": [],
     }
 
-    # Run
+    # Run simulation
     cfg_obj = Config(
         cfg_id=cfg["cfg_id"],
         dataset=cfg["dataset"],
@@ -69,18 +87,19 @@ def main():
     bets_df, summary_df = simulate(cfg_obj)
 
     # Persist artifacts
-    bets_df.to_csv(Path(args.outdir)/"bets_log.csv", index=False)
-    summary_df.to_csv(Path(args.outdir)/"summary.csv", index=False)
-    with open(Path(args.outdir)/f"params_cfg{cfg['cfg_id']}.json","w") as f:
+    (outdir / "bets_log.csv").write_text(bets_df.to_csv(index=False), encoding="utf-8")
+    (outdir / "summary.csv").write_text(summary_df.to_csv(index=False), encoding="utf-8")
+    with open(outdir / f"params_cfg{cfg['cfg_id']}.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
-    # Job summary (for GitHub Actions)
+    # Job summary (GH Actions)
     md = write_summary_md(cfg, diagnostics, summary_df.iloc[0].to_dict())
-    print(md)  # Always print to logs
-    gh_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if gh_path:
-        with open(gh_path, "a") as f:
+    print(md)  # always print to logs
+    gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if gh_summary:
+        with open(gh_summary, "a", encoding="utf-8") as f:
             f.write(md)
+
 
 if __name__ == "__main__":
     main()
