@@ -1,100 +1,66 @@
 #!/usr/bin/env python3
-import sys, argparse
-import pandas as pd
+"""
+Prepare an enriched demo dataset from data/raw/odds/sample_odds.csv.
+
+Input  (minimal): date,player_a,player_b,odds_a,odds_b
+Output (enriched): + implied_prob_*, model_prob_*, edge_*, winner
+
+This is a deterministic demo so that CI always places some bets.
+Replace this later with your real model that emits model_prob_* and edge_*.
+"""
 from pathlib import Path
+import pandas as pd
 
-def infer_cols(df, mapping):
-    out = {}
-    for want, cands in mapping.items():
-        for c in cands:
-            if c in df.columns:
-                out[want] = c
-                break
-    return out
-
-def vigfree_from_odds(oa: float, ob: float):
-    ia, ib = 1.0/oa, 1.0/ob
-    s = ia + ib
-    return ia/s, ib/s
+SRC = Path("data/raw/odds/sample_odds.csv")
+DST = Path("data/raw/odds/sample_odds_enriched.csv")
 
 def main():
-    ap = argparse.ArgumentParser(description="Normalize various inputs -> outputs/prob_enriched.csv")
-    ap.add_argument("--input", required=True, help="Path to CSV (e.g., results/tennis_data.csv)")
-    ap.add_argument("--output", required=True, help="Destination CSV (e.g., outputs/prob_enriched.csv)")
-    args = ap.parse_args()
+    if not SRC.exists():
+        raise FileNotFoundError(f"Missing input file: {SRC}")
 
-    inp = Path(args.input)
-    if not inp.exists():
-        print(f"[prepare] ERROR: input not found: {inp}", file=sys.stderr)
-        sys.exit(2)
+    df = pd.read_csv(SRC)
 
-    df = pd.read_csv(inp)
+    # Sanity
+    required = {"date","player_a","player_b","odds_a","odds_b"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Input is missing columns: {sorted(missing)}")
 
-    # Flexible column aliases
-    name_map = infer_cols(df, {
-        "date":     ["date","event_date","match_date"],
-        "player_a": ["player_a","home","A","team_a"],
-        "player_b": ["player_b","away","B","team_b"],
-        "oa":       ["oa","odds_a","a_odds","oddsA","odds"],   # 'odds' = total odds if 2-way only
-        "ob":       ["ob","odds_b","b_odds","oddsB"],
-        "pa":       ["pa","prob_a","p_a","p"],                 # 'p' = model prob for player_a
-        "pb":       ["pb","prob_b","p_b"],
-        "pa_vf":    ["prob_a_vigfree","pa_vigfree"],
-        "pb_vf":    ["prob_b_vigfree","pb_vigfree"],
-    })
+    implied_a = 1.0 / df["odds_a"]
+    implied_b = 1.0 / df["odds_b"]
 
-    # Players (optional—fill blanks for synthetic sets)
-    if "player_a" not in name_map:
-        df["player_a"] = ""
-        name_map["player_a"] = "player_a"
-    if "player_b" not in name_map:
-        df["player_b"] = ""
-        name_map["player_b"] = "player_b"
+    # Deterministic nudge pattern so some bets have +edge
+    nudges = [0.06, -0.03, -0.08, 0.02, 0.05, -0.07, -0.04, 0.09, 0.01, -0.05]
+    nudges = (nudges * ((len(df) // len(nudges)) + 1))[:len(df)]
 
-    # Need odds.
-    if "oa" not in name_map or "ob" not in name_map:
-        print("[prepare] ERROR: need oa/ob columns to proceed.", file=sys.stderr)
-        sys.exit(2)
+    model_prob_a = (implied_a + pd.Series(nudges)).clip(0.05, 0.95)
+    model_prob_b = 1.0 - model_prob_a
 
-    out = pd.DataFrame({
-        "date":     df[name_map["date"]] if "date" in name_map else "",
-        "player_a": df[name_map["player_a"]],
-        "player_b": df[name_map["player_b"]],
-        "oa":       pd.to_numeric(df[name_map["oa"]], errors="coerce"),
-        "ob":       pd.to_numeric(df[name_map["ob"]], errors="coerce"),
-    })
+    edge_a = model_prob_a - implied_a
+    edge_b = model_prob_b - implied_b
 
-    # Probability priority: model p -> explicit pa/pb -> vig-free
-    if "pa" in name_map:
-        pa = pd.to_numeric(df[name_map["pa"]], errors="coerce").clip(0.0, 1.0)
-        if "pb" in name_map:
-            pb = pd.to_numeric(df[name_map["pb"]], errors="coerce").clip(0.0, 1.0)
+    # Synthetic ground-truth winner (for realized PnL in the demo)
+    winner = []
+    for pa in model_prob_a:
+        if pa >= 0.55:
+            winner.append("A")
+        elif pa <= 0.45:
+            winner.append("B")
         else:
-            pb = 1.0 - pa
-        source = "model_p"
-    elif "pb" in name_map:
-        pb = pd.to_numeric(df[name_map["pb"]], errors="coerce").clip(0.0, 1.0)
-        pa = 1.0 - pb
-        source = "explicit_pa_pb"
-    elif "pa_vf" in name_map and "pb_vf" in name_map:
-        pa = pd.to_numeric(df[name_map["pa_vf"]], errors="coerce").clip(0.0, 1.0)
-        pb = pd.to_numeric(df[name_map["pb_vf"]], errors="coerce").clip(0.0, 1.0)
-        source = "vigfree_from_input"
-    else:
-        pa, pb = [], []
-        for oa, ob in zip(out["oa"], out["ob"]):
-            a, b = vigfree_from_odds(float(oa), float(ob))
-            pa.append(a); pb.append(b)
-        pa = pd.Series(pa); pb = pd.Series(pb)
-        source = "vigfree_from_oa_ob"
+            winner.append("A")
 
-    out["pa"] = pa
-    out["pb"] = pb
-    out["prob_source"] = source
+    out = df.copy()
+    out["implied_prob_a"] = implied_a.round(6)
+    out["implied_prob_b"] = implied_b.round(6)
+    out["model_prob_a"] = model_prob_a.round(6)
+    out["model_prob_b"] = model_prob_b.round(6)
+    out["edge_a"]        = edge_a.round(6)
+    out["edge_b"]        = edge_b.round(6)
+    out["winner"]        = winner
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(args.output, index=False)
-    print(f"[prepare] OK -> {args.output} (prob_source={source})")
+    DST.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(DST, index=False)
+    print(f"Wrote {DST} ({len(out)} rows).")
 
 if __name__ == "__main__":
     main()
