@@ -2,203 +2,106 @@ name: Matrix Backtest (Kelly + TE)
 
 on:
   workflow_dispatch:
-    inputs:
-      bands:
-        description: "Edge bands like 1.2,2.0|2.0,3.2|3.2,4.0"
-        required: true
-        default: "1.2,2.0|2.0,3.2|3.2,4.0"
-      staking:
-        description: "Staking method"
-        required: true
-        default: "kelly"
-        type: choice
-        options: [kelly, flat]
-      kelly_scale:
-        description: "Kelly scaler (0.5 = half Kelly)"
-        required: true
-        default: "0.5"
-      bankroll:
-        description: "Starting bankroll (units)"
-        required: true
-        default: "1000"
-      min_edge:
-        description: "Minimum true edge to consider (0.00 = none)"
-        required: true
-        default: "0.00"
+  push:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/matrix_backtest.yml'
+
+concurrency:
+  group: matrix-backtest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  backtest:
+  matrix:
     runs-on: ubuntu-latest
-    env:
-      OUT_PROB: outputs/prob_enriched.csv     # <- canonical dataset we always use
-      OUT_EDGE: outputs/edge_enriched.csv
-      BACKTEST_DIR: results/backtests
-
+    strategy:
+      fail-fast: false
+      matrix:
+        kelly_scale: [0.25, 0.5, 1.0]
+        min_edge: [0.00, 0.02, 0.05]
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
-          python -m pip install -U pip
-          pip install pandas numpy tabulate
+          python -m pip install --upgrade pip
+          pip install pandas
 
-      # This step ENSURES we have outputs/prob_enriched.csv with oa,ob,pa,pb
-      # It will try to reuse an existing file; otherwise it builds one from
-      # edge_enriched.csv -> vigfree_matches.csv -> sample_odds.csv -> results/tennis_data.csv
-      - name: Ensure prob_enriched.csv (adds/derives oa/ob/pa/pb if needed)
-        shell: bash
+      - name: Ensure enriched sample
         run: |
-          set -euo pipefail
+          python scripts/prepare_backtest_input.py
 
-          # Python helper that reads the best available source and writes outputs/prob_enriched.csv
+      - name: Run backtest
+        run: |
+          mkdir -p artifacts
+          python scripts/backtest_all.py \
+            --dataset "data/raw/odds/sample_odds_enriched.csv" \
+            --bands "[1.2,2.0]" \
+            --min_edge ${{ matrix.min_edge }} \
+            --staking "kelly" \
+            --kelly_scale ${{ matrix.kelly_scale }} \
+            --bankroll 1000 \
+            --cfg_id 1 \
+            --outdir "artifacts"
+
+      - name: Stamp results with params
+        run: |
           python - <<'PY'
-          import sys, os
-          import pandas as pd
-          from pathlib import Path
-
-          want = Path("outputs/prob_enriched.csv")
-          want.parent.mkdir(parents=True, exist_ok=True)
-
-          # Candidates in priority order (first that exists and has usable data wins)
-          candidates = [
-              "outputs/prob_enriched.csv",
-              "outputs/edge_enriched.csv",
-              "data/raw/vigfree_matches.csv",
-              "data/raw/odds/sample_odds.csv",
-              "results/tennis_data.csv",
-          ]
-
-          def first_existing(paths):
-              for p in paths:
-                  if Path(p).is_file():
-                      return Path(p)
-              return None
-
-          src = first_existing(candidates)
-          if src is None:
-              raise FileNotFoundError("No usable dataset found among: " + ", ".join(candidates))
-
-          df = pd.read_csv(src)
-          # Normalize header case/whitespace just in case
-          df.columns = [c.strip() for c in df.columns]
-
-          # Typical alias map we’ve seen across your runs
-          aliases = {
-              "date": ["date", "event_date"],
-              "player_a": ["player_a", "playerA", "home", "a"],
-              "player_b": ["player_b", "playerB", "away", "b"],
-              "oa": ["oa", "odds_a", "oddsA", "oddsa", "o_a"],
-              "ob": ["ob", "odds_b", "oddsB", "oddsb", "o_b"],
-              "pa": ["pa", "prob_a", "probA", "p_a", "prob_a_vigfree", "prob_a_vig_free"],
-              "pb": ["pb", "prob_b", "probB", "p_b", "prob_b_vigfree", "prob_b_vig_free"],
-          }
-
-          def pick(df, names):
-              for n in names:
-                  if n in df.columns:
-                      return n
-              return None
-
-          col = {}
-          for k, opts in aliases.items():
-              col[k] = pick(df, opts)
-
-          # Build the minimal output frame
-          out = pd.DataFrame()
-          # carry over identifying columns if available
-          for base in ("date","player_a","player_b"):
-              if col[base] and col[base] in df.columns:
-                  out[base] = df[col[base]]
-              else:
-                  # make them if totally missing
-                  if base == "date" and "date" not in out:
-                      out["date"] = pd.NA
-                  if base == "player_a" and "player_a" not in out:
-                      out["player_a"] = pd.NA
-                  if base == "player_b" and "player_b" not in out:
-                      out["player_b"] = pd.NA
-
-          # Pull any of oa/ob/pa/pb we can find
-          for k in ("oa","ob","pa","pb"):
-              if col[k]:
-                  out[k] = df[col[k]]
-
-          # Derive missing pieces
-          # If probs missing but odds present: pa=1/oa, pb=1/ob then normalize
-          if ("pa" not in out or out["pa"].isna().all()) and "oa" in out and "ob" in out:
-              oa = pd.to_numeric(out["oa"], errors="coerce")
-              ob = pd.to_numeric(out["ob"], errors="coerce")
-              pa = 1.0/oa
-              pb = 1.0/ob
-              s = pa + pb
-              out["pa"] = pa/s
-              out["pb"] = pb/s
-
-          # If odds missing but probs present: oa=1/pa_norm, ob=1/pb_norm
-          if ("oa" not in out or out["oa"].isna().all()) and "pa" in out and "pb" in out:
-              pa = pd.to_numeric(out["pa"], errors="coerce")
-              pb = pd.to_numeric(out["pb"], errors="coerce")
-              s = pa + pb
-              pa = pa/s
-              pb = pb/s
-              out["oa"] = 1.0/pa
-              out["ob"] = 1.0/pb
-
-          # Final validation
-          need = ["oa","ob","pa","pb"]
-          missing = [c for c in need if c not in out.columns]
-          if missing:
-              raise ValueError(f"Cannot construct required columns {missing}. Source={src}, cols={list(df.columns)}")
-
-          out.to_csv(want, index=False)
-          print(f"[prepare] Wrote {want} from {src}")
+          import pandas as pd, os
+          a = pd.read_csv('artifacts/summary.csv')
+          a['kelly_scale'] = float(os.environ['KELLY'])
+          a['min_edge'] = float(os.environ['EDGE'])
+          a.to_csv('artifacts/summary_labeled.csv', index=False)
           PY
+        env:
+          KELLY: ${{ matrix.kelly_scale }}
+          EDGE: ${{ matrix.min_edge }}
 
-      - name: Enrich edges (EdgeSmith)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # If your repo has edge_smith_enrich.py, call it; otherwise skip gracefully
-          if [[ -f scripts/edge_smith_enrich.py ]]; then
-            python scripts/edge_smith_enrich.py --input "$OUT_PROB" --output "$OUT_EDGE" --min-edge "${{ github.event.inputs.min_edge }}"
-          else
-            echo "[enrich] scripts/edge_smith_enrich.py not found; skipping."
-          fi
-
-      - name: Run matrix backtest
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "${BACKTEST_DIR}"
-          python scripts/run_matrix_backtest.py \
-            --dataset "$OUT_PROB" \
-            --min-edge "${{ github.event.inputs.min_edge }}" \
-            --staking "${{ github.event.inputs.staking }}" \
-            --kelly-scale "${{ github.event.inputs.kelly_scale }}" \
-            --bankroll "${{ github.event.inputs.bankroll }}" \
-            --bands "${{ github.event.inputs.bands }}"
-
-      - name: Generate HTML report
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -f scripts/generate_report.py ]]; then
-            python scripts/generate_report.py
-          else
-            echo "[report] scripts/generate_report.py not found; skipping."
-          fi
-
-      - name: Upload artifacts
+      - name: Upload artifact (per combo)
         uses: actions/upload-artifact@v4
         with:
-          name: matrix-backtest-${{ github.run_id }}
-          path: |
+          name: matrix-${{ matrix.kelly_scale }}-${{ matrix.min_edge }}-${{ github.run_id }}
+          path: artifacts/*
+          retention-days: 7
+
+  merge:
+    needs: matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: collected
+
+      - name: Merge summaries
+        run: |
+          python - <<'PY'
+          import pandas as pd, pathlib
+          base = pathlib.Path('collected')
+          frames = []
+          for p in base.rglob('summary_labeled.csv'):
+            frames.append(pd.read_csv(p))
+          out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+          out.to_csv('matrix_summary.csv', index=False)
+          print(out.to_markdown(index=False))
+          PY
+
+      - name: Upload merged matrix summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-merged-${{ github.run_id }}
+          path: matrix_summary.csv
+          retention-days: 7
+
             results/backtests/**
             outputs/prob_enriched.csv
             outputs/edge_enriched.csv
