@@ -2,68 +2,65 @@ name: All-in-One Backtest
 
 on:
   workflow_dispatch:
-    inputs:
-      path:
-        description: "Path to CSV (optional). Falls back to outputs/prob_enriched.csv -> data/raw/vigfree_matches.csv -> data/raw/odds/sample_odds.csv"
-        required: false
-        default: ""
-      edge_bands:
-        description: "Odds band for the chosen side (e.g. 1.2,2.0|2.0,3.2|3.2,4.0). Single config uses the FIRST band."
-        required: true
-        default: "1.2,2.0|2.0,3.2|3.2,4.0"
-      staking:
-        description: "Staking method"
-        required: true
-        default: "kelly"
-        type: choice
-        options: ["kelly","flat"]
-      kelly_scale:
-        description: "Kelly scaler (0.5 = half Kelly, for flat: fraction of bankroll per bet)"
-        required: true
-        default: "0.5"
-      bankroll:
-        description: "Starting bankroll (units)"
-        required: true
-        default: "1000"
-      min_edge:
-        description: "Minimum true edge to consider (0.00 = none)"
-        required: true
-        default: "0.00"
+  push:
+    paths:
+      - 'scripts/**'
+      - 'data/raw/odds/**'
+      - '.github/workflows/all_in_one_backtest.yml'
+
+concurrency:
+  group: all-in-one-backtest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy
+          pip install pandas
 
-      - name: Run all-in-one (prints summary, writes job summary)
+      - name: Prepare enriched input (demo)
         run: |
-          set -euo pipefail
-          python scripts/backtest_all.py \
-            --dataset "${{ inputs.path }}" \
-            --min-edge "${{ inputs.min_edge }}" \
-            --bands "${{ inputs.edge_bands }}" \
-            --staking "${{ inputs.staking }}" \
-            --kelly-scale "${{ inputs.kelly_scale }}" \
-            --bankroll "${{ inputs.bankroll }}" \
-            --outdir results/allinone
+          python scripts/prepare_backtest_input.py
 
-      - name: Upload artifacts (CSV + JSON)
+      - name: Run backtest
+        run: |
+          python scripts/backtest_all.py \
+            --dataset "data/raw/odds/sample_odds_enriched.csv" \
+            --bands "[1.2,2.0]" \
+            --min_edge 0.0 \
+            --staking "kelly" \
+            --kelly_scale 0.5 \
+            --bankroll 1000 \
+            --cfg_id 1 \
+            --outdir "artifacts"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: all-in-one-backtest-${{ github.run_id }}
-          path: |
-            results/allinone/**/*.csv
-            results/allinone/**/*.json
-          if-no-files-found: warn
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
