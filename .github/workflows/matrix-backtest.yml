@@ -22,6 +22,7 @@ jobs:
       matrix:
         kelly_scale: [0.25, 0.5, 1.0]
         min_edge: [0.00, 0.02, 0.05]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas
 
-      - name: Ensure enriched sample
+      - name: Ensure enriched sample (demo)
         run: |
           python scripts/prepare_backtest_input.py
 
@@ -56,11 +57,12 @@ jobs:
       - name: Stamp results with params
         run: |
           python - <<'PY'
-          import pandas as pd, os
+          import os, pandas as pd
           a = pd.read_csv('artifacts/summary.csv')
           a['kelly_scale'] = float(os.environ['KELLY'])
           a['min_edge'] = float(os.environ['EDGE'])
           a.to_csv('artifacts/summary_labeled.csv', index=False)
+          print(a.to_markdown(index=False))
           PY
         env:
           KELLY: ${{ matrix.kelly_scale }}
@@ -76,7 +78,18 @@ jobs:
   merge:
     needs: matrix
     runs-on: ubuntu-latest
+
     steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -85,14 +98,28 @@ jobs:
       - name: Merge summaries
         run: |
           python - <<'PY'
-          import pandas as pd, pathlib
+          import pandas as pd, pathlib, os
           base = pathlib.Path('collected')
-          frames = []
-          for p in base.rglob('summary_labeled.csv'):
-            frames.append(pd.read_csv(p))
-          out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-          out.to_csv('matrix_summary.csv', index=False)
-          print(out.to_markdown(index=False))
+          files = list(base.rglob('summary_labeled.csv'))
+          if not files:
+            print("No summary_labeled.csv files found.")
+            open('matrix_summary.csv','w').write('')
+          else:
+            frames = [pd.read_csv(p) for p in files]
+            out = pd.concat(frames, ignore_index=True)
+            # order columns nicely
+            cols = ['kelly_scale','min_edge','cfg_id','n_bets','total_staked','pnl','roi','end_bankroll']
+            out = out[[c for c in cols if c in out.columns]]
+            out.sort_values(['kelly_scale','min_edge'], inplace=True)
+            out.to_csv('matrix_summary.csv', index=False)
+            # also write a pretty table to the job summary
+            md = out.to_markdown(index=False)
+            print(md)
+            summ = os.environ.get('GITHUB_STEP_SUMMARY')
+            if summ:
+              with open(summ,'a') as f:
+                f.write("# Matrix Backtest Summary\n\n")
+                f.write(md + "\n")
           PY
 
       - name: Upload merged matrix summary
@@ -102,8 +129,3 @@ jobs:
           path: matrix_summary.csv
           retention-days: 7
 
-            results/backtests/**
-            outputs/prob_enriched.csv
-            outputs/edge_enriched.csv
-            index.html
-          if-no-files-found: warn
