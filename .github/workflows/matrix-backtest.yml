@@ -2,17 +2,6 @@ name: Matrix Backtest (Kelly + TE)
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'scripts/**'
-      - '.github/workflows/matrix_backtest.yml'
-
-concurrency:
-  group: matrix-backtest-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   matrix:
@@ -32,30 +21,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas tabulate
 
-      - name: Prepare enriched input (demo)
+      - name: Run backtest
         run: |
-          python scripts/prepare_backtest_input.py
-
-      - name: Sanity check paths
-        run: |
-          echo "PWD=$(pwd)"
-          ls -al
-          echo "---- scripts/"
-          ls -al scripts || true
-          echo "---- data/raw/odds/"
-          ls -al data/raw/odds || true
-          test -f data/raw/odds/sample_odds_enriched.csv || (echo "Missing enriched CSV" && exit 1)
-
-      - name: Run backtest (matrix combo)
-        env:
-          PYTHONPATH: ./scripts:.
-        run: |
-          mkdir -p artifacts
+          mkdir -p results
           python scripts/backtest_all.py \
             --dataset "data/raw/odds/sample_odds_enriched.csv" \
             --bands "[1.2,2.0]" \
@@ -64,47 +37,25 @@ jobs:
             --kelly_scale ${{ matrix.kelly_scale }} \
             --bankroll 1000 \
             --cfg_id 1 \
-            --outdir "artifacts"
-          echo "---- artifacts/summary.csv"
-          cat artifacts/summary.csv
+            --outdir results
+          mv results/summary.csv results/summary_${{ matrix.kelly_scale }}_${{ matrix.min_edge }}.csv
 
-      - name: Stamp results with params (pretty print)
-        run: |
-          python - <<'PY'
-          import os, pandas as pd
-          a = pd.read_csv('artifacts/summary.csv')
-          a['kelly_scale'] = float(os.environ['KELLY'])
-          a['min_edge'] = float(os.environ['EDGE'])
-          a.to_csv('artifacts/summary_labeled.csv', index=False)
-          # Pretty log table; fallback to CSV if needed
-          try:
-              print(a.to_markdown(index=False))
-          except Exception:
-              print("tabulate not available; printing CSV instead:")
-              print(a.to_csv(index=False))
-          PY
-        env:
-          KELLY: ${{ matrix.kelly_scale }}
-          EDGE: ${{ matrix.min_edge }}
-
-      - name: Upload artifact (per combo)
+      - name: Upload result
         uses: actions/upload-artifact@v4
         with:
-          name: matrix-${{ matrix.kelly_scale }}-${{ matrix.min_edge }}-${{ github.run_id }}
-          path: artifacts/*
-          retention-days: 7
+          name: matrix-${{ matrix.kelly_scale }}-${{ matrix.min_edge }}
+          path: results/*.csv
 
   merge:
     needs: matrix
     runs-on: ubuntu-latest
-
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas tabulate
@@ -114,41 +65,39 @@ jobs:
         with:
           path: collected
 
-      - name: Merge summaries
+      - name: Merge results and print summary
         run: |
           python - <<'PY'
           import pandas as pd, pathlib, os
+
           base = pathlib.Path('collected')
-          files = list(base.rglob('summary_labeled.csv'))
-          if not files:
-              print("No summary_labeled.csv files found.")
-              open('matrix_summary.csv','w').write('')
-          else:
-              frames = [pd.read_csv(p) for p in files]
-              out = pd.concat(frames, ignore_index=True)
-              cols = ['kelly_scale','min_edge','cfg_id','n_bets','total_staked','pnl','roi','end_bankroll']
-              out = out[[c for c in cols if c in out.columns]]
-              out.sort_values(['kelly_scale','min_edge'], inplace=True)
-              out.to_csv('matrix_summary.csv', index=False)
-              # Pretty print to Job Summary; fallback gracefully
-              md = None
-              try:
-                  md = out.to_markdown(index=False)
-                  print(md)
-              except Exception:
-                  print("tabulate not available; printing CSV instead:")
-                  print(out.to_csv(index=False))
-              summ = os.environ.get('GITHUB_STEP_SUMMARY')
-              if md and summ:
-                  with open(summ,'a') as f:
-                      f.write("# Matrix Backtest Summary\n\n")
-                      f.write(md + "\n")
+          files = list(base.rglob('summary_*.csv'))
+          dfs = []
+          for f in files:
+              k, e = f.stem.split('_')[1:]
+              df = pd.read_csv(f)
+              df['kelly_scale'] = float(k)
+              df['min_edge'] = float(e)
+              dfs.append(df)
+
+          out = pd.concat(dfs, ignore_index=True)
+          out = out[['kelly_scale','min_edge','n_bets','pnl','roi','end_bankroll']]
+          out.sort_values(['kelly_scale','min_edge'], inplace=True)
+          out.to_csv('matrix_summary.csv', index=False)
+
+          # Pretty markdown table for GitHub summary
+          try:
+              print(out.to_markdown(index=False))
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+                      f.write("# 📊 Matrix Backtest Summary\n\n")
+                      f.write(out.to_markdown(index=False))
+          except Exception:
+              print(out)
           PY
 
-      - name: Upload merged matrix summary
+      - name: Upload merged summary
         uses: actions/upload-artifact@v4
         with:
-          name: matrix-merged-${{ github.run_id }}
+          name: matrix-summary
           path: matrix_summary.csv
-          retention-days: 7
-
