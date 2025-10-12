@@ -3,6 +3,9 @@ name: Matrix Backtest (Kelly + TE)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   matrix:
     runs-on: ubuntu-latest
@@ -26,7 +29,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas tabulate
 
-      - name: Run backtest
+      # >>> This creates data/raw/odds/sample_odds_enriched.csv on the fresh runner
+      - name: Prepare enriched input (demo)
+        run: |
+          python scripts/prepare_backtest_input.py
+          test -f data/raw/odds/sample_odds_enriched.csv || (echo "Enriched CSV missing" && exit 1)
+
+      - name: Run backtest (matrix combo)
+        env:
+          PYTHONPATH: ./scripts:.
         run: |
           mkdir -p results
           python scripts/backtest_all.py \
@@ -39,16 +50,20 @@ jobs:
             --cfg_id 1 \
             --outdir results
           mv results/summary.csv results/summary_${{ matrix.kelly_scale }}_${{ matrix.min_edge }}.csv
+          echo "---- summary_${{ matrix.kelly_scale }}_${{ matrix.min_edge }}.csv"
+          cat results/summary_${{ matrix.kelly_scale }}_${{ matrix.min_edge }}.csv
 
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
           name: matrix-${{ matrix.kelly_scale }}-${{ matrix.min_edge }}
           path: results/*.csv
+          retention-days: 7
 
   merge:
     needs: matrix
     runs-on: ubuntu-latest
+
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -72,28 +87,36 @@ jobs:
 
           base = pathlib.Path('collected')
           files = list(base.rglob('summary_*.csv'))
+          if not files:
+              print("No per-combo summaries found.")
+              open('matrix_summary.csv','w').write('')
+              raise SystemExit(0)
+
           dfs = []
           for f in files:
-              k, e = f.stem.split('_')[1:]
+              stem = f.stem  # e.g., summary_0.25_0.02
+              _, k, e = stem.split('_')
               df = pd.read_csv(f)
               df['kelly_scale'] = float(k)
               df['min_edge'] = float(e)
               dfs.append(df)
 
           out = pd.concat(dfs, ignore_index=True)
-          out = out[['kelly_scale','min_edge','n_bets','pnl','roi','end_bankroll']]
+          out = out[['kelly_scale','min_edge','n_bets','total_staked','pnl','roi','end_bankroll']]
           out.sort_values(['kelly_scale','min_edge'], inplace=True)
           out.to_csv('matrix_summary.csv', index=False)
 
-          # Pretty markdown table for GitHub summary
+          # Pretty markdown table to logs + job summary
           try:
-              print(out.to_markdown(index=False))
+              md = out.to_markdown(index=False)
+              print(md)
               if os.environ.get('GITHUB_STEP_SUMMARY'):
                   with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
                       f.write("# 📊 Matrix Backtest Summary\n\n")
-                      f.write(out.to_markdown(index=False))
+                      f.write(md + "\n")
           except Exception:
               print(out)
+
           PY
 
       - name: Upload merged summary
@@ -101,3 +124,4 @@ jobs:
         with:
           name: matrix-summary
           path: matrix_summary.csv
+          retention-days: 7
